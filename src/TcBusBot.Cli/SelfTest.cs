@@ -6,6 +6,7 @@ using TcBusBot.Core.Configuration;
 using TcBusBot.Core.DataSources;
 using System.Text.Json;
 using TcBusBot.Core.Bus;
+using TcBusBot.Core.Hosting;
 using TcBusBot.Core.Models;
 using TcBusBot.Core.Realtime;
 using TcBusBot.Core.Subscriptions;
@@ -81,7 +82,10 @@ public static class SelfTest
         Section("16. 儲存後端：MongoDB → SQLite → 文字檔 → 記憶體");
         TestStorageBackends();
 
-        Section("17. 輪詢成本：$select 只要求會用到的欄位");
+        Section("17. 健康檢查端點與防休眠（Render 部署用）");
+        TestHealthEndpoint();
+
+        Section("18. 輪詢成本：$select 只要求會用到的欄位");
         TestEtaSelect(Path.Combine(fixturesRoot, "real", "EstimatedTimeOfArrival.sample.json"));
 
         Console.WriteLine();
@@ -1449,6 +1453,98 @@ public static class SelfTest
         {
             Environment.SetEnvironmentVariable(key, previous);
         }
+    }
+
+    /// <summary>
+    /// 健康檢查端點與防休眠迴圈（部署到 Render 這類 Web Service 用的）。
+    ///
+    /// 這兩個元件放在 Core（不依賴 Discord），所以可以在離線環境完整驗證：
+    /// 真的開一個埠、真的用 HttpClient 打它、真的檢查 HTTP 狀態碼與內容。
+    /// </summary>
+    private static void TestHealthEndpoint()
+    {
+        var payloadCalls = 0;
+
+        // 埠傳 0 = 讓作業系統挑一個空閒埠（測試不必猜）
+        using var endpoint = new HealthEndpoint(0, () => { payloadCalls++; return "{\"status\":\"ok\"}"; });
+
+        if (!endpoint.Start(out var message))
+        {
+            Check("健康檢查端點可以啟動", false, message);
+            return;
+        }
+
+        Check("★ 健康檢查端點可以啟動", endpoint.IsRunning, message);
+
+        var baseUrl = $"http://127.0.0.1:{endpoint.Port}";
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
+        // ── GET /（Render 的健康檢查會打這個）──
+        var root = http.GetAsync($"{baseUrl}/").GetAwaiter().GetResult();
+        var rootBody = root.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+        Check("★ GET / 回 200", (int)root.StatusCode == 200, ((int)root.StatusCode).ToString());
+        Check("★ GET / 的內容正確", rootBody.Contains("TcBusBot is running", StringComparison.Ordinal), rootBody);
+        Check("回應有正確的 Content-Type",
+            root.Content.Headers.ContentType?.MediaType == "text/plain", root.Content.Headers.ContentType?.ToString());
+
+        // ── GET /health（狀態 JSON）──
+        var health = http.GetAsync($"{baseUrl}/health").GetAwaiter().GetResult();
+        var healthBody = health.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+        Check("★ GET /health 回 200 JSON",
+            (int)health.StatusCode == 200
+            && health.Content.Headers.ContentType?.MediaType == "application/json", healthBody);
+        Check("/health 有去問狀態內容（不是寫死的字串）", payloadCalls > 0, $"呼叫 {payloadCalls} 次");
+
+        // ── 查詢字串與結尾斜線都要能通（監控服務常常這樣送）──
+        var withQuery = http.GetAsync($"{baseUrl}/health?from=uptimerobot").GetAwaiter().GetResult();
+        Check("★ /health?query 與 /health/ 都能通",
+            (int)withQuery.StatusCode == 200
+            && (int)http.GetAsync($"{baseUrl}/health/").GetAwaiter().GetResult().StatusCode == 200);
+
+        // ── 其他路徑 404、非 GET 405 ──
+        Check("★ 不存在的路徑回 404",
+            (int)http.GetAsync($"{baseUrl}/nope").GetAwaiter().GetResult().StatusCode == 404);
+
+        var post = http.PostAsync($"{baseUrl}/health", new StringContent("x")).GetAwaiter().GetResult();
+        Check("★ 非 GET 回 405（不讓別人亂打）", (int)post.StatusCode == 405, ((int)post.StatusCode).ToString());
+
+        // ── HEAD 只要標頭（有些監控服務用 HEAD）──
+        var head = new HttpRequestMessage(HttpMethod.Head, $"{baseUrl}/");
+        var headResponse = http.SendAsync(head).GetAwaiter().GetResult();
+        Check("HEAD / 回 200 且沒有內容",
+            (int)headResponse.StatusCode == 200
+            && headResponse.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult().Length == 0);
+
+        // ── 防休眠：真的去 ping 那個端點 ★（這是沙箱裡原本驗不到的部分）──
+        var keepAlive = new KeepAliveLoop($"{baseUrl}/health", intervalMinutes: 10,
+                                          requestTimeout: TimeSpan.FromSeconds(5));
+
+        Check("防休眠的說明文字包含網址",
+            keepAlive.Describe().Contains(baseUrl, StringComparison.Ordinal), keepAlive.Describe());
+
+        keepAlive.PingOnceAsync().GetAwaiter().GetResult();
+
+        Check("★ 防休眠 ping 成功（成功 1 次）",
+            keepAlive.SuccessCount == 1 && keepAlive.FailureCount == 0,
+            $"成功 {keepAlive.SuccessCount}／失敗 {keepAlive.FailureCount}（{keepAlive.LastResult}）");
+        Check("防休眠記得住最後一次結果",
+            keepAlive.LastResult?.Contains("200", StringComparison.Ordinal) == true
+            && keepAlive.LastPingAt is not null, keepAlive.LastResult ?? "(null)");
+
+        keepAlive.Dispose();
+
+        // ping 不到的網址要算失敗（而且不能丟例外）
+        using var broken = new KeepAliveLoop("http://127.0.0.1:1/health", 10, TimeSpan.FromSeconds(3));
+        broken.PingOnceAsync().GetAwaiter().GetResult();
+
+        Check("★ 打不通時算失敗且不丟例外",
+            broken.FailureCount == 1 && broken.SuccessCount == 0, broken.LastResult ?? "(null)");
+
+        endpoint.Dispose();
+        Check("端點可以正常關閉", !endpoint.IsRunning);
     }
 
     private static void Section(string title)

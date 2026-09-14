@@ -1,32 +1,70 @@
+# ─────────────────────────────────────────────────────────────
+#  Render Blueprint：TcBusBot（Discord Bot ＋ 健康檢查端點）
+#
+#  ⚠️ three 個欄位與常見草稿不同，都是有原因的：
+#
+#  1. `type: web`（不是 `worker`）
+#     Render 的免費層**只有 Web Service**。Worker 需要付費方案，
+#     而且 worker 不會被要求監聽埠 —— 但免費層的 Web Service 會。
+#     所以 Bot 同時開一個 HTTP 端點（程式內建，見 HealthEndpoint.cs）。
+#
+#  2. `runtime: docker`（不是 `env: docker`）
+#     Blueprint 規格的欄位名是 `runtime`；寫 `env` 不會生效。
+#
+#  3. `healthCheckPath: /health`
+#     直接指到程式提供的端點（回 200 JSON），Render 就能正確判斷服務狀態，
+#     不用另外寫一個靜態頁面。
+#
+#  ⚠️ 免費層沒有持久化磁碟：容器裡的 tcbus.db 每次重新部署都會清空。
+#     要留住訂閱組請設 `TCBUS_MONGO`（MongoDB Atlas 免費層就夠）。
+# ─────────────────────────────────────────────────────────────
 services:
-  - type: worker
+  - type: web
     name: tcbusbot-discord
-    env: docker
+    runtime: docker
     repo: https://github.com/abo-nb/TcBusBot.git
-    region: singapore # 可选: singapore, oregon, frankfurt, ohio (选择离你最近的节点)
-    plan: free # 使用免费层级
-    
-    # 关键配置：指定 Dockerfile 相对路径
+    region: singapore # 可選：singapore / oregon / frankfurt / ohio（選離你最近的）
+    plan: free
+
+    # Docker 相關：Dockerfile 在子目錄，context 要是專案根目錄
+    # （不然 COPY src/TcBusBot.Core 會找不到）
     dockerfilePath: src/TcBusBot.Discord/Dockerfile
-    # 指定 Docker 构建上下文路径为根目录（确保能引用到 src/TcBusBot.Core）
     dockerContext: .
 
-    # 环境变量设置
+    # 健康檢查：程式提供 GET /health → 200 JSON（GET / 也可以）
+    healthCheckPath: /health
+
     envVars:
+      # ── 必填 ──────────────────────────────────────────────
       - key: DISCORD_TOKEN
-        sync: false 
+        sync: false # 在 Render 後台填，不進 Git
 
+      # ── 選填：有填才有真實到站時間（沒填會用內建離線資料集）──
       - key: TDX_CLIENT_ID
-        sync: false 
-
+        sync: false
       - key: TDX_CLIENT_SECRET
-        sync: false 
+        sync: false
 
-      - key: TCBUS_MONGO 
-        sync: false 
+      # ── 選填但強烈建議：訂閱組存到 MongoDB（容器沒有持久化磁碟）──
+      - key: TCBUS_MONGO
+        sync: false
+      - key: TCBUS_MONGO_DB
+        value: tcbus
 
+      # ── 輪詢與防休眠 ──────────────────────────────────────
+      # 30 秒 ≈ 60~80 點/月（TDX 銅級 200 點/月足夠）；想更省可設 60
       - key: TCBUS_POLL_INTERVAL
-        sync: false 
+        value: "30"
+
+      # 要監聽的埠。Render 預設會注入 PORT，這裡明確定成 8080 也可以
+      # （程式讀 PORT，沒設時預設就是 8080）。想讓 Render 自己挑就刪掉這兩行。
+      - key: PORT
+        value: "8080"
+
+      # 防休眠：程式會每 N 分鐘 ping 自己一次（沒設 APP_URL 時會自動用
+      # Render 注入的 RENDER_EXTERNAL_URL）。免費層閒置約 15 分鐘會休眠。
+      - key: KEEP_ALIVE_MINUTES
+        value: "10"
 
       - key: DOTNET_ENVIRONMENT
         value: Production

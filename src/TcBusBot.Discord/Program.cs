@@ -4,6 +4,7 @@ using Discord.Interactions;
 using Discord.WebSocket;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.DataSources;
+using TcBusBot.Core.Hosting;
 using TcBusBot.Core.Realtime;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Subscriptions;
@@ -44,6 +45,19 @@ public static class Program
         {
             PrintTokenHelp();
             return 1;
+        }
+
+        // ── 健康檢查端點 ───────────────────────────────────
+        // 刻意在「連 Discord 之前」就開埠：Render 會在啟動後不久探測這個埠，
+        // 等到 Discord 連上才開就已經被判定部署失敗了（Discord 連線本來就要好幾秒）。
+        HealthEndpoint? health = null;
+        if (!dryRun && cfg.EnableHealthEndpoint)
+        {
+            health = new HealthEndpoint(cfg.Port, BotStatus.ToJson);
+            Console.WriteLine(health.Start(out var healthMessage)
+                ? $"  ✅ 健康檢查端點：{healthMessage}"
+                : $"  ⚠️  {healthMessage}");
+            Console.WriteLine();
         }
 
         // ── 1) 靜態資料 ────────────────────────────────────
@@ -90,6 +104,8 @@ public static class Program
         Console.WriteLine($"✅ 資料就緒：{data.StopCount} 個站牌、{data.TripCount} 筆路線站序");
         Console.WriteLine();
 
+        BotStatus.DataSource = sourceDesc;
+
         // ── 離線 UI 驗證（不需要 Token）────────────────────
         if (dryRun) return DryRun.Run(data, cfg);
 
@@ -103,6 +119,7 @@ public static class Program
         {
             savedGroups = new SavedGroupStore(cfg.DatabasePath, cfg.MongoUri, cfg.MongoDatabase);
             Console.WriteLine($"✅ 訂閱組儲存：{savedGroups.Describe()}");
+            BotStatus.StorageMode = savedGroups.Describe();
         }
         catch (Exception ex)
         {
@@ -111,6 +128,10 @@ public static class Program
         }
         Console.WriteLine();
 
+
+        // 健康檢查端點會讀這裡的數字（訂閱數、快取筆數）
+        BotStatus.SubscriptionCounts = () => (subs.GroupCount, subs.SubscriptionCount);
+        BotStatus.CachedEtas = () => cache.Count;
 
         var runtime = new BotRuntime(subs, api) { DataSourceDescription = sourceDesc };
 
@@ -293,6 +314,23 @@ public static class Program
             Console.WriteLine("   你可以用 /bus panel 完成訂閱後按「模擬一則通知」來驗收通知內容。");
         }
 
+        BotStatus.Poller = runtime.PollerDescription;
+
+        // ── 防休眠（Render 免費層閒置約 15 分鐘就會把服務停掉）──
+        KeepAliveLoop? keepAlive = null;
+        if (!string.IsNullOrWhiteSpace(cfg.AppUrl))
+        {
+            keepAlive = new KeepAliveLoop(cfg.AppUrl, cfg.KeepAliveMinutes);
+            keepAlive.Start();
+            Console.WriteLine($"▶️  防休眠已啟動（{keepAlive.Describe()}）");
+            Console.WriteLine("    ⚠️ 服務真的睡著之後就沒辦法 ping 自己了 —— " +
+                              "要保證隨時醒著，請另外設外部監控（UptimeRobot／cron-job.org）。");
+        }
+        else
+        {
+            Console.WriteLine("⏸️  防休眠未啟動（沒有 APP_URL／RENDER_EXTERNAL_URL）");
+        }
+
         Console.WriteLine();
         Console.WriteLine("Bot 已啟動。按 Ctrl+C 結束。（手機版：在 App 裡按「停止服務」）");
 
@@ -303,6 +341,8 @@ public static class Program
         catch (OperationCanceledException) { }
 
         Console.WriteLine("正在關閉…");
+        keepAlive?.Dispose();
+        health?.Dispose();
         await client.StopAsync();
         await client.LogoutAsync();
         savedGroups.Dispose();
@@ -335,6 +375,8 @@ public static class Program
         Console.WriteLine($"  輪詢間隔　　 ：{cfg.PollIntervalSeconds} 秒／預設提前通知：{cfg.DefaultNotifyMinutes} 分鐘");
         Console.WriteLine($"  訂閱組儲存　 ：{cfg.DatabasePath}");
         Console.WriteLine($"  MongoDB　　　：{cfg.MongoPreview}");
+        Console.WriteLine($"  健康檢查端點 ：{(cfg.EnableHealthEndpoint ? $"埠 {cfg.Port}（/ 與 /health）" : "已停用（--no-health）")}");
+        Console.WriteLine($"  防休眠　　　 ：{(string.IsNullOrWhiteSpace(cfg.AppUrl) ? "未設定（沒有 APP_URL）" : $"每 {cfg.KeepAliveMinutes} 分鐘 ping {cfg.AppUrl}")}");
         Console.WriteLine();
     }
 

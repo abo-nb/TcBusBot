@@ -39,6 +39,20 @@ public sealed class BotConfig
     /// <summary>MongoDB 資料庫名稱（預設 `tcbus`）。</summary>
     public string MongoDatabase { get; private set; } = "tcbus";
 
+    /// <summary>
+    /// 健康檢查端點要聽的埠。Render 會用 `PORT` 環境變數指定，所以預設讀 `PORT`、沒有才用 8080。
+    /// </summary>
+    public int Port { get; private set; } = 8080;
+
+    /// <summary>是否啟動健康檢查端點（`--no-health` 可關掉，例如手機版不需要）。</summary>
+    public bool EnableHealthEndpoint { get; private set; } = true;
+
+    /// <summary>防休眠要 ping 的網址（`APP_URL`／`--app-url`；Render 也會自動提供 `RENDER_EXTERNAL_URL`）。</summary>
+    public string AppUrl { get; private set; } = "";
+
+    /// <summary>防休眠的間隔分鐘數（預設 10）。</summary>
+    public int KeepAliveMinutes { get; private set; } = 10;
+
     /// <summary>從 .env 匯出到行程環境變數的鍵數（0 = 全部都已經由系統環境變數提供）。</summary>
     public int EnvExportedKeys { get; private set; }
 
@@ -114,6 +128,22 @@ public sealed class BotConfig
                                ["TCBUS_MONGO", "TCBUS_MONGO_URI", "MONGO_URI"]).Value ?? "";
         cfg.MongoDatabase = SettingResolver.Resolve(args, "--mongo-db", file, ["TCBUS_MONGO_DB"]).Value ?? "tcbus";
         cfg.Refresh = args.Contains("--refresh");
+
+        // ── 部署到 Render（或其他 PaaS）用 ──────────────────
+        // Render 會用 PORT 指定要監聽的埠；APP_URL 是「自己的公開網址」，用來防休眠。
+        // RENDER_EXTERNAL_URL 是 Render 自動注入的，所以兩種寫法都支援。
+        var port = SettingResolver.Resolve(args, "--port", file, ["PORT", "TCBUS_PORT"]).Value;
+        if (int.TryParse(port, out var pv) && pv is > 0 and < 65536) cfg.Port = pv;
+
+        var appUrl = SettingResolver.Resolve(args, "--app-url", file,
+                                             ["APP_URL", "RENDER_EXTERNAL_URL"]).Value;
+        cfg.AppUrl = appUrl ?? "";
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--keep-alive", file, ["KEEP_ALIVE_MINUTES"]).Value,
+                         out var ka) && ka > 0)
+            cfg.KeepAliveMinutes = ka;
+
+        if (args.Contains("--no-health")) cfg.EnableHealthEndpoint = false;
 
         var guild = SettingResolver.Resolve(args, "--guild", file, ["DISCORD_GUILD_ID"]).Value;
         if (ulong.TryParse(guild, out var gid)) cfg.GuildId = gid;

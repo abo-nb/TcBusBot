@@ -5,7 +5,19 @@
 
 > ### 📌 需求變更紀錄
 >
-> **v13（目前）**：**設定來源三合一**（命令列／系統環境變數／`.env`）。
+> **v14（目前）**：**部署到 Render**（Web Service ＋ 健康檢查 ＋ 防休眠）。
+> - `TcBusBot.Discord` 內建極輕量 HTTP 端點（`GET /` 與 `GET /health`），
+>   在**連 Discord 之前**就開埠（Render 探測很快，太慢會被判定部署失敗）
+> - 用 **`TcpListener` 自己回 HTTP/1.1**，不是 `Sdk.Web`／`HttpListener`：
+>   前者會讓 Termux 版「裝了但起不來」，後者在 Windows 需要 URL ACL
+>   （變成「Render 上可以、本機跑不起來」）→ 兩者都無法在本機驗證（§19.2）
+> - **防休眠**：每 10 分鐘 ping 自己（`APP_URL`／`RENDER_EXTERNAL_URL`），
+>   並在啟動時誠實說明「睡著之後就叫不醒自己」（§19.4）
+> - `Dockerfile`（修掉 `ENTRYPOINT` 的組件名、非 root 寫入路徑、離線資料集）＋
+>   `render.yaml`（`type: web`／`runtime: docker`／`healthCheckPath: /health`）（§19.5）
+> - Android APK 專案**暫時擱置**（程式碼留著，已從方案建置移除）
+>
+> **v13**：**設定來源三合一**（命令列／系統環境變數／`.env`）。
 > - `.env` 的值可以用 `${VAR}` 引用**同檔案的其他鍵**或**系統環境變數**
 >   （兩邊都沒有就保留原樣，看得出是哪個沒設）→「金鑰放系統環境變數、其他放 .env」可行（§3.1）
 > - 載入 `.env` 之後會**匯出到行程環境變數**，所以任何地方都能用
@@ -2290,7 +2302,7 @@ Discord.Net 本身幾乎不佔記憶體。
 | --- | --- | --- | --- |
 | **M0** 骨架 | 專案、Options、`appsettings` | `dotnet build` 通過 | ✅ **完成** |
 | **M1** TDX 用戶端 | Token + `TdxApiClient` + Models | 真實 JSON payload 可正確解析 | ✅ **完成**（Models 與解析已驗證） |
-| **M2** 靜態索引＋搜尋＋匹配 | `TaichungBusDataService` + `StopNameNormalizer` + `StopSearchService` + 建議群組 + `LocationTarget` + 候選集合匹配 + 訂閱群組 + Matcher | **`tcbus selftest` 229 項全數通過** | ✅ **完成** |
+| **M2** 靜態索引＋搜尋＋匹配 | `TaichungBusDataService` + `StopNameNormalizer` + `StopSearchService` + 建議群組 + `LocationTarget` + 候選集合匹配 + 訂閱群組 + Matcher | **`tcbus selftest` 244 項全數通過** | ✅ **完成** |
 | **M3** Discord UI | Slash command + Modal + 多選 Select + Buttons + **訂閱組（§8.1）** | `--dryrun` 全元件符合限制 **＋ 接線檢查（§7.6）通過**；Discord 端 Step 1→13 | 🟡 進行中（實機驗收中） |
 | **M4** 即時資料 | `EtaPollerService`（輪詢）+ `DiscordNotifier`（節流） | 實際等到通知 | 🟡 部分（Matcher / Cache / 訂閱清單的預計到站時間已完成） |
 | **M5** 收尾 | `/bus remove`、`/bus status`、錯誤處理 | 長時間掛機不爆掉 | ⬜ 待做 |
@@ -2334,7 +2346,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 229 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 244 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -2734,6 +2746,97 @@ MongoDB（設了 TCBUS_MONGO）→ SQLite → 文字檔 → 記憶體
 | 未設定 MongoDB | ✅ 實跑：走原本的本機路徑 |
 | **真的連上 MongoDB** | ⏳ 需要一組連線字串（Atlas 免費層即可）才能驗；**這是我唯一沒能實測的一段** |
 | 手機上跑 Termux | ⏳ 需要你在手機上 `pkg install` ＋ 填 Token |
+
+---
+
+## 19. 部署到 Render（Web Service ＋ 健康檢查 ＋ 防休眠）
+
+### 19.1 為什麼需要一個 HTTP 端點
+
+Render 的免費層**只提供 Web Service**：服務必須監聽 HTTP 埠，否則平台判定部署失敗。
+所以同一個程式要同時當「Discord Bot」與「Web Service」。
+
+### 19.2 ★ 為什麼不是 `Microsoft.NET.Sdk.Web` + `WebApplication`
+
+使用者最初的草案是改成 `Microsoft.NET.Sdk.Web`，用 `WebApplication.CreateBuilder`。
+**實測後改成用 BCL 的 `TcpListener` 自己回 HTTP**，理由如下：
+
+| 平台 | ASP.NET Core 可用嗎 | 影響 |
+| --- | --- | --- |
+| Render（Linux 容器） | ✅ | 沒問題 |
+| Windows／Linux 桌面版 | ✅ | 沒問題 |
+| **Termux（手機控制台版）** | ❌ Termux 只有 `dotnet-runtime`，沒有 ASP.NET Core 執行階段 | 手機版會「裝了但起不來」 |
+| Android APK（已擱置） | ❌ 沒有 `Microsoft.AspNetCore.App` 框架參考 | 當時會讓 APK 建不起來 |
+
+手機版與桌面版**編譯同一份原始碼**（§17.1），所以把 ASP.NET Core 放進共用程式碼
+會波及所有宿主；而我們需要的只是「聽一個埠、回 200」。
+`System.Net` 是 BCL 內建的，零套件、零框架參考，每個平台都能跑。
+
+**還試過 `HttpListener`（也是 BCL），但退回了**：它在 Windows 上需要 HTTP.SYS 的 URL ACL
+（非管理員連 `http://localhost:port/` 都綁不起來），
+變成「Render 上可以、本機跑不起來」—— 那就沒辦法在本機驗證，也違背「本機能 dotnet run」。
+
+最後用 `TcpListener` 自己寫 HTTP/1.1 回應（約 200 行），任何平台、任何權限都能綁：
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 341
+Cache-Control: no-store
+Connection: close
+```
+
+> 這是**真正的 HTTP**：有 status line、標準標頭、body；
+> curl／瀏覽器／Render 的健康檢查／UptimeRobot 都直接可用（實測）。
+
+### 19.3 端點與狀態
+
+| 路徑 | 回應 |
+| --- | --- |
+| `GET /` | `200 TcBusBot is running!`（Render 的 healthCheckPath 用 `/health`） |
+| `GET /health` | `200` JSON：`uptimeSeconds`、`discordReady`、`storage`、`dataSource`、`poller`、`subscriptionGroups`、`subscriptions`、`cachedEtas` |
+| 其他 | `404`；非 GET／HEAD → `405` |
+
+**開埠的時機很重要**：健康檢查端點在「**連 Discord 之前**」就啟動。
+Render 會在啟動後不久探測，等到 Discord 連上（本來就要好幾秒）才開埠會被判定部署失敗。
+
+狀態由 `BotStatus`（靜態快照）提供：端點啟動時 `subs`／`cache` 還不存在，
+用區域變數會抓不到（C# 也不允許區域函式捕捉之後才宣告的變數），
+所以由 `Program` 邊建立邊填進去。
+
+### 19.4 防休眠（keep-alive）
+
+免費層閒置約 15 分鐘會停掉服務。設了 `APP_URL`（或 Render 自動注入的
+`RENDER_EXTERNAL_URL`）之後，`KeepAliveLoop` 每 `KEEP_ALIVE_MINUTES`（預設 10）分鐘 ping 一次自己：
+
+```
+[keep-alive] 14:12:03 ping https://…/health → HTTP 200（成功 3／失敗 0）
+```
+
+> ⚠️ **誠實說明極限**：服務真的睡著之後就沒有東西可以 ping 自己了。
+> 自我 ping 只能「在醒著時維持清醒」，**不能把自己叫醒**；
+> 要保證隨時都醒著需要**外部**監控或付費方案。程式啟動時會把這句話印出來。
+
+### 19.5 容器／Render 才會遇到的坑
+
+| 坑 | 症狀 | 處理 |
+| --- | --- | --- |
+| `ENTRYPOINT ["dotnet","TcBusBot.Discord.dll"]` | 容器啟動即失敗 `Could not find …` | 專案 `AssemblyName` 是 `tcbus-bot` → 用 **`tcbus-bot.dll`** |
+| 非 root 使用者寫不進 `/app` | 訂閱組靜默退回記憶體模式（只有一行警告） | Dockerfile 設 `TCBUS_DB=/tmp/tcbus.db`、`TCBUS_CACHE=/tmp/tcbus-cache` |
+| 容器檔案系統是暫時的 | 重新部署後訂閱組消失 | 設 `TCBUS_MONGO`（Atlas 免費層） |
+| 離線資料集不在映像裡 | 沒有 TDX 金鑰時啟動失敗 | Dockerfile `COPY --from=build /src/tests/fixtures ./tests/fixtures`（`Program` 會從工作目錄往上找） |
+| Render 的 Blueprint 欄位名 | `env: docker`／`type: worker` 不生效 | 正確是 **`runtime: docker`**、**`type: web`**（免費層沒有 worker） |
+
+### 19.6 驗證到什麼程度
+
+| 項目 | 狀態 |
+| --- | --- |
+| 端點：`/`、`/health`、404、405、HEAD、查詢字串、結尾斜線 | ✅ `tcbus selftest` 第 17 節（真的開埠、真的用 HttpClient 打） |
+| 隱私：健康檢查只回狀態，不含 Token／連線字串 | ✅（`BotStatus` 只放訂閱數、快取筆數等） |
+| 防休眠：ping 成功會計數、打不通不丟例外 | ✅ 同一節（離線測試原本驗不到，因為它要等 Discord 登入成功才啟動） |
+| 本機啟動 ＋ 原始 HTTP 位元組 | ✅ 實跑：`dotnet tcbus-bot.dll` ＋ TcpClient 讀到 `HTTP/1.1 200 OK` |
+| **Docker 映像建置** | ⏳ 本機沒有 docker，未實測 |
+| **Render 實際部署** | ⏳ 需要你的帳號與 repo |
 
 ---
 

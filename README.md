@@ -17,10 +17,11 @@
 | --- | --- |
 | M0 專案骨架 | ✅ |
 | M1 TDX 資料模型與解析 | ✅ |
-| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 229 項離線驗收測試全過 |
+| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 244 項離線驗收測試全過 |
 | **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
 | M4 即時輪詢 | ✅ 程式完成（輪詢迴圈 + 到站時間總表），實際運作需 TDX 金鑰 |
-| **M7 Android APK**（掛在舊手機上） | ✅ 已實機驗證（安裝／啟動／執行階段都正常；與桌面版共用同一份原始碼） |
+| **M7 Android APK**（掛在舊手機上） | ⏸ **擱置**（已實機驗證過，程式碼留著；改用 Render） |
+| **M10 Render 部署** | ✅ 健康檢查端點 + 防休眠 + Dockerfile + `render.yaml`（端點有離線測試） |
 | **M8 儲存後端**（MongoDB / SQLite / 文字檔） | ✅ 自動挑選 + 失敗退回本機，都有測試 |
 | **M9 Termux**（手機上的控制台） | ✅ 發佈腳本 + 實機步驟（`publish-termux.ps1`） |
 | M5 / M6 | ⬜ |
@@ -29,14 +30,19 @@
 
 ## 三種跑法
 
-| | 桌面版（Windows） | 手機版 APK | **Termux（手機上的控制台）** |
+| | 桌面版（Windows） | **Render（雲端，推薦）** | Termux（手機上的控制台） |
 | --- | --- | --- | --- |
-| 專案 | `src/TcBusBot.Discord` | `src/TcBusBot.Mobile` | 同上（發佈後複製到手機） |
+| 專案 | `src/TcBusBot.Discord` | 同上（＋ `render.yaml`／Dockerfile） | 同上（發佈後複製到手機） |
 | Bot 邏輯 | 同一份原始碼 | 同一份原始碼（`<Compile Include>` 共用） | 同一個發佈產物 |
-| 啟動方式 | `dotnet run --project src\TcBusBot.Discord` | 手機上按「▶ 啟動服務」 | `sh run.sh`（有完整控制台） |
-| 常駐機制 | 主控台視窗 | 前景服務 | `termux-wake-lock` + 背景執行 |
-| 訂閱組儲存 | SQLite（內建 `winsqlite3.dll`） | `android.database.sqlite` | 文字檔（`saved_groups.txt`） |
-| 適合 | 開發、除錯 | 想要一個 App、不想碰終端機 | **想要控制台、最省事** |
+| 啟動方式 | `dotnet run --project src\TcBusBot.Discord` | push 到 GitHub → Render 自動部署 | `sh run.sh`（有完整控制台） |
+| 常駐機制 | 主控台視窗 | Web Service ＋ 自我 ping 防休眠 | `termux-wake-lock` + 背景執行 |
+| 訂閱組儲存 | SQLite（內建 `winsqlite3.dll`） | MongoDB（容器沒有持久化磁碟） | 文字檔或 MongoDB |
+| 適合 | 開發、除錯 | **24 小時掛著、不用自己顧機器** | 想要控制台、不想用雲端 |
+
+> 📦 **Android APK（`src/TcBusBot.Mobile`）目前擱置**：程式碼與 `build-apk.ps1` 都還在，
+> 只是不再納入方案建置（Render 這條路已經能 24 小時掛著，不需要自己的手機）。
+> 要回來做的話：`dotnet sln add src\TcBusBot.Mobile\TcBusBot.Mobile.csproj` 之後
+> 執行 `.\build-apk.ps1` 即可（當初已在實機驗證過）。
 
 > ⚠️ **同一個 Discord Bot Token 不要同時在兩台機器上跑**：會有兩個閘道連線，
 > 通知會重複送。要換機器時，先把舊的那台停掉。
@@ -298,6 +304,69 @@ MTP 看不到，只有 adb 能撈），所以 App 裡有一顆 **「📁 選擇�
 
 ---
 
+## 部署到 Render（免費層：Web Service ＋ 健康檢查 ＋ 防休眠）
+
+Render 的免費層**只提供 Web Service**（必須監聽一個 HTTP 埠），所以
+`TcBusBot.Discord` 內建了一個極輕量的 HTTP 端點（`src/TcBusBot.Core/Hosting/HealthEndpoint.cs`）：
+
+```
+GET /        → 200 "TcBusBot is running!"
+GET /health  → 200 JSON：uptime、discordReady、storage、dataSource、poller、訂閱數、快取筆數
+其他          → 404       非 GET → 405
+```
+
+它送出的就是**標準 HTTP/1.1**（有 status line、headers、body），curl／瀏覽器／
+Render 的健康檢查都認得：
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 341
+Cache-Control: no-store
+Connection: close
+```
+
+### 檔案
+
+| 檔案 | 用途 |
+| --- | --- |
+| `render.yaml` | Blueprint：`type: web` + `runtime: docker` + `healthCheckPath: /health` + 環境變數 |
+| `src/TcBusBot.Discord/Dockerfile` | 容器映像（`dotnet build -f src/TcBusBot.Discord/Dockerfile .`） |
+| `.dockerignore` | 不把 `bin/`、`obj/`、`dist/`、`tcbus.db` 送進建置 context |
+
+### 部署步驟
+
+1. 把 repo 推上 GitHub（`render.yaml` 已經指向 `https://github.com/abo-nb/TcBusBot.git`）
+2. Render → **New → Blueprint** → 選這個 repo（會自動讀 `render.yaml`）
+3. 在後台填 `DISCORD_TOKEN`（必填）、TDX 金鑰（選填）、`TCBUS_MONGO`（**強烈建議**，見下）
+4. 部署完成後打 `https://<你的服務>.onrender.com/health` 應該看到 JSON
+
+### 三個容器／Render 才會遇到的坑（都已處理）
+
+| 坑 | 處理 |
+| --- | --- |
+| **ENTRYPOINT 寫成 `TcBusBot.Discord.dll`** | 專案的 `AssemblyName` 是 `tcbus-bot`，容器會直接「找不到檔案」。Dockerfile 用的是 **`tcbus-bot.dll`** |
+| **非 root 使用者寫不進 `/app`** | 預設的相對路徑（`tcbus.db`、`cache/`）會寫失敗 → Dockerfile 設 `TCBUS_DB=/tmp/tcbus.db`、`TCBUS_CACHE=/tmp/tcbus-cache` |
+| **容器檔案系統是暫時的** | 每次重新部署就清空 → **訂閱組請設 `TCBUS_MONGO`**（MongoDB Atlas 免費層足夠） |
+
+### 防休眠（keep-alive）
+
+免費層閒置約 **15 分鐘**就會把服務停掉（下次有人連進來要等幾十秒喚醒）。
+設了 `APP_URL`（或 Render 自動注入的 `RENDER_EXTERNAL_URL`）之後，程式會
+**每 10 分鐘 ping 自己一次**：
+
+```
+▶️  防休眠已啟動（每 10 分鐘 ping https://tcbusbot-discord.onrender.com/）
+[keep-alive] 14:12:03 ping https://…/health → HTTP 200（成功 3／失敗 0）
+```
+
+> ⚠️ **自我 ping 的極限**：服務真的睡著之後，它就沒有東西可以 ping 自己了。
+> 所以這只能「在醒著時維持清醒」，**不能把自己叫醒**。
+> 要保證隨時都是醒的，請另外設外部監控（UptimeRobot／cron-job.org 免費層）
+> 打 `/health`，或升級 Render 付費方案。
+
+---
+
 ## 訂閱組要放哪裡（四種後端，自動挑）
 
 「訂閱」是記憶體（重啟就消失，這是刻意的），但**訂閱組**是使用者自己整理出來的範本，
@@ -551,7 +620,7 @@ TDX 公車 v2 的公式是 **`呼叫次數 / 1,500` ＋ `回傳資料量(MB) / 1
 沒有 Discord Token 的情況下完整測試。
 
 ```powershell
-# 229 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端、.env 路徑、合併與復原、SQLite 持久化
+# 244 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端、.env 路徑、合併與復原、SQLite 持久化
 dotnet run --project src\TcBusBot.Cli -- selftest
 
 # 模糊站牌搜尋
