@@ -1,0 +1,59 @@
+[
+  {
+    "PlateNumb": "",
+    "StopUID": "TXG12251",
+    "StopID": "12251",
+    "StopName": { "Zh_tw": "臺中車站(A月台)", "En": "Taichung Station(Platform A)" },
+    "RouteUID": "TXG300",
+    "RouteID": "300",
+    "RouteName": { "Zh_tw": "300", "En": "300" },
+    "SubRouteUID": "TXG300",
+    "SubRouteID": "300",
+    "SubRouteName": { "Zh_tw": "300", "En": "300" },
+    "Direction": 1,
+    "StopSequence": 1,
+    "StopStatus": 1,
+    "NextBusTime": "2026-09-12T05:46:00+08:00",
+    "SrcUpdateTime": "2026-09-12T00:45:45+08:00",
+    "UpdateTime": "2026-09-12T00:46:05+08:00"
+  },
+  {
+    "PlateNumb": "KKA-7868",
+    "StopUID": "TXG10652",
+    "StopID": "10652",
+    "StopName": { "Zh_tw": "逢甲大學(福星路)", "En": "Feng Chia University(Fuxing Road)" },
+    "RouteUID": "TXG160",
+    "RouteID": "160",
+    "RouteName": { "Zh_tw": "160", "En": "160" },
+    "SubRouteUID": "TXG160",
+    "SubRouteID": "160",
+    "SubRouteName": { "Zh_tw": "160", "En": "160" },
+    "Direction": 0,
+    "EstimateTime": 960,
+    "StopSequence": 8,
+    "StopStatus": 0,
+    "NextBusTime": "2026-09-12T06:44:00+08:00",
+    "Estimates": [
+      { "PlateNumb": "KKA-7868", "EstimateTime": 960, "IsLastBus": false }
+    ],
+    "SrcUpdateTime": "2026-09-12T00:44:26+08:00",
+    "UpdateTime": "2026-09-12T00:44:45+08:00"
+  },
+  {
+    "PlateNumb": "",
+    "StopUID": "TXG13567",
+    "StopID": "13567",
+    "StopName": { "Zh_tw": "靜宜大學(專用道)", "En": "Providence University(Dedicated Road)" },
+    "RouteUID": "TXG303",
+    "RouteID": "303",
+    "RouteName": { "Zh_tw": "303", "En": "303" },
+    "SubRouteUID": "TXG303",
+    "SubRouteID": "303",
+    "SubRouteName": { "Zh_tw": "303", "En": "303" },
+    "Direction": 0,
+    "StopSequence": 31,
+    "StopStatus": 3,
+    "SrcUpdateTime": "2026-09-12T00:45:45+08:00",
+    "UpdateTime": "2026-09-12T00:46:05+08:00"
+  }
+]

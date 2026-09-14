@@ -1,0 +1,17 @@
+[
+  {
+    "StopUID": "TXG12251",
+    "StopID": "12251",
+    "AuthorityID": "007",
+    "StopName": { "Zh_tw": "臺中車站(A月台)", "En": "Taichung Station(Platform A)" },
+    "StopPosition": { "PositionLon": 120.686459, "PositionLat": 24.137749, "GeoHash": "wsmc661hw" },
+    "Bearing": "NE",
+    "StationID": "4980",
+    "StationGroupID": "4980",
+    "City": "Taichung",
+    "CityCode": "TXG",
+    "LocationCityCode": "TXG",
+    "UpdateTime": "2026-09-11T22:37:51+08:00",
+    "VersionID": 11394
+  }
+]

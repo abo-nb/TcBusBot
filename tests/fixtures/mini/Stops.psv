@@ -1,0 +1,71 @@
+# 台中公車站牌（最小驗收資料集）
+# 來源：2026-09-12 實測 TDX /v2/Bus/StopOfRoute/City/Taichung 的真實資料整理而成
+# 格式：stopUid|站名|lon|lat|stationId|英文名(可空)
+#
+# 這份資料刻意只包含「臺中車站 → 靜宜大學」走廊上的站牌，用來離線驗證：
+#   1. 模糊搜尋（臺/台、口語「火車站」、全形、漏字、英文名）
+#   2. 建議群組（同名站牌合併、不同站不該合併）
+#   3. 候選集合路線匹配（方向、站序、多個候選上車站）
+TXG12251|臺中車站(A月台)|120.686459|24.137749|4980|Taichung Station(Platform A)
+TXG11020|臺中車站(臺灣大道)|120.684407|24.138207|720|Taichung Station(Taiwan Boulevard)
+TXG12769|干城站|120.685758|24.140969|44|Gancheng Station
+TXG12771|臺中公園(雙十路)|120.685888|24.144184|78|Taichung Park(Shuangshi Road)
+TXG13554|新民高中(健行路)|120.68742184733|24.158937333907|490|Shin-min Senior High School(Jianxing Road)
+TXG13553|新民高中(三民路)|120.68847378836|24.156756782608|727|Shin-min Senior High School(Sanmin Road)
+TXG2252|寶覺寺|120.68989|24.157995|378|Baojue Temple
+TXG2250|三民錦新街口|120.685717|24.153871|225|Sanmin-Jinxin Intersection
+TXG2249|中友百貨|120.684828|24.151707|341|Chungyo Department Store
+TXG13460|國立臺中科技大學|120.684165|24.149711|10050|National Taichung University of Science and Technology
+TXG16296|中興堂|120.684488|24.146212|2144|Chunghsing Hall
+TXG17811|第一廣場|120.683522|24.139093|2557|First Square
+TXG22398|第一廣場|120.683527|24.138804|2558|First Square
+TXG4887|彰化銀行(臺灣大道)|120.68254203337|24.139902172999|464|Chang Hwa Bank(Taiwan Boulevard)
+TXG2381|彰化銀行(臺灣大道)|120.682304|24.139861|465|Chang Hwa Bank(Taiwan Boulevard)
+TXG1754|第二市場(臺灣大道)|120.680134|24.141998|111|2nd Market(Taiwan Boulevard)
+TXG13530|第二市場(臺灣大道)|120.680019|24.141863|112|2nd Market(Taiwan Boulevard)
+TXG22417|仁愛醫院|120.678061|24.143748|4046|Ren-Ai Hospital
+TXG5386|仁愛醫院|120.678188|24.143504|4045|Ren-Ai Hospital
+TXG1865|臺灣大道中華路口|120.676905|24.144813|1336|Taiwan Boulevard-Zhonghua Intersection
+TXG19265|臺灣大道中華路口|120.676875|24.144629|1335|Taiwan Boulevard-Zhonghua Intersection
+TXG1864|臺灣大道原子街口|120.674872|24.146572|788|Taiwan Boulevard-Yuanzi Intersection
+TXG19264|臺灣大道原子街口|120.674826|24.146362|789|Taiwan Boulevard-Yuanzi Intersection
+TXG1272|茄苳腳(專用道)|120.671055|24.149904|239|Qiedongjiao(Dedicated Road)
+TXG1301|茄苳腳(專用道)|120.671613|24.149206|240|Qiedongjiao(Dedicated Road)
+TXG1271|中正國小(專用道)|120.66799314627|24.152528234889|653|Chung-Cheng Elementary School(Dedicated Road)
+TXG10724|中正國小(專用道)|120.66746262747|24.152634633083|652|Chung-Cheng Elementary School(Dedicated Road)
+TXG22416|科博館(專用道)|120.662855|24.155448|4843|National Museum of Natural Science(Dedicated Road)
+TXG6053|科博館(專用道)|120.662745|24.155302|4844|National Museum of Natural Science(Dedicated Road)
+TXG19429|忠明國小(專用道)|120.65932291943|24.15747106935|170|Chungming Elementary School(Dedicated Road)
+TXG19430|忠明國小(專用道)|120.65910595273|24.157273797065|171|Chungming Elementary School(Dedicated Road)
+TXG1268|頂何厝(專用道)|120.656219|24.159136|4203|Dinghecuo(Dedicated Road)
+TXG19431|頂何厝(專用道)|120.655721|24.159138|4202|Dinghecuo(Dedicated Road)
+TXG8403|市政府(專用道)|120.649108|24.163022|3910|Taichung City Hall(Dedicated Road)
+TXG8503|市政府(專用道)|120.649195|24.162766|3911|Taichung City Hall(Dedicated Road)
+TXG1264|新光/遠百(專用道)|120.644034|24.165861|4763|Shin Kong Mitsukoshi/Top City Dept. Store(Dedicated Road)
+TXG1309|新光/遠百(專用道)|120.643231|24.165999|4762|Shin Kong Mitsukoshi/Top City Dept. Store(Dedicated Road)
+TXG1262|秋紅谷(專用道)|120.639734|24.168793|4761|Maple Garden(Dedicated Road)
+TXG1311|秋紅谷(專用道)|120.638879|24.169165|4760|Maple Garden(Dedicated Road)
+TXG11053|福安(專用道)|120.623451|24.179194|63|Fu-an(Dedicated Road)
+TXG9993|福安(專用道)|120.623955|24.178688|64|Fu-an(Dedicated Road)
+TXG606|中港新城(專用道)|120.61981971913|24.180923538491|655|Zhonggang Community(Dedicated Road)
+TXG10730|中港新城(專用道)|120.61955176882|24.180888184761|654|Zhonggang Community(Dedicated Road)
+TXG10966|澄清醫院(專用道)|120.61660587975|24.182532940764|700|Cheng Ching Hospital(Dedicated Road)
+TXG10967|澄清醫院(專用道)|120.616774|24.182245|701|Cheng Ching Hospital(Dedicated Road)
+TXG22399|玉門路(專用道)|120.60987|24.184551|3194|Yumen Road(Dedicated Road)
+TXG18163|玉門路(專用道)|120.60992|24.184402|3193|Yumen Road(Dedicated Road)
+TXG657|榮總/東海大學(專用道)|120.603111|24.182976|4889|Taichung Veterans General Hospital/Tunghai Uni.(Dedicated Road)
+TXG696|榮總/東海大學(專用道)|120.603479|24.182835|4888|Taichung Veterans General Hospital/Tunghai Uni.(Dedicated Road)
+TXG16601|東海別墅(專用道)|120.59352771434|24.182910790898|751|Donghai Villa(Dedicated Road)
+TXG16564|東海別墅(專用道)|120.59351635159|24.182739398451|750|Donghai Villa(Dedicated Road)
+TXG7104|坪頂(專用道)|120.5858644448|24.186131506878|1355|Pingding(Dedicated Road)
+TXG11257|坪頂(專用道)|120.58566809429|24.186045538196|1356|Pingding(Dedicated Road)
+TXG19432|正英路(專用道)|120.581549|24.209231|4204|Zhengying Road(Dedicated Road)
+TXG19433|正英路(專用道)|120.581137|24.209925|4205|Zhengying Road(Dedicated Road)
+TXG19434|弘光科技大學(專用道)|120.580592|24.216875|1344|Hungkuang University (Dedicated Road)
+TXG19435|弘光科技大學(專用道)|120.580258|24.217481|1343|Hungkuang University (Dedicated Road)
+TXG19436|晉江寮(專用道)|120.579767|24.221097|4206|Jinjiangliao(Dedicated Road)
+TXG19437|晉江寮(專用道)|120.579074|24.221858|4207|Jinjiangliao(Dedicated Road)
+TXG13567|靜宜大學(專用道)|120.576539|24.225899|1387|Providence University(Dedicated Road)
+TXG21478|靜宜大學(專用道)|120.577203|24.225322|1388|Providence University(Dedicated Road)
+TXG19438|靜宜大學(專用道)|120.577203|24.225322|1388|Providence University(Dedicated Road)
+TXG13456|臺灣大道北勢路口|120.573567|24.230353|1340|Taiwan Boulevard-Beishi Intersection

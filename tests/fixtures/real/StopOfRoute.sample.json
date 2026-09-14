@@ -1,0 +1,53 @@
+[
+  {
+    "RouteUID": "TXG300",
+    "RouteID": "300",
+    "RouteName": { "Zh_tw": "300", "En": "300" },
+    "Operators": [
+      { "OperatorID": "1", "OperatorName": { "Zh_tw": "台中客運", "En": "Taichung Bus Co., Ltd." }, "OperatorCode": "TaichungBus", "OperatorNo": "0501" }
+    ],
+    "SubRouteUID": "TXG300",
+    "SubRouteID": "300",
+    "SubRouteName": { "Zh_tw": "300", "En": "300" },
+    "Direction": 1,
+    "City": "Taichung",
+    "CityCode": "TXG",
+    "Stops": [
+      {
+        "StopUID": "TXG12251",
+        "StopID": "12251",
+        "StopName": { "Zh_tw": "臺中車站(A月台)", "En": "Taichung Station(Platform A)" },
+        "StopBoarding": 0,
+        "StopSequence": 1,
+        "StopPosition": { "PositionLon": 120.686459, "PositionLat": 24.137749, "GeoHash": "wsmc661hw" },
+        "StationID": "4980",
+        "StationGroupID": "4980",
+        "LocationCityCode": "TXG"
+      },
+      {
+        "StopUID": "TXG1754",
+        "StopID": "1754",
+        "StopName": { "Zh_tw": "第二市場(臺灣大道)", "En": "2nd Market(Taiwan Boulevard)" },
+        "StopBoarding": 0,
+        "StopSequence": 2,
+        "StopPosition": { "PositionLon": 120.680134, "PositionLat": 24.141998, "GeoHash": "wsmc64ut6" },
+        "StationID": "111",
+        "StationGroupID": "111",
+        "LocationCityCode": "TXG"
+      },
+      {
+        "StopUID": "TXG21478",
+        "StopID": "21478",
+        "StopName": { "Zh_tw": "靜宜大學(專用道)", "En": "Providence University(Dedicated Road)" },
+        "StopBoarding": 0,
+        "StopSequence": 24,
+        "StopPosition": { "PositionLon": 120.577203, "PositionLat": 24.225322, "GeoHash": "wsm9zf1ds" },
+        "StationID": "1388",
+        "StationGroupID": "1388",
+        "LocationCityCode": "TXG"
+      }
+    ],
+    "UpdateTime": "2026-09-11T22:37:51+08:00",
+    "VersionID": 11394
+  }
+]

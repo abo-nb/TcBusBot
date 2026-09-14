@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <RootNamespace>TcBusBot.Core</RootNamespace>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!--
+    刻意保持「零外部套件相依」：
+      * 純 BCL（System.Text.Json 已含在 net8.0 共用執行階段中）
+      * 讓核心邏輯可以在沒有網路、沒有 Discord Token 的環境下完整測試
+      * Discord.Net / MQTTnet 只在 TcBusBot.Discord 專案引用（第二階段）
+  -->
+
+  <ItemGroup>
+    <!-- MongoDB 後端（選配：設定了連線字串才會用到）
+         3.9.0 在本機 NuGet 快取裡，離線也能建置。 -->
+    <PackageReference Include="MongoDB.Driver" Version="3.9.0" />
+  </ItemGroup>
+
+</Project>

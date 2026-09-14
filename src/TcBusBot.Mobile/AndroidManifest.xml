@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+
+  <!-- 連到 Discord 與 TDX -->
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+  <!-- 工作目錄放在「手機儲存空間 /TcBusBot」時需要：
+       Android 10 以前是 WRITE_EXTERNAL_STORAGE；11 以後改用「所有檔案存取權」 -->
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                   android:maxSdkVersion="29" />
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+                   android:maxSdkVersion="32" />
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+                   tools:ignore="ScopedStorage" />
+
+  <!-- 前景服務：Android 才不會把手機上的 Bot 殺掉 -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+  <!-- 請使用者把 App 排除在電池最佳化之外（Doze 會斷網路，輪詢就停了） -->
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+  <application
+      android:label="台中公車通知"
+      android:allowBackup="true"
+      android:icon="@android:drawable/ic_menu_info_details"
+      android:usesCleartextTraffic="false"
+      android:requestLegacyExternalStorage="true">
+
+    <!--
+      ⚠️ 這裡**不要**手寫 <activity> / <service> 的 android:name。
+
+      .NET Android 會依 [Activity] / [Service] 屬性自動產生元件，
+      而且真正的 Java 類別是 `crc64…MainActivity`（ACW）。
+      自己寫 .MainActivity 會產生一個**不存在的 Java 類別**的 manifest 項目
+      （實測合併後的 manifest 會同時出現兩筆，啟動器點下去就是 ClassNotFoundException）。
+
+      所以：元件交給屬性產生，這裡只留權限與 application 層級的設定。
+      MainLauncher / foregroundServiceType 分別由
+      [Activity(MainLauncher = true)] 與 [Service(ForegroundServiceType = …)] 決定。
+    -->
+
+  </application>
+
+</manifest>
