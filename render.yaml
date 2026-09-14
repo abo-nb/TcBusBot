@@ -13,6 +13,19 @@ services:
     # 环境变量设置
     envVars:
       - key: DISCORD_TOKEN
-        sync: false # 表示不会在 yaml 中硬编码，需在 Render Dashboard 手动填入具体 Token
+        sync: false 
+
+      - key: TDX_CLIENT_ID
+        sync: false 
+
+      - key: TDX_CLIENT_SECRET
+        sync: false 
+
+      - key: TCBUS_MONGO 
+        sync: false 
+
+      - key: TCBUS_POLL_INTERVAL
+        sync: false 
+        
       - key: DOTNET_ENVIRONMENT
         value: Production
