@@ -28,3 +28,7 @@ obj/
 
 # Android APK 產物（build-apk.ps1 的輸出）
 dist/
+# ── 含金鑰的設定檔：一律不要提交 ──────────────────────────
+# （TcBusBot-1.env、app.env 這類「複製一份來放金鑰」的檔案都算）
+*.env
+!*.env.example

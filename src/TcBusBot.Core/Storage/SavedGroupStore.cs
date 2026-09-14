@@ -230,6 +230,9 @@ public sealed class SavedGroupStore : IDisposable
 
     private readonly ISavedGroupRepository _repo;
 
+    /// <summary>MongoDB 連不上時的背景重試（只提醒，不自動切換）。</summary>
+    private static MongoRecheckLoop? _mongoRecheck;
+
     /// <summary>是否真的寫進檔案（false = 記憶體模式，重啟就消失）。</summary>
     public bool IsPersistent => _repo.IsPersistent;
 
@@ -265,6 +268,11 @@ public sealed class SavedGroupStore : IDisposable
 
         if (wantsMongo)
         {
+            // 先講清楚「現在要連 MongoDB，最多等 15 秒」——
+            // 否則雲端上看到啟動卡住十幾秒會以為當掉了。
+            BotLog.Warn($"[儲存] 正在連線 MongoDB（{MongoDiagnostics.Mask(mongoConnectionString!)}，" +
+                        "最多等 15 秒）…");
+
             try
             {
                 var repo = new MongoSavedGroupRepository(mongoConnectionString!, mongoDb);
@@ -275,10 +283,13 @@ public sealed class SavedGroupStore : IDisposable
             {
                 if (mode == StorageMode.Mongo) throw;
 
-                // 不硬撐：連不上就退回本機儲存，但一定要讓使用者看到。
-                // 訊息只留第一行並截短 —— MongoDB 的例外內容很長，整段塞進去只會洗版。
-                BotLog.Warn($"[儲存] MongoDB 連不上（{Short(ex)}）→ " +
-                            "改用本機儲存（這次的訂閱組不會同步到其他機器）");
+                // 不硬撐：連不上就退回本機儲存，但一定要讓使用者看到**為什麼**。
+                // MongoDB 的例外訊息本身看不出原因，所以附上可執行的檢查清單。
+                BotLog.Warn($"[儲存] ❌ MongoDB 連不上（{Short(ex)}）→ 改用本機儲存" +
+                            "（這次的訂閱組不會同步到其他機器）");
+                BotLog.Warn(MongoDiagnostics.Checklist(mongoConnectionString!));
+
+                _mongoRecheck = new MongoRecheckLoop(mongoConnectionString!, mongoDb);
             }
         }
 
@@ -396,5 +407,10 @@ public sealed class SavedGroupStore : IDisposable
     /// <summary>記錄一次「被使用」，讓常用的組排在前面。</summary>
     public void Touch(long id, ulong userId) => _repo.Touch(id, userId);
 
-    public void Dispose() => _repo.Dispose();
+    public void Dispose()
+    {
+        _repo.Dispose();
+        _mongoRecheck?.Dispose();
+        _mongoRecheck = null;
+    }
 }

@@ -2827,7 +2827,29 @@ Render 會在啟動後不久探測，等到 Discord 連上（本來就要好幾�
 | 離線資料集不在映像裡 | 沒有 TDX 金鑰時啟動失敗 | Dockerfile `COPY --from=build /src/tests/fixtures ./tests/fixtures`（`Program` 會從工作目錄往上找） |
 | Render 的 Blueprint 欄位名 | `env: docker`／`type: worker` 不生效 | 正確是 **`runtime: docker`**、**`type: web`**（免費層沒有 worker） |
 
-### 19.6 驗證到什麼程度
+### 19.6 MongoDB 連不上的診斷（雲端部署的頭號問題）
+
+實測回報：Render 上出現 `TimeoutException: A timeout occurred after 2998ms selecting a server…`。
+兩個問題都修了：
+
+| 問題 | 修正 |
+| --- | --- |
+| **逾時太短**（3 秒） | 雲端第一次連 Atlas 要 DNS SRV → TLS → 複製集探索，3 秒不夠。改成**連線 10 秒／伺服器選擇 15 秒／Socket 20 秒**（`MongoSavedGroupRepository`） |
+| **訊息看不出原因** | 新增 `MongoDiagnostics`：印出遮罩後的連線字串、**SRV 記錄查詢結果**（`DnsClient`，本來就是 driver 的相依），再照發生機率列出檢查清單 |
+
+`srv` 查詢結果把問題一刀切開：
+**查得到節點** → DNS 沒問題，連不上就是白名單／帳密／TLS；
+**查不到** → DNS 被擋或叢集名稱錯。實測本機 `查到 1 個節點`，
+所以本機的失敗是網路層（沙箱沒有對外 TLS），而不是 DNS。
+
+另外新增 `MongoRecheckLoop`：連不上時**每 5 分鐘重測**，連上就印一則提醒
+（**不自動切換** —— 中途用本機儲存寫入的訂閱組不會自動搬過去，
+自動切換會讓使用者誤以為資料都在雲端）。使用者重啟服務即切換。
+
+> 開埠時機在這裡也幫上忙：健康檢查端點在**連 MongoDB 之前**就啟動，
+> 所以「等 15 秒才知道 Mongo 連不上」不會影響 Render 的健康檢查。
+
+### 19.7 驗證到什麼程度
 
 | 項目 | 狀態 |
 | --- | --- |

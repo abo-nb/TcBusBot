@@ -349,6 +349,42 @@ Connection: close
 | **非 root 使用者寫不進 `/app`** | 預設的相對路徑（`tcbus.db`、`cache/`）會寫失敗 → Dockerfile 設 `TCBUS_DB=/tmp/tcbus.db`、`TCBUS_CACHE=/tmp/tcbus-cache` |
 | **容器檔案系統是暫時的** | 每次重新部署就清空 → **訂閱組請設 `TCBUS_MONGO`**（MongoDB Atlas 免費層足夠） |
 
+### MongoDB 連不上？（雲端部署最常見的問題）
+
+```
+[儲存] 正在連線 MongoDB（mongodb+srv://***@tcbus.xxxxx.mongodb.net/?appName=tcbus，最多等 15 秒）…
+[儲存] ❌ MongoDB 連不上（TimeoutException: A timeout occurred after 15004ms selecting a server…）
+        連線字串 ：mongodb+srv://***@tcbus.xxxxx.mongodb.net/?appName=tcbus
+        SRV 檢查 ：查到 1 個節點（_mongodb._tcp.tcbus.xxxxx.mongodb.net:27017）
+        主機     ：tcbus.xxxxx.mongodb.net
+        請依序檢查：
+          1. ★ Atlas → Network Access（IP 白名單）…
+```
+
+**照順序檢查**（前兩項佔了絕大多數）：
+
+| # | 原因 | 怎麼確認／修 |
+| --- | --- | --- |
+| 1 | **Atlas 的 IP 白名單** | Atlas → Network Access → 加 `0.0.0.0/0`。雲端平台的對外 IP 是動態的，免費方案幾乎只能這樣開 |
+| 2 | 帳密錯 | 密碼含 `@ : / ?` 等字元要 URL encode（用 Atlas 的「Connect」按鈕直接複製最保險） |
+| 3 | 叢集被暫停 | Atlas 介面顯示 `Paused` → 按 Resume，喚醒要幾十秒 |
+| 4 | 字串漏了資料庫名稱 | Atlas 給的字串常是 `…/xxx/?appName=…`（沒有 `/dbname`）。**本程式會用 `TCBUS_MONGO_DB`（預設 `tcbus`）補上，不用自己加** |
+
+**最有效的判別方法**：在**自己的電腦**上用同一個 env 檔跑一次
+
+```powershell
+dotnet run --project src\TcBusBot.Discord -- --env TcBusBot-1.env --data fixture
+```
+
+* 電腦**連得上**、Render **連不上** → 就是第 1 項（白名單）
+* 電腦也連不上 → 看上面的 `SRV 檢查` 那行：查不到節點 = DNS／叢集名稱問題
+* 連不上時 Bot 不會掛掉：退回本機儲存繼續運作，每 5 分鐘重測一次，
+  連上之後會印一則「MongoDB 現在連得到了 → 重啟服務即可切換」
+
+> 伺服器選擇逾時原本設 3 秒 —— 雲端第一次連 Atlas 要經過 DNS SRV → TLS → 複製集探索，
+> 3 秒不夠（你看到的 `TimeoutException … after 2998ms` 就是這個）。
+> 現在放寬成 **連線 10 秒／伺服器選擇 15 秒／Socket 20 秒**。
+
 ### 防休眠（keep-alive）
 
 免費層閒置約 **15 分鐘**就會把服務停掉（下次有人連進來要等幾十秒喚醒）。

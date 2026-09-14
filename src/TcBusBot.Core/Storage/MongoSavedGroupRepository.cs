@@ -33,8 +33,13 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
     public const string CounterCollectionName = "counters";
     public const string CounterId = "saved_groups_seq";
 
-    /// <summary>連不上時不要卡住整個 Bot（3 秒就放棄，讓呼叫端退回本機儲存）。</summary>
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(3);
+    // 連線逾時：**不要設太短**。雲端（Render）連 Atlas 第一次要經過
+    // DNS SRV → TLS 握手 → 複製集探索，3 秒常常不夠（實測就會出現
+    // 「A timeout occurred after 2998ms selecting a server」）。
+    // 也不能太長，否則連不上時啟動會卡很久。
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ServerSelectionTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan SocketTimeout = TimeSpan.FromSeconds(20);
 
     private readonly IMongoCollection<SavedGroupDocument> _groups;
     private readonly IMongoCollection<CounterDocument> _counters;
@@ -46,9 +51,12 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
             throw new ArgumentException("沒有 MongoDB 連線字串", nameof(connectionString));
 
         var settings = MongoClientSettings.FromConnectionString(connectionString);
-        settings.ConnectTimeout = Timeout;
-        settings.ServerSelectionTimeout = Timeout;
-        settings.SocketTimeout = Timeout;
+        settings.ConnectTimeout = ConnectTimeout;
+        settings.ServerSelectionTimeout = ServerSelectionTimeout;
+        settings.SocketTimeout = SocketTimeout;
+
+        // 連不上時不要無止境地重試（啟動時要快點決定用哪個後端）
+        settings.RetryWrites = true;
 
         // 不要在日誌裡印出連線字串（裡面有帳密）
         var client = new MongoClient(settings);
