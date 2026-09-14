@@ -2,6 +2,7 @@ services:
   - type: worker
     name: tcbusbot-discord
     env: docker
+    repo: https://github.com/abo-nb/TcBusBot.git
     region: singapore # 可选: singapore, oregon, frankfurt, ohio (选择离你最近的节点)
     plan: free # 使用免费层级
     
@@ -26,6 +27,6 @@ services:
 
       - key: TCBUS_POLL_INTERVAL
         sync: false 
-        
+
       - key: DOTNET_ENVIRONMENT
         value: Production
