@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: tcbusbot-discord
+    env: docker
+    region: singapore # 可选: singapore, oregon, frankfurt, ohio (选择离你最近的节点)
+    plan: free # 使用免费层级
+    
+    # 关键配置：指定 Dockerfile 相对路径
+    dockerfilePath: src/TcBusBot.Discord/Dockerfile
+    # 指定 Docker 构建上下文路径为根目录（确保能引用到 src/TcBusBot.Core）
+    dockerContext: .
+
+    # 环境变量设置
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false # 表示不会在 yaml 中硬编码，需在 Render Dashboard 手动填入具体 Token
+      - key: DOTNET_ENVIRONMENT
+        value: Production
