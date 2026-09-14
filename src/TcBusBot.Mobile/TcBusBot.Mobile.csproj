@@ -56,6 +56,8 @@
     <RuntimeIdentifiers>android-arm64;android-arm</RuntimeIdentifiers>
 
     <InvariantGlobalization>false</InvariantGlobalization>
+
+    <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
   </PropertyGroup>
 
   <ItemGroup>
@@ -77,6 +79,12 @@
     <!-- 沒有 TDX 金鑰時的離線資料集（與桌面版能力一致） -->
     <AndroidAsset Include="..\..\tests\fixtures\mini\Stops.psv" Link="mini\Stops.psv" />
     <AndroidAsset Include="..\..\tests\fixtures\mini\StopOfRoute.psv" Link="mini\StopOfRoute.psv" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\.dockerignore">
+      <Link>.dockerignore</Link>
+    </Content>
   </ItemGroup>
 
 </Project>

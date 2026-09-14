@@ -8,6 +8,7 @@
     <RootNamespace>TcBusBot.Core</RootNamespace>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
   </PropertyGroup>
 
   <!--
@@ -21,6 +22,12 @@
     <!-- MongoDB 後端（選配：設定了連線字串才會用到）
          3.9.0 在本機 NuGet 快取裡，離線也能建置。 -->
     <PackageReference Include="MongoDB.Driver" Version="3.9.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\.dockerignore">
+      <Link>.dockerignore</Link>
+    </Content>
   </ItemGroup>
 
 </Project>

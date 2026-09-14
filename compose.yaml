@@ -1,0 +1,49 @@
+﻿services:
+  tcbusbot.cli:
+    image: tcbusbot.cli
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Cli/Dockerfile
+
+  tcbusbot.core:
+    image: tcbusbot.core
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Core/Dockerfile
+
+  tcbusbot.discord:
+    image: tcbusbot.discord
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Discord/Dockerfile
+
+  tcbusbot.mobile:
+    image: tcbusbot.mobile
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Mobile/Dockerfile
+
+  tcbusbot.cli-1:
+    image: tcbusbot.cli-1
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Cli/Dockerfile
+
+  tcbusbot.core-1:
+    image: tcbusbot.core-1
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Core/Dockerfile
+
+  tcbusbot.discord-1:
+    image: tcbusbot.discord-1
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Discord/Dockerfile
+
+  tcbusbot.mobile-1:
+    image: tcbusbot.mobile-1
+    build:
+      context: .
+      dockerfile: src/TcBusBot.Mobile/Dockerfile
+
