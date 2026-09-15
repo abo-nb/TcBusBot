@@ -370,6 +370,27 @@ Connection: close
 | 3 | 叢集被暫停 | Atlas 介面顯示 `Paused` → 按 Resume，喚醒要幾十秒 |
 | 4 | 字串漏了資料庫名稱 | Atlas 給的字串常是 `…/xxx/?appName=…`（沒有 `/dbname`）。**本程式會用 `TCBUS_MONGO_DB`（預設 `tcbus`）補上，不用自己加** |
 
+**實測（本機，2026-09）**：同一條連線字串在開發機上完全正常 ——
+`✅ 連線成功（963 ms）`、三個節點 `TCP + TLS` 全成功、
+新增／讀取／還原／改名／計數／刪除全通過。
+所以 **Render 連不上時，幾乎可以確定是 Atlas 的 IP 白名單**（Render 的對外 IP 是動態的）。
+
+用這個指令可以在任何機器上驗同一條連線字串（輸出跟 Bot 用同一套判斷邏輯）：
+
+```powershell
+dotnet run --project src\TcBusBot.Cli -- mongo --env TcBusBot-1.env --write-test
+```
+
+**如果白名單已經開了還是不行**：改用「非 SRV」的標準連線字串
+（有些平台的 DNS 對 SRV 處理不好；參數取自 Atlas 的 TXT 記錄）：
+
+```
+mongodb://<user>:<pass>@ac-eeavuzc-shard-00-00.gbk5wj0.mongodb.net:27017,
+        ac-eeavuzc-shard-00-01.gbk5wj0.mongodb.net:27017,
+        ac-eeavuzc-shard-00-02.gbk5wj0.mongodb.net:27017/TCBUS
+        ?ssl=true&replicaSet=atlas-iw1lln-shard-0&authSource=admin&retryWrites=true&w=majority
+```
+
 **最有效的判別方法**：在**自己的電腦**上用同一個 env 檔跑一次
 
 ```powershell
@@ -668,6 +689,11 @@ dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學
 
 # 逐條說明「哪條路線為什麼被排除」
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口
+
+# 診斷 MongoDB（網路探測 + 連線延遲 + 完整 CRUD 驗證）
+dotnet run --project src\TcBusBot.Cli -- mongo --env TcBusBot-1.env
+dotnet run --project src\TcBusBot.Cli -- mongo --env TcBusBot-1.env --write-test
+dotnet run --project src\TcBusBot.Cli -- mongo "mongodb+srv://…" --db TCBUS_SELFTEST
 
 # Discord UI 離線驗證：把整個互動流程跑一遍並檢查元件是否合法
 dotnet run --project src\TcBusBot.Discord -- --dryrun
