@@ -159,8 +159,27 @@ public static class MongoDiagnostics
         {
             // ⚠️ 一定要挖到最內層：.NET 的 TLS 失敗常常只說
             //    「Authentication failed, see inner exception」，
-            //    真正的答案（SEC_E_NO_CREDENTIALS、憑證錯誤、連線被關…）在最裡面。
-            return $"{target} → {address} → ❌ {RootCause(ex)}";
+            //    真正的答案（白名單、憑證、連線被關…）在最裡面。
+            var cause = RootCause(ex);
+
+            // ★ Atlas 對「不在 Network Access 白名單裡的 IP」的標準反應：
+            //   TCP 連得上、TLS 握手卻被伺服器中止，錯誤是
+            //   `tlsv1 alert internal error`。
+            //   這一點一定要講清楚，不然使用者會以為是 TLS 被中間人攔截。
+            // 同一個原因在不同平台的文字不一樣，所以兩種都比對：
+            //   Linux/OpenSSL：error:0A000438:SSL routines::tlsv1 alert internal error
+            //   Windows/SChannel：Authentication failed because the remote party sent a TLS alert: 'InternalError'
+            if (cause.Contains("alert internal error", StringComparison.OrdinalIgnoreCase)
+                || cause.Contains("InternalError", StringComparison.OrdinalIgnoreCase)
+                || cause.Contains("SSL_ERROR_SSL", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"{target} → {address} → ❌ TLS 被伺服器拒絕" +
+                       $"（{Truncate(cause, 70)}）\n" +
+                       "        ★ 這個訊號幾乎都是 **Atlas IP 白名單沒開**：" +
+                       "TCP 連得上、TLS 卻被中止";
+            }
+
+            return $"{target} → {address} → ❌ {cause}";
         }
     }
 
@@ -189,10 +208,12 @@ public static class MongoDiagnostics
                   主機     ：{host}
                   網路探測 ：{ProbeNetwork(connectionString)}
                   請對照上面的探測結果判斷：
+                    ★ TLS 被伺服器拒絕（tlsv1 alert internal error）
+                      → **Atlas IP 白名單沒開**（TCP 過、TLS 被中止就是這個）
+                        Atlas → Network Access → Add IP → 0.0.0.0/0
                     SRV 查不到 ........................ DNS 被擋／叢集名稱錯／叢集已刪除
                     節點解析不出 IP ................... A 記錄被擋（公司網路常見）
-                    IP 有了但 TCP 連不上 .............. 對外 27017 被擋，或 **Atlas IP 白名單沒開**
-                    TCP 過但 TLS 失敗 ................. TLS 被中間人攔截／憑證問題
+                    IP 有了但 TCP 連不上 .............. 對外 27017 被擋（防火牆）
                     TCP ＋ TLS 都成功 ................. 網路沒問題 → 帳密錯，或叢集被暫停（Atlas 顯示 Paused，按 Resume）
                   補充：
                     • 雲端平台（Render／Heroku…）對外 IP 是動態的，Atlas 幾乎只能允許 0.0.0.0/0

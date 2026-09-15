@@ -170,6 +170,11 @@ public static class Program
         {
             readyTcs.TrySetResult(true);
 
+            // 健康檢查端點會讀這個值（/health 的 discordReady）
+            // ⚠️ 要放在 `if (registered) return;` **之前** —— 否則重新連線後
+            //    這個值就不會再更新（第一次是 true，之後若斷線重連也不會反映）。
+            BotStatus.DiscordReady = true;
+
             if (registered) return;
             registered = true;
 
