@@ -14,6 +14,8 @@ namespace TcBusBot.Cli;
 ///   tcbus selftest                      離線驗收測試（M2 的驗收條件）
 ///   tcbus search 台中車站                模糊站牌搜尋（含建議群組）
 ///   tcbus route 台中車站 靜宜大學         候選集合路線匹配 + 訂閱展開
+///   tcbus diag 台中科技大學 大坑口        診斷「哪條路線為什麼被排除」
+///   tcbus mongo --env TcBusBot-1.env    診斷 MongoDB（--write-test 可做寫入測試）
 ///   tcbus help
 /// </summary>
 public static class Program
@@ -42,6 +44,7 @@ public static class Program
                 "search" => RunSearch(LoadData(fixtures, dataMode, cacheDir), rest),
                 "route" => RunRoute(LoadData(fixtures, dataMode, cacheDir), rest),
                 "diag" => RunDiag(LoadData(fixtures, dataMode, cacheDir), rest),
+                "mongo" => MongoCheck.Run(rest),
                 _ => Unknown(command)
             };
         }
