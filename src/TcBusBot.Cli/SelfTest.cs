@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Net;
+using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Chat;
 using TcBusBot.Core.Storage;
@@ -101,6 +102,9 @@ public static class SelfTest
 
         Section("22. 儲存方案的 DI 註冊（後端選擇、共用實例、生命週期）");
         TestStorageDi();
+
+        Section("23. 模型思考開關（LLM_REASONING：SK 送不出去，所以在 HTTP 層補）");
+        TestReasoning();
 
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
@@ -1632,6 +1636,112 @@ public static class SelfTest
         Check("StorageSettings 說得出自己的模式", settings.Describe().Contains("MongoDB", StringComparison.Ordinal));
         Check("沒有連線字串時預覽寫「存在本機」",
             new StorageSettings("tcbus.db").MongoPreview.Contains("本機", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 模型思考開關（<see cref="ReasoningOffHandler"/>）。
+    ///
+    /// 為什麼要這麼「繞」：SK 這個版本送不出「不要思考」的欄位
+    /// （`ExtensionData` 被忽略、型別化的 `ReasoningEffort` 拒絕 `none`），
+    /// 所以在 HTTP 這一層把欄位補進 JSON。這裡就驗那一段改寫：
+    ///   * 該加的欄位有加（off → 兩種寫法都送）
+    ///   * 不該動的時候一個字都不動（auto／非 chat 路徑／呼叫端自己指定過）
+    ///   * **壞掉的 body 不可以讓對話掛掉**（原樣送出）
+    /// </summary>
+    private static void TestReasoning()
+    {
+        // ── 1) 欄位對應（純函式）──────────────────────────
+        var off = LlmOptions.ReasoningFields("off");
+        Check("★ off → 送 reasoning_effort=none（OpenAI 系寫法）",
+            off.TryGetValue("reasoning_effort", out var effort) && (string?)effort == "none");
+        Check("★ off → 同時送 thinking={type:disabled}（Anthropic 系寫法）",
+            off.TryGetValue("thinking", out var thinking)
+            && thinking is Dictionary<string, object?> { } dict
+            && dict["type"] as string == "disabled");
+
+        Check("auto → 什麼都不加（用服務端預設）", LlmOptions.ReasoningFields("auto").Count == 0);
+        Check("沒設定（null）→ 預設就是關閉思考", LlmOptions.ReasoningFields(null).Count == 2);
+
+        var high = LlmOptions.ReasoningFields("high");
+        Check("high → 只送 reasoning_effort=high（不硬關思考）",
+            high.Count == 1 && (string?)high["reasoning_effort"] == "high",
+            string.Join(",", high.Keys));
+
+        Check("描述文字分得出「已關閉」與「服務端預設」",
+            new LlmOptions { Reasoning = "off" }.ReasoningDescription.Contains("已關閉", StringComparison.Ordinal)
+            && new LlmOptions { Reasoning = "auto" }.ReasoningDescription.Contains("預設", StringComparison.Ordinal));
+
+        // ── 2) HTTP 改寫（用假的 handler 攔下送出的內容）────
+        string? sent = null;
+        string? sentPath = null;
+
+        async Task<string?> Send(string url, string body, LlmOptions options)
+        {
+            sent = null;
+            sentPath = null;
+
+            var handler = new ReasoningOffHandler(options) { InnerHandler = new CaptureHandler(body, captured => sent = captured) };
+            using var http = new HttpClient(handler);
+
+            await http.PostAsync(url, new StringContent(body, Encoding.UTF8, "application/json"));
+            sentPath ??= url;
+            return sent;
+        }
+
+        const string chatUrl = "https://api.example.com/v1/chat/completions";
+        const string chatBody = """{"model":"m","messages":[{"role":"user","content":"hi"}]}""";
+
+        var offBody = Send(chatUrl, chatBody, new LlmOptions { Reasoning = "off" }).GetAwaiter().GetResult();
+        Check("★ 送出去的 JSON 真的被補上了 reasoning_effort=none",
+            offBody?.Contains("\"reasoning_effort\":\"none\"", StringComparison.Ordinal) == true, offBody);
+        Check("★ 也補上了 thinking",
+            offBody?.Contains("\"thinking\":{\"type\":\"disabled\"}", StringComparison.Ordinal) == true);
+        Check("原本的內容沒有被動到（model／messages 還在）",
+            offBody?.Contains("\"model\":\"m\"", StringComparison.Ordinal) == true
+            && offBody?.Contains("content", StringComparison.Ordinal) == true);
+
+        var autoBody = Send(chatUrl, chatBody, new LlmOptions { Reasoning = "auto" }).GetAwaiter().GetResult();
+        Check("★ auto → 一個字都沒改", autoBody == chatBody, autoBody);
+
+        var highBody = Send(chatUrl, chatBody, new LlmOptions { Reasoning = "high" }).GetAwaiter().GetResult();
+        Check("high → 送 reasoning_effort=high 而且不送 thinking",
+            highBody?.Contains("\"reasoning_effort\":\"high\"", StringComparison.Ordinal) == true
+            && highBody?.Contains("thinking", StringComparison.Ordinal) != true);
+
+        var modelsBody = Send("https://api.example.com/v1/models", chatBody, new LlmOptions { Reasoning = "off" })
+            .GetAwaiter().GetResult();
+        Check("★ 非 chat 路徑（/models）不動它", modelsBody == chatBody);
+
+        // 呼叫端自己指定過就不要覆蓋
+        var explicitBody = Send(chatUrl, """{"model":"m","reasoning_effort":"high"}""", new LlmOptions { Reasoning = "off" })
+            .GetAwaiter().GetResult();
+        Check("★ 呼叫端已經指定 reasoning_effort → 不覆蓋（尊重呼叫端）",
+            explicitBody?.Contains("\"reasoning_effort\":\"high\"", StringComparison.Ordinal) == true, explicitBody);
+
+        // ── 3) 壞掉的 body 不可以讓對話掛掉 ────────────────
+        var brokenBody = Send(chatUrl, "這不是 JSON", new LlmOptions { Reasoning = "off" }).GetAwaiter().GetResult();
+        Check("★ body 不是 JSON → 原樣送出、不丟例外", brokenBody == "這不是 JSON", brokenBody);
+
+        var emptyBody = Send(chatUrl, "", new LlmOptions { Reasoning = "off" }).GetAwaiter().GetResult();
+        Check("空 body 也不會壞", emptyBody == "");
+
+        // ── 4) 不會誤判形狀 ──────────────────────────────
+        Check("JSON 不是物件（例如陣列）→ 不改",
+            ReasoningOffHandler.Patch("[1,2,3]", LlmOptions.ReasoningFields("off")) is null);
+        Check("不需要改時回傳 null（呼叫端就知道不用換 Content）",
+            ReasoningOffHandler.Patch("""{"reasoning_effort":"x"}""",
+                                      new Dictionary<string, object?> { ["reasoning_effort"] = "none" }) is null);
+    }
+
+    /// <summary>攔下送出的 body（模擬 HTTP 層，不需要網路）。</summary>
+    private sealed class CaptureHandler(string responseBody, Action<string> capture) : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            capture(request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken));
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(responseBody) };
+        }
     }
 
     /// <summary>

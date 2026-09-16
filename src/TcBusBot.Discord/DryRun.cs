@@ -1423,6 +1423,10 @@ public static class DryRun
         Console.WriteLine($"  端點：{llm.BaseUrl}");
         Console.WriteLine($"  金鑰：{llm.MaskedKey}");
         Console.WriteLine($"  每週上限：{(llm.WeeklyTokenLimit > 0 ? $"{llm.WeeklyTokenLimit:N0} tokens" : "不限（0）")}");
+        Console.WriteLine($"  模型思考：{llm.ReasoningDescription}" +
+                          (llm.Reasoning.Trim().ToLowerInvariant() is "auto"
+                              ? "（⚠️ 思考會吃掉輸出額度又算錢：實測同一個問題 out 660 → 20 tokens）"
+                              : ""));
         Console.WriteLine($"  時間切段：超過 {llm.SegmentGapMinutes} 分鐘算新的一段" +
                           $"（話題判斷：{(llm.TopicDetect ? "交給 LLM" : "關閉")}）");
         Console.WriteLine($"  上下文：最多 {llm.MaxContextTurns} 則／約 {llm.MaxContextTokens} tokens" +

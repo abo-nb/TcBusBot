@@ -2378,7 +2378,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 350 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具…）
+    └─ SelfTest.cs                      ★ 367 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2388,7 +2388,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 350 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 367 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3073,6 +3073,41 @@ Discord/BusToolProvider       每次提問現做一份 plugin（帶著「誰在�
 * 程式透過 `SettingResolver` 問過的每個鍵（含別名，見 `SettingResolver.SeenKeys`）
   → 一定要出現在 CSV 裡，否則視為問題
 * CSV 裡寫了但程式沒用到的 → 印出來提醒（可能是別的平台用的，或說明過期）
+
+### 20.10 關掉模型思考（`LLM_REASONING`）
+
+這個用途不需要 reasoning，而思考**會吃掉輸出額度又算錢**。實測同一個問題：
+
+| 設定 | 輸出 tokens | 回覆長度 |
+| --- | --- | --- |
+| `LLM_REASONING=auto` | **660** | 23 字 |
+| `LLM_REASONING=off`（預設） | **20** | 27 字 |
+
+**怎麼送出去（三個實驗的結論）**：
+
+| 方法 | 結果 |
+| --- | --- |
+| `OpenAIPromptExecutionSettings.ExtensionData["reasoning_effort"]` | ❌ **SK 1.66 直接忽略**（決定性實驗：`ExtensionData["n"]=2`，回應仍只有 1 則） |
+| `OpenAIPromptExecutionSettings.ReasoningEffort = "none"` | ❌ `NotSupportedException: The provided reasoning effort 'none' is not supported` |
+| `reasoning_effort: "minimal"`（SK 接受的值） | ❌ 端點仍會思考（24 reasoning tokens） |
+| **`DelegatingHandler` 改寫送出的 JSON** | ✅ 有效，而且 SK 的 kernel／plugin／自動工具呼叫完全不用動 |
+
+**哪些欄位有效（實測 `deepseek-flash`，baseline 31 reasoning tokens）**：
+
+| 欄位 | 結果 |
+| --- | --- |
+| `reasoning_effort: "none"` | ✅ reasoning tokens 消失（OpenAI 系寫法） |
+| `thinking: {"type":"disabled"}` | ✅ reasoning tokens 消失（Anthropic 系寫法） |
+| `enable_thinking: false` / `reasoning: {enabled:false}` / `chat_template_kwargs` / `thinking_budget: 0` | ❌ 全部無效 |
+
+所以 `ReasoningOffHandler`（`Core/Chat/ReasoningOffHandler.cs`）在 `off` 模式**同時送兩種寫法**，並且：
+
+* 只碰 `POST …/chat/completions`，其他路徑（例如 `/models`）一個字都不動
+* 呼叫端已經指定過的欄位**不覆蓋**
+* 任何意外（body 不是 JSON、空 body、解析失敗）→ **原樣送出**：關掉思考只是省錢，不該讓對話壞掉
+
+驗收：`tcbus selftest` 第 23 節（**17 項**，用假的 HttpMessageHandler 攔下送出的 body 來驗，
+完全不需要網路）＋ 真實 API 實測（思考關掉後**工具呼叫與話題判斷都仍然正常**）。
 
 ---
 

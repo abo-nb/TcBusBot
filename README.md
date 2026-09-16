@@ -17,7 +17,7 @@
 | --- | --- |
 | M0 專案骨架 | ✅ |
 | M1 TDX 資料模型與解析 | ✅ |
-| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 350 項離線驗收測試全過 || **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
+| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 367 項離線驗收測試全過 || **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
 | M4 即時輪詢 | ✅ 程式完成（輪詢迴圈 + 到站時間總表），實際運作需 TDX 金鑰 |
 | **M7 Android APK**（掛在舊手機上） | ⏸ **擱置**（已實機驗證過，程式碼留著；改用 Render） |
 | **M10 Render 部署** | ✅ 健康檢查端點 + 防休眠 + Dockerfile + `render.yaml`（端點有離線測試） |
@@ -346,6 +346,20 @@ Bot ：（只用 find_routes 查詢，沒有建立訂閱）✅
 > 開著工具時每次提問的輸入 token 約 1,500～1,900（工具定義本身要送出去），
 > 關掉約 200。以 30 萬/週來看，開著大約可以問 150～180 次。
 
+#### 不需要「思考」（預設已關掉）
+
+這個用途（聊天、訂閱公車、判斷換話題）不需要模型的 reasoning，而思考**會吃掉輸出額度又算錢**：
+實測同一個問題，`LLM_REASONING=auto` 是 **out 660 tokens**，`off` 只要 **out 20 tokens**（33 倍）。
+
+`LLM_REASONING` 預設 `off`，運作方式是在送出的 JSON 補上
+`reasoning_effort: "none"` ＋ `thinking: {"type":"disabled"}`（兩種寫法實測都有效，
+其他候選如 `enable_thinking`／`reasoning.enabled`／`chat_template_kwargs`／`thinking_budget` 實測**無效**）。
+
+> 為什麼要動到 HTTP 這一層？因為 Semantic Kernel 這個版本**送不出**這些欄位
+> （`ExtensionData` 會被忽略 —— 用 `n=2` 做決定性實驗只有 1 則回覆；
+> 型別化的 `ReasoningEffort` 又直接拒絕 `none`）。細節寫在 `ReasoningOffHandler` 的註解裡。
+> 換到不認識這些欄位的服務時，設 `LLM_REASONING=auto` 就好。
+
 #### 上下文的相關環境變數
 
 | 鍵 | 預設 | 說明 |
@@ -359,6 +373,7 @@ Bot ：（只用 find_routes 查詢，沒有建立訂閱）✅
 | `LLM_API_KEY` | — | **有填才會啟用**（別名：`OPENAI_API_KEY`、`DEEPSEEK_API_KEY`） |
 | `LLM_BASE_URL` | `https://api.deepseek.com/v1` | 任何 OpenAI 相容端點（要含 `/v1`） |
 | `LLM_MODEL` | `deepseek-flash` | 模型名稱 |
+| `LLM_REASONING` | `off` | 模型要不要「思考」。`off` 最省（實測同一個問題 out 660 → 20 tokens）、`auto` 用服務端預設、`low`／`medium`／`high` 明確要思考 |
 | `LLM_WEEKLY_TOKENS` | `300000` | 每週 token 上限（全域；`0` = 不限） |
 | `LLM_SEGMENT_GAP_MINUTES` | `30` | 超過幾分鐘沒說話就當成新的一段 |
 | `LLM_TOPIC_DETECT` | `true` | 時間內是否讓 LLM 判斷「換話題了沒」 |
@@ -869,7 +884,7 @@ TDX 公車 v2 的公式是 **`呼叫次數 / 1,500` ＋ `回傳資料量(MB) / 1
 沒有 Discord Token 的情況下完整測試。
 
 ```powershell
-# 350 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端與 DI 註冊、.env 路徑、合併與復原、結束追蹤、AI 聊天切段與每週額度、LLM 工具訂閱、SQLite 持久化
+# 367 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端與 DI 註冊、.env 路徑、合併與復原、結束追蹤、AI 聊天切段與每週額度、LLM 工具訂閱、模型思考開關、SQLite 持久化
 dotnet run --project src\TcBusBot.Cli -- selftest
 
 # 模糊站牌搜尋

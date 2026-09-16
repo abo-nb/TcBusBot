@@ -63,7 +63,23 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
         try
         {
             // 自己管 HttpClient：逾時要能控制（預設 100 秒太久，使用者會以為當掉）
-            var http = new HttpClient { Timeout = TimeSpan.FromSeconds(Math.Max(5, options.RequestTimeoutSeconds)) };
+            //
+            // ⚠️ 這裡多掛一層 ReasoningOffHandler：SK 這個版本**送不出**
+            //    「不要思考」的欄位（詳見該類別的說明，有三個實驗的結果），
+            //    所以在 HTTP 這一層把它補進 JSON。任何意外都原樣送出，不影響對話。
+            HttpMessageHandler inner = new HttpClientHandler();
+            var pipeline = ReasoningOffHandler.CreateIfNeeded(options);
+
+            if (pipeline is not null)
+            {
+                pipeline.InnerHandler = inner;
+                inner = pipeline;
+            }
+
+            var http = new HttpClient(inner)
+            {
+                Timeout = TimeSpan.FromSeconds(Math.Max(5, options.RequestTimeoutSeconds))
+            };
 
             var builder = Kernel.CreateBuilder();
             builder.AddOpenAIChatCompletion(

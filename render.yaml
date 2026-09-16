@@ -85,6 +85,9 @@ services:
       # 讓 LLM 用工具真的幫使用者訂閱公車（設 false 就只剩聊天）
       - key: LLM_TOOLS
         value: "true"
+      # 模型思考：off 最省 token（實測同一個問題 out 660 → 20 tokens）
+      - key: LLM_REASONING
+        value: "off"
 
       - key: DOTNET_ENVIRONMENT
         value: Production

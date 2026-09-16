@@ -33,6 +33,50 @@ public sealed class LlmOptions
     /// </summary>
     public bool ToolsEnabled { get; set; } = true;
 
+    /// <summary>
+    /// 要不要讓模型「思考」（reasoning／thinking）。
+    ///
+    /// 這個用途（聊天、訂閱公車、判斷換話題）不需要思考，而思考會**吃掉輸出額度又算錢**
+    /// （實測：`1+1=?` 這種問題也花了 31 個 reasoning tokens，設 `max_tokens=100` 時
+    /// 80 個都被思考用掉、回覆還被截斷）。
+    ///
+    /// | 值 | 行為 |
+    /// | --- | --- |
+    /// | `off`（預設） | 送出 `reasoning_effort: "none"` ＋ `thinking: {"type":"disabled"}`（實測有效） |
+    /// | `auto` | 完全不動，用服務端的預設值（換到不認識這些欄位的服務時設這個） |
+    /// | `low` / `medium` / `high` | 只送 `reasoning_effort: <值>`（明確要思考時） |
+    /// </summary>
+    public string Reasoning { get; set; } = "off";
+
+    /// <summary>轉成要注入請求 JSON 的欄位（純函式，可離線測試；空 = 什麼都不加）。</summary>
+    public static IReadOnlyDictionary<string, object?> ReasoningFields(string? reasoning)
+        => (reasoning ?? "off").Trim().ToLowerInvariant() switch
+        {
+            // 兩個都送：實測這個端點兩種寫法都認（OpenAI 系與 Anthropic 系各一種）
+            "off" or "none" or "false" or "0" => new Dictionary<string, object?>
+            {
+                ["reasoning_effort"] = "none",
+                ["thinking"] = new Dictionary<string, object?> { ["type"] = "disabled" }
+            },
+
+            "low" or "medium" or "high" => new Dictionary<string, object?>
+            {
+                ["reasoning_effort"] = reasoning!.Trim().ToLowerInvariant()
+            },
+
+            // auto / 其他任何值 → 不注入
+            _ => new Dictionary<string, object?>()
+        };
+
+    /// <summary>給橫幅與 `/ai status` 看的一行說明。</summary>
+    public string ReasoningDescription => Reasoning.Trim().ToLowerInvariant() switch
+    {
+        "off" or "none" or "false" or "0" => "已關閉（省 token）",
+        "low" or "medium" or "high" => $"reasoning_effort={Reasoning.Trim().ToLowerInvariant()}",
+        _ => "服務端預設"
+    };
+
+
     /// <summary>帶進提示詞的歷史上限（則）。</summary>
     public int MaxContextTurns { get; set; } = 20;
 
@@ -107,7 +151,8 @@ public sealed class LlmOptions
     public string Describe()
         => IsConfigured
             ? $"{Model} @ {EndpointHost}（每週上限 " +
-              (WeeklyTokenLimit > 0 ? $"{WeeklyTokenLimit:N0} tokens" : "不限") + "）"
+              (WeeklyTokenLimit > 0 ? $"{WeeklyTokenLimit:N0} tokens" : "不限") +
+              $"，思考：{ReasoningDescription}）"
             : "未啟用（沒有 LLM_API_KEY）";
 
     public LlmOptions Clone() => (LlmOptions)MemberwiseClone();
