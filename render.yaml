@@ -88,6 +88,16 @@ services:
       # 模型思考：off 最省 token（實測同一個問題 out 660 → 20 tokens）
       - key: LLM_REASONING
         value: "off"
+      # 讓模型看到「誰在說話」（暱稱 ＋ ID）與允許它 @ 使用者
+      - key: LLM_EXPOSE_IDS
+        value: "true"
+      - key: LLM_ALLOW_MENTIONS
+        value: "true"
+      # 「主人」授權：名單 ＋ 訊息裡必須帶的特殊 key（兩個都設才會生效）
+      - key: LLM_ADMIN_IDS
+        sync: false
+      - key: LLM_ADMIN_KEY
+        sync: false
 
       - key: DOTNET_ENVIRONMENT
         value: Production

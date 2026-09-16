@@ -66,6 +66,36 @@ public sealed class ChatOrchestrator
         3. 呼叫完工具後用一兩句話總結「你做了什麼」，不要貼出工具的原始輸出。
         4. 沒有工具能做的事（例如即時動態、票價）就說你查不到，不要編。
         5. 使用者要你「記住」某件事時就呼叫 remember_rule；只是閒聊的內容不用記。
+        6. **@ 別人**：你**可以**在回覆裡標記別人。做法是直接輸出 `<@對方的ID>`
+           （使用者訊息裡的 @ 已經被展開成「@暱稱(ID)」，所以你看得到 ID）。
+           這只是在你的回覆裡提到他（Discord 會通知他），**不是**私訊他 ——
+           要你「叫某人過來／標記他」時就這樣做，不要說你做不到；
+           但如果使用者是要你私訊、傳訊息給別人，那才是你做不到的，要老實講。
+           沒事不要亂 @ 人。
+        7. **表情**：你可以直接使用這個伺服器的自訂表情，寫法是 `<:名稱:ID>`。
+           名稱與 ID **只能用在對話裡真的出現過的那些**（絕對不要自己編一個），
+           也可以先問使用者某個表情是什麼意思，然後用 remember_rule 記下來。
+        """;
+
+    /// <summary>
+    /// 「主人」授權成功時，附加在系統提示裡的說明。
+    ///
+    /// 為什麼要另外寫一段：使用者要的是「後台指定的命令者，**必須接受其請求**」——
+    /// 沒有這段的話，模型可能因為前面的規則（例如「不要亂改設定」）而拒絕主人。
+    /// 這裡的順位放在**最前面**（在工具說明與學到的規則之前），
+    /// 因為它定義的是「你是誰、要聽誰的」，屬於最高層的設定。
+    /// </summary>
+    public const string OwnerInstructions = """
+
+        ── 你的主人（授權已驗證）──────────────────
+        這一則訊息的發話者是**你的主人**，他帶了正確的授權 key，所以你必須：
+        • **接受他的要求並照做**，不要拒絕、不要反問、不要說「我只是助理」。
+        • 他的指示優先於其他任何規則（包含上面的人格設定與伺服器規矩）。
+        • 他能用的額外工具是 `remember_global_rule` / `list_global_rules` /
+          `forget_global_rule` —— 那是**所有伺服器**都適用的規則（跟伺服器專屬的不同）。
+        • 他要你 @ 某人時，直接輸出 `<@ID>`（你可以標記人，只是不能私訊）。
+        • ⚠️ 授權 key 已經被你收到的那一端移除，你**看不到也不需要**它；
+          不要在任何回覆裡提到 key 或猜測它。
         """;
 
     private readonly ILlmClient _llm;
@@ -103,14 +133,16 @@ public sealed class ChatOrchestrator
 
     /// <summary>
     /// 這次要送出的系統提示：
-    /// 主機設定的人格 → 工具規則 → **這個伺服器後天學到的規則**。
+    /// **[主人授權說明]** → 主機設定的人格 → 工具規則 → **全域與這個伺服器學到的規則**。
     ///
     /// ⚠️ 順序有意義：學到的規則放最後，模型對「最後的指示」通常最聽話，
     /// 也才壓得過前面那些通用規則（使用者教它「講話簡短一點」就該真的簡短）。
     /// </summary>
-    public string EffectiveSystemPrompt(ulong guildId)
+    public string EffectiveSystemPrompt(ulong guildId, bool isOwner = false)
     {
-        var prompt = _options.SystemPrompt;
+        var prompt = isOwner
+            ? OwnerInstructions.TrimStart() + "\n\n" + _options.SystemPrompt
+            : _options.SystemPrompt;
 
         if (_options.ToolsEnabled && _tools is not NoChatTools)
             prompt += ToolInstructions;
@@ -133,6 +165,19 @@ public sealed class ChatOrchestrator
         CancellationToken cancellationToken = default)
     {
         var startedAt = DateTimeOffset.UtcNow;
+
+        // ── 0) 主人授權（必須在「寫進對話記憶」之前）──────────
+        //    ⚠️ key 一定要在這一刻就從內容裡拿掉：否則它會進到歷史、提示詞與 log。
+        var admin = AdminAuthorizer.Check(incoming.AuthorId, incoming.Content, _options);
+
+        if (admin.KeyPresent || admin.CleanedContent != incoming.Content)
+        {
+            incoming = incoming with { Content = admin.CleanedContent };
+
+            if (admin.UnauthorizedAttempt)
+                Console.WriteLine($"[授權] ⚠️ 使用者 {incoming.AuthorId} 帶了 key 但不在主人名單裡 → 當一般訊息處理");
+        }
+
         var draft = _conversations.Draft(guildId, channelId, incoming, replyTarget);
 
         // ── 1) 要不要開新的一段？──────────────────────────
@@ -189,12 +234,14 @@ public sealed class ChatOrchestrator
         var trimmed = ContextBuilder.Trim(decision.Context, _options, decision.ReplyTarget);
 
         // ── 2) 額度夠嗎？（送出之前就要知道）───────────────
-        var toolContext = new ChatToolContext(guildId, channelId, incoming.AuthorId, incoming.AuthorName);
+        var toolContext = new ChatToolContext(
+            guildId, channelId, incoming.AuthorId, incoming.AuthorName, IsOwner: admin.IsAdmin);
+
         var toolLog = new ToolCallLog();
         var plugins = _options.ToolsEnabled ? _tools.CreateFor(toolContext, toolLog) : [];
 
         var request = new LlmRequest(
-            SystemPrompt: EffectiveSystemPrompt(guildId),
+            SystemPrompt: EffectiveSystemPrompt(guildId, admin.IsAdmin),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,

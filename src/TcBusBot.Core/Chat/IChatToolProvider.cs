@@ -7,13 +7,15 @@ public sealed record ChatToolContext(
     ulong GuildId,
     ulong ChannelId,
     ulong UserId,
-    string UserName)
+    string UserName,
+    bool IsOwner = false)
 {
     /// <summary>私訊（沒有伺服器）。</summary>
     public bool IsDirectMessage => GuildId == 0;
 
     public string Describe()
-        => $"{(IsDirectMessage ? "私訊" : $"伺服器 {GuildId}")}／頻道 {ChannelId}／{UserName}（{UserId}）";
+        => $"{(IsDirectMessage ? "私訊" : $"伺服器 {GuildId}")}／頻道 {ChannelId}／{UserName}（{UserId}）" +
+           (IsOwner ? "／主人授權" : "");
 }
 
 /// <summary>

@@ -39,6 +39,16 @@ public sealed class GuildPersonaStore
     /// <summary>持久化用的鍵名（與每週用量共用同一個 blob 區）。</summary>
     public const string BlobKey = "guild_personas";
 
+    /// <summary>
+    /// 「全域」規則的桶子（主人的指令）。
+    ///
+    /// 為什麼要跟伺服器分開：使用者要的是「**只限那個伺服器**」，
+    /// 但主人（後台指定的 ID ＋ 特殊 key）應該能改**所有伺服器都適用**的規則。
+    /// `/rest` 只清伺服器那一份，不會動到全域（不然主人在 A 伺服器打 `/rest`
+    /// 就把全體規則清掉了）。
+    /// </summary>
+    public const string GlobalKey = "*";
+
     private readonly ILlmStateStore? _store;
     private readonly object _gate = new();
 
@@ -50,15 +60,25 @@ public sealed class GuildPersonaStore
         Load();
     }
 
-    /// <summary>學到了幾條（全部伺服器加起來）——`/ai status` 用。</summary>
+    /// <summary>學到了幾條（全部伺服器加起來，不含全域）——`/ai status` 用。</summary>
     public int TotalLines
     {
-        get { lock (_gate) return _lines.Values.Sum(v => v.Count); }
+        get { lock (_gate) return _lines.Where(kv => kv.Key != GlobalKey).Sum(kv => kv.Value.Count); }
     }
 
     public int GuildCount
     {
-        get { lock (_gate) return _lines.Count; }
+        get { lock (_gate) return _lines.Count(kv => kv.Key != GlobalKey); }
+    }
+
+    /// <summary>主人指定的全域規則（所有伺服器都適用）。</summary>
+    public IReadOnlyList<string> GlobalLines
+    {
+        get
+        {
+            lock (_gate)
+                return _lines.TryGetValue(GlobalKey, out var list) ? list.ToList() : [];
+        }
     }
 
     public IReadOnlyList<string> Lines(ulong guildId)
@@ -69,22 +89,44 @@ public sealed class GuildPersonaStore
 
     /// <summary>
     /// 要接在系統提示後面的內容（沒有學到東西時回傳空字串）。
+    ///
+    /// 順序：**全域（主人）→ 伺服器**。主人的規則放前面，伺服器自己的規則緊接著，
+    /// 兩者都在「工具說明」之後（對最後的指示最聽話）。
     /// </summary>
     public string Overlay(ulong guildId)
     {
-        var lines = Lines(guildId);
-        if (lines.Count == 0) return "";
+        var global = GlobalLines;
+        var local = Lines(guildId);
+
+        if (global.Count == 0 && local.Count == 0) return "";
 
         var sb = new StringBuilder();
         sb.AppendLine();
         sb.AppendLine();
-        sb.AppendLine("── 這個伺服器後天學到的規則（由伺服器成員或你自己加上去的）──");
-        sb.AppendLine("（這些是**這個伺服器專屬**的偏好與知識。 Discord 的自訂表情名稱只有在這裡才有意義。）");
 
-        foreach (var line in lines)
+        if (global.Count > 0)
         {
-            if (sb.Length + line.Length > MaxOverlayLength) break;
-            sb.AppendLine($"• {line}");
+            sb.AppendLine("── 全域規則（由 Bot 的主人指定，所有伺服器都適用）──");
+
+            foreach (var line in global)
+            {
+                if (sb.Length + line.Length > MaxOverlayLength) break;
+                sb.AppendLine($"• {line}");
+            }
+
+            if (local.Count > 0) sb.AppendLine();
+        }
+
+        if (local.Count > 0)
+        {
+            sb.AppendLine("── 這個伺服器後天學到的規則（由伺服器成員或你自己加上去的）──");
+            sb.AppendLine("（這些是**這個伺服器專屬**的偏好與知識。 Discord 的自訂表情名稱只有在這裡才有意義。）");
+
+            foreach (var line in local)
+            {
+                if (sb.Length + line.Length > MaxOverlayLength) break;
+                sb.AppendLine($"• {line}");
+            }
         }
 
         return sb.ToString().TrimEnd();
@@ -101,6 +143,15 @@ public sealed class GuildPersonaStore
 
     /// <summary>加一條規則（AI 自己學到的、或使用者教的都走這裡）。</summary>
     public LearnResult Learn(ulong guildId, string? text)
+        => LearnInto(Key(guildId), text, evict: true);
+
+    /// <summary>
+    /// 加一條**全域**規則（只有通過主人授權的請求能用）。
+    /// 不會被 <see cref="Reset"/> 清掉 —— 那是伺服器層級的重設。
+    /// </summary>
+    public LearnResult LearnGlobal(string? text) => LearnInto(GlobalKey, text, evict: false);
+
+    private LearnResult LearnInto(string key, string? text, bool evict)
     {
         var clean = Clean(text);
         if (clean.Length == 0) return LearnResult.Empty;
@@ -108,15 +159,16 @@ public sealed class GuildPersonaStore
 
         lock (_gate)
         {
-            var key = Key(guildId);
-
             if (!_lines.TryGetValue(key, out var list))
             {
-                // 太多伺服器時淘汰「最少條」的那個（通常是最不常用）
-                if (_lines.Count >= MaxGuilds)
+                // 太多伺服器時淘汰「最少條」的那個（通常是很少用的）
+                if (evict && _lines.Count(kv => kv.Key != GlobalKey) >= MaxGuilds)
                 {
-                    var victim = _lines.OrderBy(kv => kv.Value.Count).ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                    var victim = _lines.Where(kv => kv.Key != GlobalKey)
+                                       .OrderBy(kv => kv.Value.Count)
+                                       .ThenBy(kv => kv.Key, StringComparer.Ordinal)
                                        .First().Key;
+
                     _lines.Remove(victim);
                 }
 
@@ -134,13 +186,18 @@ public sealed class GuildPersonaStore
     }
 
     /// <summary>依關鍵字刪掉符合的規則（找不到就回傳 0）。</summary>
-    public int Forget(ulong guildId, string? match)
+    public int Forget(ulong guildId, string? match) => ForgetIn(Key(guildId), match);
+
+    /// <summary>依關鍵字刪掉全域規則（主人限定）。</summary>
+    public int ForgetGlobal(string? match) => ForgetIn(GlobalKey, match);
+
+    private int ForgetIn(string key, string? match)
     {
         var needle = (match ?? "").Trim();
 
         lock (_gate)
         {
-            if (!_lines.TryGetValue(Key(guildId), out var list)) return 0;
+            if (!_lines.TryGetValue(key, out var list)) return 0;
 
             var removed = needle.Length == 0
                 ? list.Count
@@ -151,7 +208,11 @@ public sealed class GuildPersonaStore
         }
     }
 
-    /// <summary>清掉這個伺服器學到的全部內容，回傳被清掉的內容（讓使用者可以複製回去）。</summary>
+    /// <summary>
+    /// 清掉這個伺服器學到的全部內容，回傳被清掉的內容（讓使用者可以複製回去）。
+    ///
+    /// ⚠️ **不會動到全域規則** —— 那是主人的，不該因為某個伺服器打了 `/rest` 就消失。
+    /// </summary>
     public IReadOnlyList<string> Reset(ulong guildId)
     {
         List<string> removed;
@@ -171,9 +232,13 @@ public sealed class GuildPersonaStore
     public string Describe(ulong guildId)
     {
         var count = Lines(guildId).Count;
-        return count == 0
+        var global = GlobalLines.Count;
+
+        var local = count == 0
             ? "還沒學到東西（可以教它，例如「講話再簡短一點」或「<表情> 是 什麼意思」）"
             : $"已學到 {count}/{MaxLinesPerGuild} 條（這個伺服器專用）";
+
+        return global == 0 ? local : $"{local}｜另有 {global} 條全域規則（主人指定）";
     }
 
     // ─────────────────────────────────────────────────────
@@ -202,8 +267,7 @@ public sealed class GuildPersonaStore
                 _lines.Clear();
                 foreach (var (key, value) in loaded)
                     if (value is { Count: > 0 }) _lines[key] = value.Take(MaxLinesPerGuild).ToList();
-            }
-        }
+            }        }
         catch (Exception ex)
         {
             BotLog.Warn($"[人格] 讀不到學到的規則（{ex.GetType().Name}），這次從空的開始");

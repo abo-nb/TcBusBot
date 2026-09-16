@@ -147,6 +147,15 @@ public sealed class LlmChatService : IDisposable
 
         var text = StripMention(raw, botId).Trim();
 
+        // 把「@某人」展開成「@暱稱(ID)」：模型原本只看到 <@123456789>，不知道那是誰。
+        // （Discord 的 mention 有 <@id>、<@!id> 兩種寫法，純函式在 Core 裡可測）
+        var mentions = userMessage.MentionedUsers
+            .Where(u => u.Id != botId)
+            .GroupBy(u => u.Id)
+            .ToDictionary(g => g.Key, g => DisplayNameOf(g.First()));
+
+        text = MentionFormatter.Expand(text, mentions, _options.ExposeUserIds);
+
         if (text.Length == 0)
         {
             await SafeReplyAsync(userMessage, "要問什麼呢？（直接 @ 我然後打訊息就好）");
@@ -190,7 +199,12 @@ public sealed class LlmChatService : IDisposable
             message.Author.Id,
             message.Id,
             text,
-            message.Timestamp.ToUniversalTime());
+            message.Timestamp.ToUniversalTime(),
+            PromptLabel: MentionFormatter.Label(
+                DisplayNameOf(message.Author),
+                message.Author.Username,
+                message.Author.Id,
+                _options.ExposeUserIds));
 
         var replyTarget = referenced is null ? null : ToTurn(referenced, _client.CurrentUser?.Id ?? 0);
         var where = DescribeWhere(guildId, message);
@@ -251,15 +265,19 @@ public sealed class LlmChatService : IDisposable
 
         var chunks = Split(replyText, MaxChunkChars);
         IMessage? sent = null;
+        var allowedMentions = ReplyMentions();
 
         for (var i = 0; i < chunks.Count; i++)
         {
             var isLast = i == chunks.Count - 1;
 
             sent = i == 0
-                ? await message.ReplyAsync(chunks[i], components: isLast ? components : null)
-                : await message.Channel.SendMessageAsync(
-                    chunks[i], components: isLast ? components : null);
+                ? await message.ReplyAsync(chunks[i],
+                    allowedMentions: allowedMentions,
+                    components: isLast ? components : null)
+                : await message.Channel.SendMessageAsync(chunks[i],
+                    allowedMentions: allowedMentions,
+                    components: isLast ? components : null);
         }
 
         // 把 Bot 的回覆記進同一段（附上真正的訊息 ID）
@@ -320,7 +338,26 @@ public sealed class LlmChatService : IDisposable
             message.Author.Id,
             message.Id,
             message.Content ?? "",
-            message.Timestamp.ToUniversalTime());
+            message.Timestamp.ToUniversalTime(),
+            PromptLabel: MentionFormatter.Label(
+                DisplayNameOf(message.Author), message.Author.Username, message.Author.Id, includeId: true));
+
+    /// <summary>伺服器暱稱優先，沒有就用帳號名（DM 沒有暱稱）。</summary>
+    private static string DisplayNameOf(IUser user)
+        => user is SocketGuildUser guildUser && !string.IsNullOrWhiteSpace(guildUser.DisplayName)
+            ? guildUser.DisplayName
+            : user.Username;
+
+    /// <summary>
+    /// 回覆時允許的 mention。
+    ///
+    /// 「讓它 @ 別人」是使用者要的，但**只開放 @ 使用者**：
+    /// mention 的文字是模型產生的，開放 @everyone／@身分組等於讓它有機會洗頻整個伺服器。
+    /// </summary>
+    private AllowedMentions ReplyMentions()
+        => _options.AllowMentions
+            ? new AllowedMentions { AllowedTypes = AllowedMentionTypes.Users }
+            : AllowedMentions.None;
 
     /// <summary>把「@Bot」那個 mention 拿掉（Discord 給的是 &lt;@123&gt; / &lt;@!123&gt;）。</summary>
     private static string StripMention(string content, ulong botId)

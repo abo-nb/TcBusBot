@@ -279,17 +279,28 @@ public sealed class BotToolProvider : IChatToolProvider
         var tools = new BusTools(_actions, _subs, context, log, _arrivals);
         _last = tools;
 
-        return
-        [
+        var plugins = new List<KernelPlugin>
+        {
             KernelPluginFactory.CreateFromObject(tools, "bus"),
             KernelPluginFactory.CreateFromObject(
                 new PersonaTools(_personas, context.GuildId, log), "persona")
-        ];
+        };
+
+        // 主人專用的工具另外包一個 plugin：它的說明裡寫著「只有主人能用」，
+        // 沒有授權的對話看不到這些函式（模型連「有這個能力」都不知道）。
+        if (context.IsOwner)
+        {
+            plugins.Add(KernelPluginFactory.CreateFromObject(
+                new OwnerTools(_personas, log), "owner"));
+        }
+
+        return plugins;
     }
 
     public string Describe()
         => "公車工具 7 個（查站牌／查路線號碼／查路線／訂閱／列出訂閱／取消訂閱／到站時間）" +
-           "＋ 記憶工具 3 個（記住規矩／列出規矩／忘記規矩）";
+           "＋ 記憶工具 3 個（記住規矩／列出規矩／忘記規矩）" +
+           "＋ 主人工具 3 個（全域規則，只在授權時提供）";
 
     /// <summary>這一輪如果模型取消了訂閱，把內容交出來讓呼叫端掛「↩️ 復原」。</summary>
     public IReadOnlyList<(SubscriptionGroup Group, IReadOnlyList<Subscription> Subscriptions)>? TakePendingUndo()
@@ -297,5 +308,74 @@ public sealed class BotToolProvider : IChatToolProvider
         var pending = _last?.PendingUndo;
         if (_last is not null) _last = null;
         return pending;
+    }
+}
+
+/// <summary>
+/// 主人專用工具（**只有在授權成功的那一次請求**才會被掛上去）。
+///
+/// 差別在「範圍」：<see cref="PersonaTools"/> 改的是**這個伺服器**的規則，
+/// 這裡改的是**全域**規則（所有伺服器都適用）。
+/// 一般使用者連這幾個函式的存在都看不到（plugin 根本沒有掛上去）。
+/// </summary>
+public sealed class OwnerTools
+{
+    private readonly GuildPersonaStore _personas;
+    private readonly ToolCallLog _log;
+
+    public OwnerTools(GuildPersonaStore personas, ToolCallLog log)
+    {
+        _personas = personas;
+        _log = log;
+    }
+
+    [KernelFunction("remember_global_rule")]
+    [Description("把一條規則記成**全域**（所有伺服器都適用）。只有通過主人授權的請求能用。" +
+                 "主人說「以後不管在哪都要…」時用這個；一般使用者的要求請用 remember_rule。")]
+    public string RememberGlobalRule(
+        [Description("要記住的那一句話")] string rule)
+    {
+        var result = _personas.LearnGlobal(rule);
+
+        _log.Record("remember_global_rule",
+            result == GuildPersonaStore.LearnResult.Added ? GuildPersonaStore.Clean(rule) : result.ToString(),
+            changedState: result == GuildPersonaStore.LearnResult.Added);
+
+        return result switch
+        {
+            GuildPersonaStore.LearnResult.Added =>
+                $"✅ 已記成全域規則（所有伺服器都適用）：{GuildPersonaStore.Clean(rule)}",
+            GuildPersonaStore.LearnResult.Duplicate => "這條全域規則已經有了。",
+            GuildPersonaStore.LearnResult.TooLong =>
+                $"太長了（上限 {GuildPersonaStore.MaxLineLength} 字），請縮短。",
+            GuildPersonaStore.LearnResult.TooMany => "全域規則數量已達上限，請先刪掉一些。",
+            _ => "沒有內容可以記。"
+        };
+    }
+
+    [KernelFunction("list_global_rules")]
+    [Description("列出全部的全域規則（主人指定、所有伺服器都適用）。")]
+    public string ListGlobalRules()
+    {
+        var lines = _personas.GlobalLines;
+        _log.Record("list_global_rules", $"{lines.Count} 條");
+
+        return lines.Count == 0
+            ? "目前沒有全域規則。"
+            : $"目前有 {lines.Count} 條全域規則：\n" +
+              string.Join("\n", lines.Select((l, i) => $"{i + 1}. {l}"));
+    }
+
+    [KernelFunction("forget_global_rule")]
+    [Description("刪掉符合關鍵字的全域規則（主人指定、所有伺服器都適用）。")]
+    public string ForgetGlobalRule(
+        [Description("要比對的關鍵字")] string keyword)
+    {
+        var removed = _personas.ForgetGlobal(keyword);
+        _log.Record("forget_global_rule", $"{keyword}（刪了 {removed} 條）", changedState: removed > 0);
+
+        return removed == 0
+            ? $"找不到符合「{keyword}」的全域規則。"
+            : $"✅ 已刪掉 {removed} 條全域規則。";
     }
 }

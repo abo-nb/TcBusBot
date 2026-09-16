@@ -577,6 +577,10 @@ public static class Program
         Console.WriteLine($"  健康檢查端點 ：{(cfg.EnableHealthEndpoint ? $"埠 {cfg.Port}（/ 與 /health）" : "已停用（--no-health）")}");
         Console.WriteLine($"  防休眠　　　 ：{(string.IsNullOrWhiteSpace(cfg.AppUrl) ? "未設定（沒有 APP_URL）" : $"每 {cfg.KeepAliveMinutes} 分鐘 ping {cfg.AppUrl}")}");
         Console.WriteLine($"  AI 聊天　　　：{cfg.Llm.Describe()}");
+        Console.WriteLine($"  主人授權　　 ：{cfg.Llm.AdminDescription}" +
+                          (cfg.Llm.AdminEnabled
+                              ? "（⚠️ key 要打在訊息裡，請在私訊或私人頻道使用）"
+                              : ""));
         Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
         Console.WriteLine();
     }

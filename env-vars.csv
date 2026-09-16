@@ -36,3 +36,7 @@
 "LLM_USER_COOLDOWN_SECONDS","（無）","選填","3","同一個人連續問的冷卻秒數（避免連點燒額度）","新增（AI 聊天）","AI 聊天"
 "LLM_TIMEOUT_SECONDS","（無）","選填","90","單次 LLM 呼叫的逾時秒數","新增（AI 聊天）","AI 聊天"
 "LLM_ALLOW_DM","（無）","選填","false","私訊要不要回（預設只回伺服器頻道）","新增（AI 聊天）","AI 聊天"
+"LLM_EXPOSE_IDS","（無）","選填","true","讓模型看到發話者的暱稱＋@帳號＋Discord ID（給 false 就只給暱稱）","新增（AI 聊天）","AI 聊天"
+"LLM_ALLOW_MENTIONS","（無）","選填","true","允許模型在回覆裡 @ 使用者（@everyone／身分組一律擋掉）","新增（AI 聊天）","AI 聊天"
+"LLM_ADMIN_IDS","LLM_OWNER_IDS","選填","（無）","後台指定的「主人」Discord ID（逗號分隔）；還要帶 LLM_ADMIN_KEY 才能下令","新增（AI 聊天）","AI 聊天"
+"LLM_ADMIN_KEY","LLM_OWNER_KEY","選填","（無）","主人授權用的特殊 key（沒設定＝主人機制關閉）；訊息裡帶到它才會被當成命令，且 key 會從訊息移除","新增（AI 聊天）","AI 聊天"

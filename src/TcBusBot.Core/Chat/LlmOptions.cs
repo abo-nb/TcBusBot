@@ -24,8 +24,50 @@ public sealed class LlmOptions
     /// <summary>超過這個時間沒說話，就當成新的段落（不帶舊上下文）——不必問 LLM 就知道。</summary>
     public int SegmentGapMinutes { get; set; } = 30;
 
-    /// <summary>時間沒超過門檻時，要不要再讓 LLM 判斷「是不是換話題了」。</summary>
+    /// <summary>要不要讓 LLM 判斷「是不是換話題了」。</summary>
     public bool TopicDetect { get; set; } = true;
+
+    /// <summary>
+    /// 要不要讓模型看到「傳訊息的人是誰」：**伺服器暱稱 ＋ @帳號名 ＋ Discord ID**。
+    ///
+    /// 為什麼要給 ID：不然它分不出同名的人，也沒辦法把規則綁在特定人身上
+    /// （「某某是管理員，對他要有禮貌」）。代價是它可能把 ID 貼到頻道上。
+    /// 關掉的話就只給暱稱。
+    /// </summary>
+    public bool ExposeUserIds { get; set; } = true;
+
+    /// <summary>
+    /// 要不要讓模型在回覆裡 @ 別人（它會輸出 <c>&lt;@ID&gt;</c>）。
+    ///
+    /// ⚠️ 只允許 @ **使用者**；@everyone／@here／@身分組一律擋掉（見 LlmChatService）。
+    /// </summary>
+    public bool AllowMentions { get; set; } = true;
+
+    /// <summary>
+    /// 「主人」的 Discord 使用者 ID（逗號分隔）。**要下指令還必須在訊息裡帶上
+    /// <see cref="AdminKey"/>**，兩個條件都成立才會被當成授權指令。
+    /// </summary>
+    public ulong[] AdminUserIds { get; set; } = [];
+
+    /// <summary>
+    /// 授權用的特殊 key。訊息裡出現這個字串（且發話者在名單裡）→ 這一則就是主人的命令。
+    ///
+    /// ⚠️ 訊息裡的 key 會被**移除**之後才送進模型與對話記憶，log 也不會印出來 ——
+    ///    否則 key 會留在歷史與 console 裡，等於沒有保護。
+    /// </summary>
+    public string? AdminKey { get; set; }
+
+    /// <summary>主人機制是否可用（名單與 key 都設定了才算）。**沒設 key 就整個關閉**（fail closed）。</summary>
+    public bool AdminEnabled
+        => AdminUserIds.Length > 0 && !string.IsNullOrWhiteSpace(AdminKey);
+
+    /// <summary>給橫幅與 `/ai status` 看的一行說明（**絕對不印出 key**）。</summary>
+    public string AdminDescription
+        => !AdminEnabled
+            ? "未啟用"
+            : AdminUserIds.Length == 1
+                ? $"1 位主人（ID …{AdminUserIds[0] % 100000:00000}）＋ 需要特殊 key"
+                : $"{AdminUserIds.Length} 位主人 ＋ 需要特殊 key";
 
     /// <summary>
     /// 要不要讓 LLM 用工具**真的動手**（訂閱公車、取消訂閱…）。

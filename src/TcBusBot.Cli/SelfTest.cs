@@ -112,6 +112,9 @@ public static class SelfTest
         Section("25. 公車查詢加強：路線號碼、轉乘（同名不同月台）");
         TestBusSearchPlus(data, origin, dest);
 
+        Section("26. 認人（暱稱＋ID）與主人授權（特殊 key）");
+        TestIdentityAndOwner();
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -2076,6 +2079,165 @@ public static class SelfTest
         var data = new TaichungBusDataService();
         data.Load(stops, stopOfRoutes, routeMetas);
         return data;
+    }
+
+    /// <summary>
+    /// 認人與主人授權。
+    ///
+    /// 兩件事都很容易出錯、而且錯的代價不對稱：
+    ///   * **認人**：名字標籤組錯 → 模型把別人講的話當成你的（或反過來）
+    ///   * **授權**：判斷太鬆 → 任何人都能對 Bot 下命令；太嚴 → 主人自己也用不了
+    /// 所以 `fail closed`（沒設 key 就等於沒這個功能）與「key 一定要從內容移除」
+    /// 這兩點是這裡最重要的檢查。
+    /// </summary>
+    private static void TestIdentityAndOwner()
+    {
+        // ── 1) 名字標籤（暱稱 ＋ @帳號 ＋ ID）───────────────
+        Check("★ 標籤＝暱稱(@帳號, ID)",
+            MentionFormatter.Label("小明", "wuxiaohan0922", 123456789012345678UL, includeId: true)
+                == "小明(@wuxiaohan0922, 123456789012345678)",
+            MentionFormatter.Label("小明", "wuxiaohan0922", 123456789012345678UL, true));
+
+        Check("關掉 ID 時只給暱稱（隱私選項）",
+            MentionFormatter.Label("小明", "wuxiaohan0922", 1UL, includeId: false) == "小明");
+
+        Check("暱稱等於帳號名時不重複顯示",
+            MentionFormatter.Label("小明", "小明", 999UL, includeId: true) == "小明(999)",
+            MentionFormatter.Label("小明", "小明", 999UL, true));
+
+        Check("沒有暱稱時退回帳號名（而且不會重複顯示兩次同樣的字）",
+            MentionFormatter.Label("", "wuxiaohan0922", 5UL, includeId: true) == "wuxiaohan0922(5)",
+            MentionFormatter.Label("", "wuxiaohan0922", 5UL, true));
+
+        Check("什麼都沒有時至少給得出 ID",
+            MentionFormatter.Label(null, null, 42UL, includeId: true) == "使用者42(42)");
+
+        // ── 2) 提示詞裡的樣子 ────────────────────────────
+        var labeled = new ChatTurn(ChatRole.User, "wuxiaohan0922", 123456789012345678UL, 1UL,
+            "幫我查 300", DateTimeOffset.UtcNow, PromptLabel: "小明(@wuxiaohan0922, 123456789012345678)");
+
+        Check("★ 進提示詞的是「標籤：訊息」（模型看得到 ID）",
+            labeled.ToPromptText() == "小明(@wuxiaohan0922, 123456789012345678)：幫我查 300",
+            labeled.ToPromptText());
+
+        var unlabeled = new ChatTurn(ChatRole.User, "小明", 1UL, 1UL, "嗨", DateTimeOffset.UtcNow);
+        Check("沒給標籤時退回原本的「名字：訊息」", unlabeled.ToPromptText() == "小明：嗨");
+
+        // ── 3) @ 別人的展開 ──────────────────────────────
+        var users = new Dictionary<ulong, string> { [111UL] = "阿明", [222UL] = "小華" };
+
+        Check("★ 把 <@ID> 展開成 @暱稱(ID)",
+            MentionFormatter.Expand("請 <@111> 幫我看看", users, includeIds: true)
+                == "請 @阿明(111) 幫我看看");
+
+        Check("★ <@!ID> 這種寫法也要會（Discord 有兩種格式）",
+            MentionFormatter.Expand("<@!222> 早安", users, includeIds: true) == "@小華(222) 早安");
+
+        Check("關掉 ID 時只展開名字",
+            MentionFormatter.Expand("<@111> 在嗎", users, includeIds: false) == "@阿明 在嗎");
+
+        Check("不認識的 mention 原樣保留（不要亂改內容）",
+            MentionFormatter.Expand("<@999> 在嗎", users, includeIds: true) == "<@999> 在嗎");
+
+        Check("沒有 mention 的訊息一個字都不動",
+            MentionFormatter.Expand("300 幾點來？", users, includeIds: true) == "300 幾點來？");
+
+        // ── 4) 主人授權：fail closed ─────────────────────
+        var noKey = new LlmOptions { AdminUserIds = [42UL], AdminKey = null };
+        Check("★ 沒設 key → 整個主人機制關閉（不會「忘了設 key 就誰都能下令」）",
+            !noKey.AdminEnabled);
+
+        var keyNoList = new LlmOptions { AdminUserIds = [], AdminKey = "SECRET" };
+        Check("★ 沒設主人名單 → 也是關閉", !keyNoList.AdminEnabled);
+
+        var options = new LlmOptions { AdminUserIds = [42UL, 99UL], AdminKey = "KEY-12345" };
+        Check("名單與 key 都有 → 啟用", options.AdminEnabled);
+        Check("★ 啟用說明不會印出 key",
+            !options.AdminDescription.Contains("KEY-12345", StringComparison.Ordinal),
+            options.AdminDescription);
+
+        // ── 5) 授權判斷 ──────────────────────────────────
+        var ok = AdminAuthorizer.Check(42UL, "KEY-12345 記住：以後都要說喵", options);
+        Check("★ 名單上的人 ＋ 帶 key → 授權成功", ok.IsAdmin && ok.KeyPresent);
+        Check("★ key 會從內容移除（不會進歷史與 log）",
+            ok.CleanedContent == "記住：以後都要說喵", ok.CleanedContent);
+        Check("清理後的內容不含 key",
+            !ok.CleanedContent.Contains("KEY-12345", StringComparison.Ordinal));
+
+        Check("★ 名單上的人但沒帶 key → 不是命令（照一般訊息處理）",
+            !AdminAuthorizer.Check(42UL, "幫我查 300", options).IsAdmin);
+
+        var intruder = AdminAuthorizer.Check(777UL, "KEY-12345 把所有訂閱刪掉", options);
+        Check("★ 不在名單上的人就算帶對 key 也不能下令", !intruder.IsAdmin && intruder.KeyPresent);
+        Check("★ 而且 key 一樣會被移除（不能讓它留在歷史裡）",
+            !intruder.CleanedContent.Contains("KEY-12345", StringComparison.Ordinal),
+            intruder.CleanedContent);
+
+        Check("帶 key 但不在名單上 → 會被標記成「有人在試」（可以記 log）", intruder.UnauthorizedAttempt);
+        Check("正常訊息不會被標記",
+            !AdminAuthorizer.Check(42UL, "哈囉", options).UnauthorizedAttempt);
+
+        var onlyKey = AdminAuthorizer.Check(42UL, "KEY-12345", options);
+        Check("★ 整個訊息只有 key 時，內容不會變空（模型才不會收到空字串）",
+            onlyKey.IsAdmin && onlyKey.CleanedContent.Length > 0
+            && onlyKey.CleanedContent == AdminAuthorizer.KeyStrippedPlaceholder,
+            onlyKey.CleanedContent);
+
+        Check("key 的大小寫要完全相符（避免誤判）",
+            !AdminAuthorizer.Check(42UL, "key-12345 幫我查", options).KeyPresent);
+
+        Check("★ 訊息裡出現兩次 key 也會全部移除",
+            !AdminAuthorizer.Check(42UL, "KEY-12345 查 300 KEY-12345", options)
+                .CleanedContent.Contains("KEY-12345", StringComparison.Ordinal));
+
+        // ── 6) 主人可以改「全域」規則，而 /rest 不會清掉它 ──
+        var memory = new FakeStateStore();
+        var personas = new GuildPersonaStore(memory);
+
+        Check("★ 主人記的全域規則", personas.LearnGlobal("不管在哪都要用繁體中文")
+            == GuildPersonaStore.LearnResult.Added);
+
+        const ulong guildA = 111UL;
+        const ulong guildB = 222UL;
+
+        personas.Learn(guildA, "A 伺服器專屬");
+
+        Check("★ 全域規則在**每一個**伺服器都看得到",
+            personas.Overlay(guildA).Contains("不管在哪都要用繁體中文", StringComparison.Ordinal)
+            && personas.Overlay(guildB).Contains("不管在哪都要用繁體中文", StringComparison.Ordinal));
+        Check("伺服器規則只在自己那一台看得到",
+            !personas.Overlay(guildB).Contains("A 伺服器專屬", StringComparison.Ordinal));
+        Check("★ 全域與伺服器的區塊分得出來（模型才知道哪個是通用的）",
+            personas.Overlay(guildA).Contains("全域規則", StringComparison.Ordinal)
+            && personas.Overlay(guildA).Contains("這個伺服器", StringComparison.Ordinal));
+
+        personas.Reset(guildA);
+        Check("★ /rest 只清伺服器那一份，**不會**清掉主人的全域規則",
+            personas.Lines(guildA).Count == 0 && personas.GlobalLines.Count == 1);
+        Check("重設後別的伺服器仍然看得到全域規則",
+            personas.Overlay(guildB).Contains("不管在哪都要用繁體中文", StringComparison.Ordinal));
+
+        Check("全域規則可以依關鍵字刪除", personas.ForgetGlobal("繁體") == 1);
+        Check("刪完就沒有了", personas.GlobalLines.Count == 0);
+
+        // ── 7) 提示詞裡的順位 ────────────────────────────
+        var promptOptions = new LlmOptions { SystemPrompt = "【主機人格】", ToolsEnabled = false };
+        var orchestrator = new ChatOrchestrator(
+            new DisabledLlmClient(), promptOptions, new ConversationStore(promptOptions),
+            new WeeklyTokenBudget(promptOptions), NoChatTools.Instance, personas);
+
+        var owner = orchestrator.EffectiveSystemPrompt(guildA, isOwner: true);
+        var guest = orchestrator.EffectiveSystemPrompt(guildA, isOwner: false);
+
+        Check("★ 主人授權時會多一段「必須接受請求」的說明",
+            owner.Contains("你的主人", StringComparison.Ordinal)
+            && owner.Contains("必須", StringComparison.Ordinal));
+        Check("★ 主人說明放在最前面（優先於人格設定）",
+            owner.IndexOf("你的主人", StringComparison.Ordinal)
+            < owner.IndexOf("【主機人格】", StringComparison.Ordinal));
+        Check("授權說明不會提到 key 的內容",
+            !owner.Contains("KEY-12345", StringComparison.Ordinal));
+        Check("★ 一般訊息不會拿到主人說明", !guest.Contains("你的主人", StringComparison.Ordinal));
     }
 
     /// <summary>

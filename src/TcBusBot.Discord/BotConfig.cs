@@ -240,6 +240,29 @@ public sealed class BotConfig
         if (!string.IsNullOrWhiteSpace(reasoning)) cfg.Llm.Reasoning = reasoning!;
         if (args.Contains("--llm-think")) cfg.Llm.Reasoning = "auto";
 
+        // ── 主人（後台指定的命令者 ＋ 特殊 key）─────────────
+        var adminIds = SettingResolver.Resolve(args, "--llm-admin-ids", file,
+            ["LLM_ADMIN_IDS", "LLM_OWNER_IDS"]).Value;
+
+        if (!string.IsNullOrWhiteSpace(adminIds))
+        {
+            cfg.Llm.AdminUserIds = adminIds!
+                .Split([',', ';', ' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => ulong.TryParse(x.Trim(), out var id) ? id : 0UL)
+                .Where(id => id != 0)
+                .Distinct()
+                .ToArray();
+        }
+
+        cfg.Llm.AdminKey = SettingResolver.Resolve(args, "--llm-admin-key", file,
+            ["LLM_ADMIN_KEY", "LLM_OWNER_KEY"]).Value;
+
+        var exposeIds = SettingResolver.Resolve(args, "--llm-expose-ids", file, ["LLM_EXPOSE_IDS"]).Value;
+        if (!string.IsNullOrWhiteSpace(exposeIds)) cfg.Llm.ExposeUserIds = !IsFalsy(exposeIds!);
+
+        var mentions = SettingResolver.Resolve(args, "--llm-mentions", file, ["LLM_ALLOW_MENTIONS"]).Value;
+        if (!string.IsNullOrWhiteSpace(mentions)) cfg.Llm.AllowMentions = !IsFalsy(mentions!);
+
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
         cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;
         if (args.Contains("--no-message-intent")) cfg.EnableMessageContentIntent = false;

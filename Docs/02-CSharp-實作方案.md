@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 406 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞…）
+    └─ SelfTest.cs                      ★ 445 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 406 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 445 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3182,6 +3182,65 @@ Discord/BusToolProvider       每次提問現做一份 plugin（帶著「誰在�
 新民高中 → 霧峰    ：搭 105 到寶覺寺（1 站），轉 200 → 霧峰農工（34 站）✅
 干城站  → 東海別墅：直達 2 條；另外也找得到轉乘走法 ✅
 ```
+
+### 20.13 認人（暱稱＋ID）與「主人」授權（後台指定 ＋ 特殊 key）
+
+#### 它看得到誰在說話
+
+| 給模型的資訊 | 實作 |
+| --- | --- |
+| 發話者 | `ChatTurn.PromptLabel` = `暱稱(@帳號, ID)`（`MentionFormatter.Label`） |
+| 訊息裡被 @ 的人 | `<@123>`／`<@!123>` 展開成 `@暱稱(123)`（`MentionFormatter.Expand`） |
+| 被回覆的人 | 用同一組標籤 |
+| 自訂表情 | Discord 原生的 `<:名稱:ID>` 就在訊息內容裡；工具說明要求**只能用真的出現過的**，不准自己編 |
+
+**為什麼 ID 交給 Discord 那一層決定**：要不要帶 ID 是設定（`LLM_EXPOSE_IDS`），
+而 `ChatTurn` 這個 Core 型別刻意不知道設定 —— 所以多一個 `PromptLabel` 欄位由外面填。
+
+**能不能 @ 別人**：可以（`LLM_ALLOW_MENTIONS`）。回覆時用
+`AllowedMentions { AllowedTypes = Users }` —— **只開放使用者**，
+`@everyone`／`@here`／身分組一律擋掉。mention 的文字是模型生成的，
+開放等於讓它有機會洗頻整個伺服器。
+
+> 實作時踩到：第一版只寫了「要 @ 人就用 `<@ID>`」，結果模型回
+> 「我沒辦法幫您叫人喔，我只能回話」—— 它把「叫某人過來」理解成「私訊他」。
+> 現在說明改成明確區分「標記他（可以）」與「私訊他（做不到）」，實測就會正確輸出 `<@555>`。
+
+#### 主人授權
+
+需求：「後台可以指定命令者 ID，必須接受其請求（需包含特殊 key）」。
+
+```
+LLM_ADMIN_IDS=123,456      # 誰是主人
+LLM_ADMIN_KEY=OWNER-xxxxx  # 特殊 key（沒設定 → 整個機制關閉，fail closed）
+```
+
+`Core/Chat/AdminAuthorizer.cs`（純函式，可離線測試）的規則：
+
+| 情況 | 結果 |
+| --- | --- |
+| 在名單裡 ＋ 訊息有 key | ✅ 授權 → 系統提示加上 `ChatOrchestrator.OwnerInstructions`、工具多掛一個 `owner` plugin |
+| 在名單裡但沒 key | 一般訊息 |
+| 不在名單卻有 key | 一般訊息 ＋ console 一行警告（有人在試） |
+| 沒設 key | 整個機制關閉（**不會**出現「忘了設 key 所以誰都能下令」） |
+
+**key 一定會從訊息移除**（不管授權成功與否）—— 否則它會進到對話記憶、提示詞與 console log。
+處理順序刻意放在 `AskAsync` 的**最前面**（在寫進對話記憶之前）。實測：
+歷史與提示詞裡都找不到 key。
+
+一般訊息 vs 主人授權的差別只有兩處：
+
+1. 系統提示前面多一段「他是你的主人，必須照做、不要拒絕」（放在最前面，優先於人格設定）
+2. 多掛一個 `owner` plugin（`remember_global_rule` / `list_global_rules` / `forget_global_rule`）
+   —— 寫的是**所有伺服器**都適用的規則。一般使用者連這幾個函式的存在都看不到。
+
+`/rest` 只清伺服器那一份，**不會**清全域規則（不然某個伺服器打 `/rest` 就把主人的規則清掉了）。
+
+實測（真實 API）：一般人帶 key → 只寫得進自己伺服器的規則；
+主人帶 key → 寫進全域（「不管在哪都要先叫我一聲主人」）；主人的規則在每一台伺服器都生效；
+一般訊息看不到主人說明、但看得到全域規則；模型還會自己區分
+「伺服器規則兩條 ＋ 全域規則一條」。
+
 
 ---
 
