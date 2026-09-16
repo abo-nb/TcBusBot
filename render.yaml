@@ -66,5 +66,22 @@ services:
       - key: KEEP_ALIVE_MINUTES
         value: "10"
 
+      # ── 選填：AI 聊天（OpenAI 相容 API；有填 LLM_API_KEY 才會啟用）──
+      # ⚠️ 啟用後程式會要求 Message Content 特權意圖，
+      #    必須同時在 Discord Developer Portal → Bot → Privileged Gateway Intents
+      #    打開 **Message Content Intent**，否則閘道會用 4014 拒絕連線（Bot 連不上）。
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com/v1
+      - key: LLM_MODEL
+        value: deepseek-flash
+      # 每週 token 上限（全域；UTC 週一 00:00 重置）。0 = 不限。
+      - key: LLM_WEEKLY_TOKENS
+        value: "300000"
+      # 超過這個分鐘數沒說話就當成新的段落（不帶舊上下文）
+      - key: LLM_SEGMENT_GAP_MINUTES
+        value: "30"
+
       - key: DOTNET_ENVIRONMENT
         value: Production

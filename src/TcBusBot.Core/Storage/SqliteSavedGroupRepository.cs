@@ -52,6 +52,15 @@ internal sealed class SqliteSavedGroupRepository : ISavedGroupRepository
             """);
 
         _db.Exec("CREATE INDEX IF NOT EXISTS ix_saved_groups_user ON saved_groups(user_id);", null);
+
+        // 通用小狀態（LLM 每週用量）——同樣在這個檔案裡，只是另一張表
+        _db.Exec("""
+            CREATE TABLE IF NOT EXISTS blobs (
+                key        TEXT PRIMARY KEY,
+                json       TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """, null);
     }
 
     // ── 查詢 ──────────────────────────────────────────────
@@ -161,6 +170,17 @@ internal sealed class SqliteSavedGroupRepository : ISavedGroupRepository
     }
 
     public void Dispose() => _db.Dispose();
+
+    // ── 小型狀態文件 ──────────────────────────────────────
+
+    public string? LoadBlob(string key)
+        => _db.Scalar("SELECT json FROM blobs WHERE key = ?", key) as string;
+
+    public void SaveBlob(string key, string json)
+        => _db.Execute("""
+            INSERT INTO blobs (key, json, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at
+            """, key, json, DateTimeOffset.UtcNow.ToString("O"));
 
     private static SavedGroup Map(object?[] row)
     {

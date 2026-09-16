@@ -444,6 +444,9 @@ public static class DryRun
         // ── 指令樹（斜線指令真的註冊得起來嗎）───────────────
         AuditCommandTree(data, subs, runtime);
 
+        // ── LLM 設定（不連線，只驗設定本身合不合理）─────────
+        AuditLlmConfig(cfg);
+
         // ── 總結 ───────────────────────────────────────────
         Console.WriteLine();
         Console.WriteLine("══════════════════════════════════════════════════════════════");
@@ -1087,13 +1090,22 @@ public static class DryRun
 
         using var savedGroups = new SavedGroupStore(":memory:");
 
+        var dryLlmOptions = new TcBusBot.Core.Chat.LlmOptions();
+
         var services = new SimpleServiceProvider()
             .Add(data)
             .Add(subs)
             .Add(new BusSessionStore())
             .Add(runtime)
             .Add(new RealtimeBusCache())
-            .Add(savedGroups);
+            .Add(savedGroups)
+            .Add(dryLlmOptions)
+            .Add(new TcBusBot.Core.Chat.ConversationStore(dryLlmOptions))
+            .Add(new TcBusBot.Core.Chat.WeeklyTokenBudget(dryLlmOptions));
+
+        // ★ 與 Program.cs 一樣：ILlmClient 永遠要註冊得到（沒設定時是空物件），
+        //   否則模組建不起來 —— 這正是這個檢查抓到的第一個真 bug。
+        services.Add<TcBusBot.Core.Chat.ILlmClient>(TcBusBot.Core.Chat.DisabledLlmClient.Instance);
 
         var interactions = new InteractionService(client.Rest, new InteractionServiceConfig
         {
@@ -1106,6 +1118,7 @@ public static class DryRun
             interactions.AddModuleAsync<BusModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<BusComponentModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<SayModule>(services).GetAwaiter().GetResult();
+            interactions.AddModuleAsync<ChatModule>(services).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -1141,6 +1154,28 @@ public static class DryRun
         else
             Console.WriteLine($"  ✔ /bus 的 {expectedSubs.Length} 個子指令都在" +
                               $"（{string.Join("、", expectedSubs)}）");
+
+        // ── /ai（AI 聊天）：status 與 forget 都要在 ──────────
+        var aiGroup = interactions.Modules.FirstOrDefault(m => m.SlashGroupName == "ai");
+        if (aiGroup is null || !aiGroup.IsSlashGroup)
+        {
+            Problem("/ai 沒有被註冊成指令群組（AI 聊天的查詢與清除記憶會按不到）");
+        }
+        else
+        {
+            var aiSubs = commands
+                .Where(c => CommandPath(c).StartsWith("ai ", StringComparison.Ordinal))
+                .Select(c => c.Name)
+                .ToHashSet(StringComparer.Ordinal);
+
+            var expectedAi = new[] { "status", "forget" };
+            var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
+
+            if (missingAi.Count > 0)
+                Problem($"/ai 缺少子指令：{string.Join("、", missingAi)}");
+            else
+                Console.WriteLine($"  ✔ /ai 的 {expectedAi.Length} 個子指令都在（{string.Join("、", expectedAi)}）");
+        }
 
         // ── /say 是這次新加的：一定要在，而且只能有一個必填的字串參數 ──
         var say = commands.FirstOrDefault(c => CommandPath(c) == "say");
@@ -1373,6 +1408,76 @@ public static class DryRun
             Console.WriteLine($"    └ {option.Name} [{option.DiscordOptionType}／{required}{limit}]" +
                               $"　{option.Description}");
         }
+    }
+
+    /// <summary>
+    /// LLM 設定檢查（**完全離線**，不會打任何 API）。
+    ///
+    /// 這裡只驗「設定本身合不合理」——因為這些錯誤在啟動時看不出來，
+    /// 要等到第一次有人 @ 它才會炸，而且會炸在使用者面前：
+    ///   * base URL 不是 http(s) 或拼錯
+    ///   * 模型名稱空白
+    ///   * 每週上限小於一次對話的量（等於永遠不能用）
+    ///   * 每週上限是 0（= 不限）時要明確講出來，因為那是「錢包沒有煞車」
+    /// </summary>
+    private static void AuditLlmConfig(BotConfig cfg)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ AI 聊天設定檢查（離線，不會呼叫 API）");
+
+        var llm = cfg.Llm;
+
+        if (!llm.IsConfigured)
+        {
+            Console.WriteLine($"  ℹ 未啟用：{llm.Describe()}");
+            Console.WriteLine("     要啟用的話在 .env 放 LLM_API_KEY=<key>（可搭配 LLM_BASE_URL／LLM_MODEL）");
+            return;
+        }
+
+        Console.WriteLine($"  模型：{llm.Model}");
+        Console.WriteLine($"  端點：{llm.BaseUrl}");
+        Console.WriteLine($"  金鑰：{llm.MaskedKey}");
+        Console.WriteLine($"  每週上限：{(llm.WeeklyTokenLimit > 0 ? $"{llm.WeeklyTokenLimit:N0} tokens" : "不限（0）")}");
+        Console.WriteLine($"  時間切段：超過 {llm.SegmentGapMinutes} 分鐘算新的一段" +
+                          $"（話題判斷：{(llm.TopicDetect ? "交給 LLM" : "關閉")}）");
+        Console.WriteLine($"  上下文：最多 {llm.MaxContextTurns} 則／約 {llm.MaxContextTokens} tokens" +
+                          $"（單次輸出上限 {llm.MaxOutputTokens}）");
+
+        if (!Uri.TryCreate(llm.BaseUrl, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            Problem($"LLM_BASE_URL 不是有效的 http(s) 網址：{llm.BaseUrl}");
+        else if (!uri.AbsolutePath.TrimEnd('/').EndsWith("/v1", StringComparison.OrdinalIgnoreCase)
+                 && !uri.AbsolutePath.Contains("/v1", StringComparison.OrdinalIgnoreCase))
+            Console.WriteLine("  ℹ 提醒：OpenAI 相容端點通常是 …/v1，確認一下有沒有漏掉");
+
+        if (string.IsNullOrWhiteSpace(llm.Model))
+            Problem("LLM_MODEL 是空的");
+
+        if (llm.WeeklyTokenLimit > 0 && llm.WeeklyTokenLimit < 1000)
+            Problem($"LLM_WEEKLY_TOKENS={llm.WeeklyTokenLimit} 太小 —— " +
+                    "一次對話（含話題判斷）大約就要 500~1500 tokens，等於一下子就沒得用了");
+
+        if (llm.WeeklyTokenLimit <= 0)
+            Console.WriteLine("  ⚠️  每週上限是 0 = **不限額度**：用量會一直累積，請自行注意帳單");
+
+        if (llm.MaxContextTokens < llm.MaxOutputTokens)
+            Console.WriteLine("  ℹ 提醒：上下文上限比單次輸出上限還小，長對話會被裁得很短");
+
+        if (llm.AllowDm)
+            Console.WriteLine("  ℹ 私訊也可以聊（LLM_ALLOW_DM=true）——任何人都能私訊消耗全域額度");
+        else
+            Console.WriteLine("  ℹ 只回伺服器頻道（私訊不回；要開請設 LLM_ALLOW_DM=true）");
+
+        // 額度換算成人看得懂的話
+        var perCall = llm.MaxContextTokens + llm.MaxOutputTokens;
+        Console.WriteLine($"  ℹ 以最壞情況（每次都用滿上下文 {llm.MaxContextTokens} + 輸出 {llm.MaxOutputTokens}）估算，" +
+                          $"每週上限大約可以回 {(llm.WeeklyTokenLimit <= 0 ? "無限" : $"{llm.WeeklyTokenLimit / Math.Max(1, perCall)}")} 則");
+
+        if (!cfg.EnableMessageContentIntent)
+            Problem("有設定 LLM 但 Message Content 意圖被關掉了（--no-message-intent）→ 收不到訊息內容，AI 不會回話");
+        else
+            Console.WriteLine("  ✔ 會要求 Message Content 意圖（⚠️ 必須同時在 Developer Portal 打開，" +
+                              "否則閘道會用 4014 拒絕連線）");
     }
 
     /// <summary>與 BotRuntime.DescribeStatus 相同邏輯（DryRun 無法直接呼叫 private 方法）。</summary>

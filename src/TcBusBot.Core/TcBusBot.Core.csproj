@@ -25,6 +25,11 @@
     <!-- 直接用來查 mongodb+srv 的 SRV 記錄（診斷連線問題）；
          它本來就是 MongoDB.Driver 的相依，所以沒有多拉東西進來。 -->
     <PackageReference Include="DnsClient" Version="1.6.1" />
+    <!-- Semantic Kernel（LLM 聊天，選配：設定了 LLM_API_KEY 才會用到）。
+         連接器選 OpenAI 的：它支援自訂 endpoint，所以任何 OpenAI 相容服務都能接
+         （DeepSeek / OpenRouter / 自架 Ollama…）。 -->
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.66.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.66.0" />
   </ItemGroup>
 
   <ItemGroup>

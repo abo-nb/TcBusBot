@@ -17,13 +17,13 @@
 | --- | --- |
 | M0 專案骨架 | ✅ |
 | M1 TDX 資料模型與解析 | ✅ |
-| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 259 項離線驗收測試全過 |
-| **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
+| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 308 項離線驗收測試全過 || **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
 | M4 即時輪詢 | ✅ 程式完成（輪詢迴圈 + 到站時間總表），實際運作需 TDX 金鑰 |
 | **M7 Android APK**（掛在舊手機上） | ⏸ **擱置**（已實機驗證過，程式碼留著；改用 Render） |
 | **M10 Render 部署** | ✅ 健康檢查端點 + 防休眠 + Dockerfile + `render.yaml`（端點有離線測試） |
 | **M8 儲存後端**（MongoDB / SQLite / 文字檔） | ✅ 自動挑選 + 失敗退回本機，都有測試 |
 | **M9 Termux**（手機上的控制台） | ✅ 發佈腳本 + 實機步驟（`publish-termux.ps1`） |
+| **M11 AI 聊天**（OpenAI 相容 API ＋ Semantic Kernel） | ✅ @ 提及／回覆觸發、時間＋LLM 切段、每週全域 token 上限（實測真實 API 通過） |
 | M5 / M6 | ⬜ |
 
 ---
@@ -132,7 +132,11 @@ dotnet run --project src\TcBusBot.Discord
 /bus next      ← 查看所有訂閱目前的到站時間
 /bus end       ← 結束追蹤：一次取消全部訂閱（附「↩️ 復原」，按錯不用重設）
 /say <內容>    ← 讓 Bot 幫你說一句話（無用小功能）
+/ai status     ← AI 聊天狀態：模型、這一週用掉多少 token、這個頻道的記憶
+/ai forget     ← 忘掉這個頻道的 AI 對話記憶（不影響公車訂閱）
 ```
+
+AI 聊天不用指令：**@ 它、或回覆它的訊息**就會回話（見「AI 聊天」一節）。
 
 流程：
 
@@ -255,6 +259,74 @@ dotnet run --project src\TcBusBot.Discord
 - 內容裡的 `\n` 會變成真正的換行（斜線指令的輸入框打不出多行）
 - **關閉所有 mention** —— 不能拿它去 `@everyone` 洗頻
 - 想限制誰能用：`SAY_ALLOWED_USERS=<使用者ID>,<使用者ID>`（**不設定 = 所有人都能用**）
+
+### AI 聊天（OpenAI 相容 API ＋ Semantic Kernel）
+
+**@ 它、或回覆它的訊息**就會回話：
+
+```
+小明：@笨蛋猫猫搭公车 台中車站到靜宜大學要搭幾號？
+Bot ：300 或 304 都可以，300 走臺灣大道、304 停的站比較多。
+      即時到站我查不到，你可以用 /bus panel 訂閱，快到時我會通知你。
+
+小明：（回覆 Bot 的訊息）那大概多久一班？
+Bot ：（接著上面那一段講，知道「那」指的是 300/304）
+```
+
+沒有設定 `LLM_API_KEY` 時**整組功能不會啟用**，公車功能完全不受影響。
+
+#### 上下文怎麼決定（三段規則）
+
+| 情況 | 行為 |
+| --- | --- |
+| 距離上次說話**超過 `LLM_SEGMENT_GAP_MINUTES`**（預設 30 分） | 直接當成新的一段，**不帶**舊上下文，也不花錢問 LLM |
+| 時間內 | 由 **LLM 判斷**「這是接續還是換話題」；判斷換話題就開新的一段、不帶舊上下文 |
+| **使用者回覆了某一則訊息** | 回到那一則所屬的段落（即使它很舊、即使超過時間門檻），被回覆的內容一定會在上下文裡 |
+
+- **不同伺服器一定不相通**：記憶的 key 是 (伺服器, 頻道)，連索引都是分開的
+- 每個頻道各自一條對話；`/ai forget` 可以清掉這個頻道的記憶
+- 判斷失敗（模型亂回答、連不上）時**沿用目前段落** —— 突然失憶比多帶一點上下文更糟
+
+#### 每週 token 上限
+
+- **全域一份**（整個 Bot 共用），`LLM_WEEKLY_TOKENS`（預設 300,000；`0` = 不限）
+- 重置時間固定是 **UTC 週一 00:00**（台灣時間週一早上 8 點），`/ai status` 會顯示
+- 送出**之前**就用估算擋掉會超額的呼叫（不會先花錢再說），超過就回「額度用完了」+ 重置時間
+- 用量**會寫進資料庫**（跟訂閱組同一條後端鏈），所以重啟不會歸零
+- `/ai status` 會列出「哪個伺服器花了多少」，因為全域額度的代價就是需要看得出誰在花
+
+> 上限是軟性的：最後一次呼叫可能稍微超過（最多一次回覆的量）。
+
+#### ⚠️ 必須打開 Message Content Intent
+
+AI 聊天要讀訊息內容，這在 Discord 是**特權意圖**，必須手動開啟：
+
+1. <https://discord.com/developers/applications> → 選你的 Application
+2. 左側 **Bot** → **Privileged Gateway Intents** → 打開 **Message Content Intent**
+3. Save Changes → 重新啟動 Bot
+
+**沒開的後果**：閘道會用 `4014 Disallowed intent` 拒絕連線，Bot 完全連不上。
+程式在偵測到這個錯誤時會直接把上面三步印在 console（不會只丟一行看不懂的訊息）。
+
+不想開也可以：`--no-message-intent` → 只用公車功能（AI 聊天會關掉）。
+
+#### 相關環境變數
+
+| 鍵 | 預設 | 說明 |
+| --- | --- | --- |
+| `LLM_API_KEY` | — | **有填才會啟用**（別名：`OPENAI_API_KEY`、`DEEPSEEK_API_KEY`） |
+| `LLM_BASE_URL` | `https://api.deepseek.com/v1` | 任何 OpenAI 相容端點（要含 `/v1`） |
+| `LLM_MODEL` | `deepseek-flash` | 模型名稱 |
+| `LLM_WEEKLY_TOKENS` | `300000` | 每週 token 上限（全域；`0` = 不限） |
+| `LLM_SEGMENT_GAP_MINUTES` | `30` | 超過幾分鐘沒說話就當成新的一段 |
+| `LLM_TOPIC_DETECT` | `true` | 時間內是否讓 LLM 判斷「換話題了沒」 |
+| `LLM_MAX_CONTEXT_TURNS` | `20` | 帶進提示詞的歷史上限（則） |
+| `LLM_MAX_CONTEXT_TOKENS` | `3000` | 帶進提示詞的歷史上限（估算 token） |
+| `LLM_MAX_OUTPUT_TOKENS` | `800` | 單次回覆的輸出上限 |
+| `LLM_SYSTEM_PROMPT` | 內建人格 | 系統提示（決定人格與範圍） |
+| `LLM_USER_COOLDOWN_SECONDS` | `3` | 同一個人連續問的冷卻 |
+| `LLM_ALLOW_DM` | `false` | 私訊要不要回 |
+| `LLM_TIMEOUT_SECONDS` | `90` | 單次呼叫逾時 |
 
 ---
 
@@ -580,6 +652,11 @@ dotnet run --project src\TcBusBot.Discord
 | `TCBUS_MONGO` | — | MongoDB 連線字串（設定後訂閱組改存 MongoDB，所有平台共用） |
 | `TCBUS_MONGO_DB` | — | MongoDB 資料庫名稱（預設 `tcbus`） |
 | `SAY_ALLOWED_USERS` | — | 允許使用 `/say` 的 Discord 使用者 ID（逗號分隔）。**不設定 = 所有人都能用** |
+| `LLM_API_KEY` | — | OpenAI 相容 API 金鑰。**有填才會啟用 AI 聊天**（見「AI 聊天」一節） |
+| `LLM_BASE_URL` | — | LLM 端點（預設 `https://api.deepseek.com/v1`；任何 OpenAI 相容服務都可以） |
+| `LLM_MODEL` | — | 模型名稱（預設 `deepseek-flash`） |
+| `LLM_WEEKLY_TOKENS` | — | 每週 token 上限（全域；預設 300000；`0` = 不限） |
+| `LLM_SEGMENT_GAP_MINUTES` | — | 超過幾分鐘沒說話就當成新的一段（預設 30） |
 
 也可以用命令列覆寫，例如
 `--token <值>`、`--data tdx`、`--guild <id>`、`--verbose`、`--no-poller`、`--refresh`。
@@ -713,7 +790,7 @@ TDX 公車 v2 的公式是 **`呼叫次數 / 1,500` ＋ `回傳資料量(MB) / 1
 沒有 Discord Token 的情況下完整測試。
 
 ```powershell
-# 259 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端、.env 路徑、合併與復原、結束追蹤、SQLite 持久化
+# 308 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端、.env 路徑、合併與復原、結束追蹤、AI 聊天切段與每週額度、SQLite 持久化
 dotnet run --project src\TcBusBot.Cli -- selftest
 
 # 模糊站牌搜尋

@@ -37,6 +37,17 @@ internal interface ISavedGroupRepository : IDisposable
     bool Rename(long id, ulong userId, string newName);
     bool Delete(long id, ulong userId);
     void Touch(long id, ulong userId);
+
+    /// <summary>
+    /// 通用的小型狀態文件（目前只有「LLM 每週 token 用量」用）。
+    ///
+    /// 為什麼掛在這裡而不是另開一個儲存層：後端鏈（MongoDB → SQLite → 文字檔 → 記憶體）
+    /// 的連線、退回、警告邏輯只該有一份。多一個 key-value 只是舉手之勞，
+    /// 但要再複製一次「連不上 Mongo 怎麼辦」就太多了。
+    /// </summary>
+    string? LoadBlob(string key);
+
+    void SaveBlob(string key, string json);
 }
 
 /// <summary>一行一筆的文字檔後備（JSON Lines）。</summary>
@@ -297,4 +308,79 @@ internal sealed class TextSavedGroupRepository : ISavedGroupRepository
     }
 
     public void Dispose() { }
+
+    // ── 小型狀態文件 ──────────────────────────────────────
+    //
+    // 文字檔模式的 blob 放在**另一個檔案**（`llm_state.json`）：
+    // 混進 saved_groups.txt 會讓那個「用記事本就看得到」的檔案多出一堆看不懂的東西。
+
+    private readonly Dictionary<string, string> _blobs = new(StringComparer.Ordinal);
+
+    private string? BlobPath
+    {
+        get
+        {
+            if (_path is null) return null;
+            var dir = Path.GetDirectoryName(_path);
+            return string.IsNullOrEmpty(dir) ? "llm_state.json" : Path.Combine(dir, "llm_state.json");
+        }
+    }
+
+    public string? LoadBlob(string key)
+    {
+        lock (_gate)
+        {
+            if (_blobs.Count == 0 && BlobPath is { } path && File.Exists(path)) ReadBlobs(path);
+            return _blobs.TryGetValue(key, out var json) ? json : null;
+        }
+    }
+
+    public void SaveBlob(string key, string json)
+    {
+        lock (_gate)
+        {
+            _blobs[key] = json;
+
+            if (BlobPath is not { } path) return;
+
+            try
+            {
+                var tmp = path + ".tmp";
+                File.WriteAllText(tmp,
+                    JsonSerializer.Serialize(_blobs, BlobJson),
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                // 寫不進去只影響「用量紀錄」，不該讓聊天失敗
+                BotLog.Warn($"[儲存] 小狀態文件寫入失敗（{ex.GetType().Name}）：{path}");
+            }
+        }
+    }
+
+    private void ReadBlobs(string path)
+    {
+        try
+        {
+            var json = File.ReadAllText(path, Encoding.UTF8).TrimStart('\uFEFF');
+            if (json.Length == 0) return;
+
+            var loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(json, BlobJson);
+            if (loaded is null) return;
+
+            foreach (var kv in loaded) _blobs[kv.Key] = kv.Value;
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warn($"[儲存] 小狀態文件讀不出來（{ex.GetType().Name}）：{path}");
+        }
+    }
+
+    private static readonly JsonSerializerOptions BlobJson = new()
+    {
+        WriteIndented = true,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
 }

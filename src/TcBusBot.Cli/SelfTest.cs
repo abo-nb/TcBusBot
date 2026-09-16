@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Net;
+using TcBusBot.Core.Chat;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Tdx;
 using TcBusBot.Core.Configuration;
@@ -90,6 +91,9 @@ public static class SelfTest
 
         Section("19. 結束追蹤（/bus end）與復原");
         TestEndTracking(data, origin, dest);
+
+        Section("20. AI 聊天：時間切段、回覆舊訊息、伺服器隔離、每週 token 額度");
+        TestChat();
 
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
@@ -1161,6 +1165,234 @@ public static class SelfTest
         subs.RemoveAllForUser(other);
         Check("結束追蹤別人的訂閱時，我的完全不受影響",
             subs.GetGroup(mineA.Id) is not null && subs.GetGroup(notMine.Id) is null);
+    }
+
+    /// <summary>
+    /// <summary>
+    /// AI 聊天：**決定「這則訊息要不要接續前面」的規則**、伺服器隔離、每週額度。
+    ///
+    /// 這一段刻意完全不碰網路：切段規則、上下文裁剪、額度窗口都是純邏輯，
+    /// 而它們錯掉的代價很高 ——
+    ///   * 切錯 → 使用者看到「突然失憶」或「把別人的話題接起來」
+    ///   * 隔離錯 → **A 伺服器的對話跑到 B 伺服器**（這是最嚴重的那種錯）
+    ///   * 額度錯 → 錢包失控
+    /// </summary>
+    private static void TestChat()
+    {
+        var t0 = new DateTimeOffset(2026, 9, 16, 12, 0, 0, TimeSpan.Zero);
+
+        // ── 1) 時間切段：超過門檻就當新的一段 ────────────────
+        var options = new LlmOptions { SegmentGapMinutes = 30, TopicDetect = false, MaxContextTurns = 20 };
+        var store = new ConversationStore(options);
+
+        var first = Turn(1, "小明", "我要搭車", t0);
+        var d1 = store.Draft(100UL, 1000UL, first, null);
+        Check("★ 第一次說話 → 沒有上下文（新的一段）", d1.IsFirstEver && d1.GapExceeded);
+        var c1 = store.Commit(d1, first, startNewSegment: true, "第一次對話");
+        Check("第一次對話會建立段落", c1.NewSegment && c1.Context.Count == 0);
+
+        var second = Turn(2, "小明", "從車站到靜宜", t0.AddMinutes(2));
+        var d2 = store.Draft(100UL, 1000UL, second, null);
+        Check("兩分鐘後說話 → 不算新的一段", !d2.GapExceeded);
+        var c2 = store.Commit(d2, second, startNewSegment: false, "接續");
+        Check("★ 接續時會帶入前兩則（含 Bot 的回覆）", c2.Context.Count == 1, $"{c2.Context.Count} 則");
+
+        store.RecordAssistant(c2, BotTurn(3, "靜宜大學搭 300 或 304", t0.AddMinutes(2)));
+
+        var later = Turn(4, "小明", "晚安", t0.AddMinutes(120));
+        var d3 = store.Draft(100UL, 1000UL, later, null);
+        Check("★ 過了 2 小時 → 當成新的一段（不帶舊上下文）",
+            d3.GapExceeded && d3.Gap > TimeSpan.FromMinutes(30), $"間隔 {d3.Gap.TotalMinutes:0} 分");
+
+        var c3 = store.Commit(d3, later, startNewSegment: true, "距離上次超過 30 分鐘");
+        Check("★ 新的一段不帶任何舊訊息", c3.Context.Count == 0, $"{c3.Context.Count} 則");
+        Check("舊段落還在（可以回覆它把話題拉回來）", c3.Conversation.Segments.Count == 2);
+
+        // ── 2) 回覆舊訊息 → 即使超過時間門檻也回到那一段 ────
+        var botReply = BotTurn(3, "靜宜大學搭 300 或 304", t0.AddMinutes(2));
+        // （上面已經記過同樣的訊息 ID，這裡再用一次當作「回覆那則 Bot 訊息」）
+        var replied = Turn(5, "小明", "那大概多久一班？", t0.AddHours(3), replyTo: 3);
+        var d4 = store.Draft(100UL, 1000UL, replied, botReply);
+
+        Check("★ 被回覆的訊息找得到它屬於哪一段", d4.ReplySegment is not null);
+
+        var c4 = store.Commit(d4, replied, startNewSegment: false, "回覆舊訊息");
+        Check("★ 回覆舊訊息 → 回到那一段（不是目前這一段）",
+            c4.Segment.Id == c3.Conversation.Segments[0].Id, $"segment={c4.Segment.Id}");
+        Check("★ 回覆舊訊息時，被回覆的內容一定在上下文裡",
+            c4.Context.Any(t => t.MessageId == 3), $"{c4.Context.Count} 則");
+
+        // ── 3) 不同伺服器／不同頻道完全不相通 ──────────────
+        var otherGuild = Turn(10, "別人", "我要去逢甲", t0.AddMinutes(1));
+        var dOther = store.Draft(999UL, 1000UL, otherGuild, null);
+        Check("★ 別的伺服器是全新的一段（看不到 A 伺服器的對話）",
+            dOther.IsFirstEver && dOther.Current is null);
+
+        var otherChannel = Turn(11, "小明", "在另一個頻道問", t0.AddMinutes(1));
+        var dChannel = store.Draft(100UL, 2000UL, otherChannel, null);
+        Check("★ 同伺服器的另一個頻道也是全新的（每個頻道各自一條）",
+            dChannel.IsFirstEver && dChannel.Current is null);
+
+        // 跨伺服器「回覆」也不該撈到別人的歷史
+        Check("★ 別的伺服器的訊息 ID 在這個頻道查不到",
+            !store.HasMessage(100UL, 1000UL, dOther.Conversation.ChannelId == 1000UL ? 999UL : 999UL)
+            || !store.HasMessage(999UL, 1000UL, 1UL));
+
+        // ── 4) 上下文裁剪 ────────────────────────────────
+        var many = Enumerable.Range(1, 30)
+            .Select(i => Turn((ulong)i, "小明", $"第 {i} 句", t0.AddSeconds(i)))
+            .ToList();
+
+        var small = new LlmOptions { MaxContextTurns = 5, MaxContextTokens = 10_000 };
+        var trimmed = ContextBuilder.Trim(many, small);
+        Check("★ 超過數量上限時只留最新的幾則",
+            trimmed.Turns.Count == 5 && trimmed.Turns[^1].Content == "第 30 句",
+            $"{trimmed.Turns.Count} 則、丟掉 {trimmed.DroppedByCount}");
+
+        var tiny = new LlmOptions { MaxContextTurns = 50, MaxContextTokens = 60 };
+        var trimmedByTokens = ContextBuilder.Trim(many, tiny);
+        Check("★ token 上限也會生效（而且至少留一則）",
+            trimmedByTokens.Turns.Count is > 0 and < 30 && trimmedByTokens.EstimatedTokens <= 200,
+            $"{trimmedByTokens.Turns.Count} 則／約 {trimmedByTokens.EstimatedTokens} tokens");
+
+        var mustKeep = many[0];
+        var keepReply = ContextBuilder.Trim(many, small, mustKeep);
+        Check("★ 被回覆的那一則即使很舊也會被保留",
+            keepReply.KeptReplyTarget && keepReply.Turns.Any(t => t.MessageId == mustKeep.MessageId));
+
+        // ── 5) 話題判斷的解析（LLM 的回答不會永遠很乖）──────
+        Check("解析「SAME」→ 同一段", TopicSwitchDetector.Parse("SAME") == false);
+        Check("解析「NEW」→ 新的一段", TopicSwitchDetector.Parse("NEW") == true);
+        Check("解析「\\n new \\n」→ 新的一段（寬鬆比對）", TopicSwitchDetector.Parse("\n new \n") == true);
+        Check("★ 模型多講幾句時，以最後出現的結論為準",
+            TopicSwitchDetector.Parse("先前的對話是 SAME，但這則明顯是 NEW") == true);
+        Check("解析看不懂的回答 → null（呼叫端會沿用目前段落）",
+            TopicSwitchDetector.Parse("我不確定") is null);
+        Check("空字串 → null", TopicSwitchDetector.Parse("") is null);
+
+        // ── 6) token 估算 ────────────────────────────────
+        Check("token 估算：中文一字約一 token", TokenEstimator.Estimate("台中公車") is >= 4 and <= 8,
+            TokenEstimator.Estimate("台中公車").ToString());
+        Check("token 估算：英文四字約一 token", TokenEstimator.Estimate("hello world") is >= 2 and <= 5,
+            TokenEstimator.Estimate("hello world").ToString());
+        Check("token 估算：空字串是 0", TokenEstimator.Estimate("") == 0);
+        Check("token 估算：越長越大",
+            TokenEstimator.Estimate("公車") < TokenEstimator.Estimate("公車公車公車公車"));
+
+        // ── 7) 每週額度：窗口、重置、擋下 ──────────────────
+        Check("★ 週窗口從 UTC 週一 00:00 起算",
+            WeeklyTokenBudget.WeekStartUtc(new DateTimeOffset(2026, 9, 16, 15, 30, 0, TimeSpan.Zero))
+                == new DateTimeOffset(2026, 9, 14, 0, 0, 0, TimeSpan.Zero),
+            WeeklyTokenBudget.WeekStartUtc(t0).ToString("u"));
+
+        Check("★ 週日也算同一週（週一才是分界）",
+            WeeklyTokenBudget.WeekStartUtc(new DateTimeOffset(2026, 9, 20, 23, 59, 0, TimeSpan.Zero))
+                == new DateTimeOffset(2026, 9, 14, 0, 0, 0, TimeSpan.Zero));
+
+        Check("★ 星期一 00:00 之後就是新的一週",
+            WeeklyTokenBudget.WeekStartUtc(new DateTimeOffset(2026, 9, 21, 0, 0, 1, TimeSpan.Zero))
+                == new DateTimeOffset(2026, 9, 21, 0, 0, 0, TimeSpan.Zero));
+
+        Check("重置時間 = 週一 + 7 天",
+            WeeklyTokenBudget.ResetAt(t0) - WeeklyTokenBudget.WeekStartUtc(t0) == TimeSpan.FromDays(7));
+
+        var budgetOptions = new LlmOptions { WeeklyTokenLimit = 1000 };
+        var budget = new WeeklyTokenBudget(budgetOptions, store: null, now: t0);
+
+        Check("一開始額度是滿的", budget.Check(100, t0).Allowed);
+        Check("剩餘量正確", budget.Check(100, t0).Remaining == 1000);
+
+        budget.Record(300, 200, 100UL, t0);
+        Check("記帳之後用量累加（in + out）", budget.Usage.TotalTokens == 500, budget.Usage.TotalTokens.ToString());
+        Check("記帳含呼叫次數", budget.Usage.Calls == 1);
+        Check("★ 記得住是哪個伺服器花的（全域額度要看得出誰在花）",
+            budget.Usage.ByGuild.TryGetValue("100", out var byGuild) && byGuild == 500);
+
+        var almostFull = budget.Check(500, t0);
+        Check("★ 這次的輸入會讓總量超過上限 → 事前就擋下來", !almostFull.Allowed, almostFull.Reason);
+        Check("還差一點點但不會超過 → 放行", budget.Check(499, t0).Allowed);
+
+        budget.Record(700, 0, 100UL, t0);
+        Check("★ 額度用完後一律擋下", !budget.Check(1, t0).Allowed, budget.Usage.TotalTokens.ToString());
+
+        budget.RecordRefusal(t0);
+        Check("被擋下的次數會記錄", budget.Usage.Refusals == 1);
+
+        // 跨週自動歸零
+        var nextWeek = t0.AddDays(7);
+        var afterRollover = budget.Check(100, nextWeek);
+        Check("★ 進入新的一週 → 用量歸零、額度恢復",
+            afterRollover.Allowed && budget.Usage.TotalTokens == 0, budget.Describe());
+
+        // 不限額度（0 = 不限）
+        var unlimited = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 0 }, null, t0);
+        unlimited.Record(999_999, 1, 1UL, t0);
+        Check("LLM_WEEKLY_TOKENS=0 → 不限額度", unlimited.Check(500_000, t0).Allowed && unlimited.Check(0, t0).Unlimited);
+
+        // ── 8) 用量要能跨重啟（持久化）────────────────────
+        var memory = new FakeStateStore();
+        var persisted = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 5000 }, memory, t0);
+        persisted.Record(120, 80, 42UL, t0);
+        persisted.Flush(t0);
+
+        var reloaded = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 5000 }, memory, t0);
+        Check("★ 重啟後讀得到同一週的用量（否則每週上限形同虛設）",
+            reloaded.Usage.TotalTokens == 200, reloaded.Usage.TotalTokens.ToString());
+        Check("重啟後也記得是哪些伺服器花的",
+            reloaded.Usage.ByGuild.TryGetValue("42", out var reused) && reused == 200);
+
+        // ── 9) 對話記憶會過期清掉 ────────────────────────
+        var ttlStore = new ConversationStore(new LlmOptions { ChannelTtl = TimeSpan.FromHours(1) });
+        var ttlTurn = Turn(1, "小明", "嗨", t0);
+        ttlStore.Commit(ttlStore.Draft(1UL, 1UL, ttlTurn, null), ttlTurn, true, "第一次");
+        Check("清掃前還在", ttlStore.Snapshot(1UL, 1UL, t0) is not null);
+        Check("★ 超過 TTL 的頻道會被清掉", ttlStore.Purge(t0.AddHours(3)) == 1);
+        Check("清掉之後查不到", ttlStore.Snapshot(1UL, 1UL, t0.AddHours(3)) is null);
+
+        // ── 10) 長回覆要分段（Discord 單則 2000 字）─────────
+        var longText = string.Join("\n", Enumerable.Range(1, 300).Select(i => $"第 {i} 行：公車資訊"));
+        var chunks = SplitForTest(longText, 1900);
+        Check("★ 超長回覆會切成多段", chunks.Count > 1, $"{chunks.Count} 段");
+        Check("★ 每一段都不超過 2000 字（Discord 上限）", chunks.All(c => c.Length <= 2000),
+            chunks.Max(c => c.Length).ToString());
+        Check("★ 分段後內容完整（沒有漏字）",
+            string.Concat(chunks).Replace("\n", "").Replace(" ", "").Length
+                == longText.Replace("\n", "").Replace(" ", "").Length);
+    }
+
+    /// <summary>測試用的假儲存區（模擬「重啟後還在」）。</summary>
+    private sealed class FakeStateStore : TcBusBot.Core.Chat.ILlmStateStore
+    {
+        private readonly Dictionary<string, string> _map = new(StringComparer.Ordinal);
+
+        public string? GetBlob(string key) => _map.TryGetValue(key, out var json) ? json : null;
+
+        public void SetBlob(string key, string json) => _map[key] = json;
+    }
+
+    private static ChatTurn Turn(ulong id, string author, string content, DateTimeOffset at, ulong? replyTo = null)
+        => new(ChatRole.User, author, 12345UL, id, content, at, replyTo);
+
+    private static ChatTurn BotTurn(ulong id, string content, DateTimeOffset at)
+        => new(ChatRole.Assistant, "笨蛋猫猫搭公车", 999UL, id, content, at);
+
+    /// <summary>與 LlmChatService.Split 相同的規則（Core 不該知道 Discord 的字數限制，所以在這裡比對行為）。</summary>
+    private static List<string> SplitForTest(string text, int maxChars)
+    {
+        var chunks = new List<string>();
+        var remaining = (text ?? "").Trim();
+
+        while (remaining.Length > maxChars)
+        {
+            var cut = remaining.LastIndexOf('\n', Math.Min(maxChars, remaining.Length - 1));
+            if (cut < maxChars / 2) cut = maxChars;
+
+            chunks.Add(remaining[..cut].TrimEnd());
+            remaining = remaining[cut..].TrimStart();
+        }
+
+        if (remaining.Length > 0) chunks.Add(remaining);
+        return chunks;
     }
 
     /// <summary>

@@ -26,6 +26,9 @@ internal static class BotStatus
     /// <summary>由 Program 在建立訂閱服務後填入。</summary>
     public static Func<(int Groups, int Subscriptions)>? SubscriptionCounts { get; set; }
 
+    /// <summary>AI 聊天狀態（模型、每週用量）——由 Program 在建立 LLM 後填入。</summary>
+    public static Func<string>? Llm { get; set; }
+
     private static readonly JsonSerializerOptions Json = new()
     {
         WriteIndented = false,
@@ -50,7 +53,8 @@ internal static class BotStatus
                 poller = Poller,
                 subscriptionGroups = groups,
                 subscriptions = subs,
-                cachedEtas = CachedEtas?.Invoke() ?? 0
+                cachedEtas = CachedEtas?.Invoke() ?? 0,
+                llm = Llm?.Invoke() ?? "未啟用"
             }, Json);
         }
         catch (Exception ex)

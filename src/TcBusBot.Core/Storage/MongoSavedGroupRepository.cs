@@ -33,6 +33,9 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
     public const string CounterCollectionName = "counters";
     public const string CounterId = "saved_groups_seq";
 
+    /// <summary>通用小狀態（LLM 每週用量）放這裡。</summary>
+    public const string BlobCollectionName = "blobs";
+
     // 連線逾時：**不要設太短**。雲端（Render）連 Atlas 第一次要經過
     // DNS SRV → TLS 握手 → 複製集探索，3 秒常常不夠（實測就會出現
     // 「A timeout occurred after 2998ms selecting a server」）。
@@ -43,6 +46,7 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
 
     private readonly IMongoCollection<SavedGroupDocument> _groups;
     private readonly IMongoCollection<CounterDocument> _counters;
+    private readonly IMongoCollection<MongoDB.Bson.BsonDocument> _blobs;
     private readonly string _describe;
 
     public MongoSavedGroupRepository(string connectionString, string database = DefaultDatabase)
@@ -67,6 +71,7 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
 
         _groups = db.GetCollection<SavedGroupDocument>(CollectionName);
         _counters = db.GetCollection<CounterDocument>(CounterCollectionName);
+        _blobs = db.GetCollection<MongoDB.Bson.BsonDocument>(BlobCollectionName);
         EnsureIndexes();
 
         _describe = $"MongoDB（{Mask(connectionString)}／資料庫 {db.DatabaseNamespace.DatabaseName}）";
@@ -223,6 +228,30 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
     }
 
     public void Dispose() { }
+
+    // ── 小型狀態文件（LLM 每週用量）──────────────────────
+    //
+    // 用 BsonDocument 直接存取：只有 key／json 兩個欄位，
+    // 為它再宣告一個 document 類別不划算，而且 Atlas 介面上也一眼看得懂。
+
+    public string? LoadBlob(string key)
+    {
+        var doc = _blobs.Find(Builders<MongoDB.Bson.BsonDocument>.Filter.Eq("_id", key)).FirstOrDefault();
+        return doc is not null && doc.TryGetValue("json", out var json) ? json.AsString : null;
+    }
+
+    public void SaveBlob(string key, string json)
+    {
+        var filter = Builders<MongoDB.Bson.BsonDocument>.Filter.Eq("_id", key);
+        var doc = new MongoDB.Bson.BsonDocument
+        {
+            { "_id", key },
+            { "json", json },
+            { "updatedAt", DateTime.UtcNow }
+        };
+
+        _blobs.ReplaceOne(filter, doc, new ReplaceOptions { IsUpsert = true });
+    }
 
     /// <summary>只留 host，不印出帳號密碼（連線字串等同密碼）。</summary>
     public static string Mask(string connectionString)

@@ -1,3 +1,4 @@
+using TcBusBot.Core.Chat;
 using TcBusBot.Core.Configuration;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Tdx;
@@ -78,6 +79,20 @@ public sealed class BotConfig
     public int ConnectTimeoutSeconds { get; private set; } = 30;
 
     public TdxOptions Tdx { get; } = new();
+
+    /// <summary>LLM 聊天設定（沒有 LLM_API_KEY 時 <see cref="LlmOptions.IsConfigured"/> 為 false，功能整組關掉）。</summary>
+    public LlmOptions Llm { get; } = new();
+
+    /// <summary>
+    /// 要不要向 Discord 要 Message Content 特權意圖。
+    ///
+    /// ⚠️ 這是「讀取訊息內容」的權限，**必須同時在 Discord Developer Portal 開啟**
+    /// （Bot → Privileged Gateway Intents → Message Content Intent），
+    /// 否則閘道會用 4014（Disallowed intent）把連線踢掉，Bot 完全連不上。
+    /// 所以：沒設定 LLM 時預設不要（維持原本只要 Guilds 就能跑），
+    /// 需要時可以用 --no-message-intent 關掉。
+    /// </summary>
+    public bool EnableMessageContentIntent { get; private set; }
 
     public static BotConfig Load(string[] args)
     {
@@ -164,6 +179,64 @@ public sealed class BotConfig
         if (int.TryParse(SettingResolver.Resolve(args, "--connect-timeout", file, ["TCBUS_CONNECT_TIMEOUT"]).Value, out var ct))
             cfg.ConnectTimeoutSeconds = ct;
 
+        // ── LLM（OpenAI 相容 API，Semantic Kernel 實作）──────
+        cfg.Llm.ApiKey = SettingResolver.Resolve(args, "--llm-key", file,
+            ["LLM_API_KEY", "OPENAI_API_KEY", "OPENAI_KEY", "DEEPSEEK_API_KEY"]).Value;
+
+        cfg.Llm.BaseUrl = SettingResolver.Resolve(args, "--llm-url", file,
+            ["LLM_BASE_URL", "OPENAI_BASE_URL", "LLM_ENDPOINT"]).Value ?? cfg.Llm.BaseUrl;
+
+        cfg.Llm.Model = SettingResolver.Resolve(args, "--llm-model", file,
+            ["LLM_MODEL", "OPENAI_MODEL"]).Value ?? cfg.Llm.Model;
+
+        var systemPrompt = SettingResolver.Resolve(args, "--llm-prompt", file, ["LLM_SYSTEM_PROMPT"]).Value;
+        if (!string.IsNullOrWhiteSpace(systemPrompt)) cfg.Llm.SystemPrompt = systemPrompt!;
+
+        if (long.TryParse(SettingResolver.Resolve(args, "--llm-weekly-tokens", file,
+                ["LLM_WEEKLY_TOKENS", "LLM_WEEKLY_LIMIT"]).Value, out var weekly) && weekly >= 0)
+            cfg.Llm.WeeklyTokenLimit = weekly;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-gap", file,
+                ["LLM_SEGMENT_GAP_MINUTES", "LLM_GAP_MINUTES"]).Value, out var gap) && gap is > 0 and <= 1440)
+            cfg.Llm.SegmentGapMinutes = gap;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-context-turns", file,
+                ["LLM_MAX_CONTEXT_TURNS"]).Value, out var turns) && turns is > 0 and <= 100)
+            cfg.Llm.MaxContextTurns = turns;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-context-tokens", file,
+                ["LLM_MAX_CONTEXT_TOKENS"]).Value, out var ctxTokens) && ctxTokens >= 256)
+            cfg.Llm.MaxContextTokens = ctxTokens;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-max-output", file,
+                ["LLM_MAX_OUTPUT_TOKENS"]).Value, out var maxOut) && maxOut is > 0 and <= 8192)
+            cfg.Llm.MaxOutputTokens = maxOut;
+
+        if (double.TryParse(SettingResolver.Resolve(args, "--llm-temperature", file,
+                ["LLM_TEMPERATURE"]).Value, out var temp) && temp is >= 0 and <= 2)
+            cfg.Llm.Temperature = temp;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-cooldown", file,
+                ["LLM_USER_COOLDOWN_SECONDS"]).Value, out var cooldown) && cooldown >= 0)
+            cfg.Llm.UserCooldownSeconds = cooldown;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-timeout", file,
+                ["LLM_TIMEOUT_SECONDS"]).Value, out var llmTimeout) && llmTimeout is >= 5 and <= 600)
+            cfg.Llm.RequestTimeoutSeconds = llmTimeout;
+
+        var topicDetect = SettingResolver.Resolve(args, "--llm-topic-detect", file,
+            ["LLM_TOPIC_DETECT"]).Value;
+        if (!string.IsNullOrWhiteSpace(topicDetect))
+            cfg.Llm.TopicDetect = !IsFalsy(topicDetect!);
+
+        var allowDm = SettingResolver.Resolve(args, "--llm-dm", file, ["LLM_ALLOW_DM"]).Value;
+        if (!string.IsNullOrWhiteSpace(allowDm)) cfg.Llm.AllowDm = !IsFalsy(allowDm!);
+
+        // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
+        cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;
+        if (args.Contains("--no-message-intent")) cfg.EnableMessageContentIntent = false;
+        if (args.Contains("--message-intent")) cfg.EnableMessageContentIntent = true;
+
         // ★ 最後才把 .env 的內容匯出到行程環境變數（讓程式內任何地方都能用
         //   Environment.GetEnvironmentVariable 讀到）。
         //   ⚠️ 一定要在 Resolve 之後：否則 Resolve 會先在環境變數裡找到 .env 的值，
@@ -186,6 +259,10 @@ public sealed class BotConfig
     public string TokenPreview => string.IsNullOrEmpty(Token)
         ? "（未設定）"
         : $"{Token.Length} 字元，來源：{TokenSource}";
+
+    /// <summary>true／1／yes／on → true；false／0／no／off → false（大小寫不拘）。</summary>
+    private static bool IsFalsy(string value)
+        => value.Trim().ToLowerInvariant() is "0" or "false" or "no" or "off" or "n";
 
     // ─────────────────────────────────────────────────────
 }

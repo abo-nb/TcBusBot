@@ -3,6 +3,7 @@ using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
 using TcBusBot.Core.Bus;
+using TcBusBot.Core.Chat;
 using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Hosting;
 using TcBusBot.Core.Realtime;
@@ -135,18 +136,76 @@ public static class Program
 
         var runtime = new BotRuntime(subs, api) { DataSourceDescription = sourceDesc };
 
+        // ── 2b) AI 聊天（選配：有 LLM_API_KEY 才啟用）──────
+        //   刻意讓「LLM 壞掉」不影響公車功能：設定錯、連不上、金鑰過期
+        //   都只印警告，Bot 照常上線。
+        var llmOptions = cfg.Llm;
+        ILlmClient? llm = null;
+        SemanticKernelLlmClient? llmClient = null;
+
+        // 對話記憶與用量預算**一律建立**（沒有 LLM 時就是空的）：
+        // `/ai status` 才不用處理「服務不存在」這種情況。
+        var conversations = new ConversationStore(llmOptions);
+        var budget = new WeeklyTokenBudget(llmOptions, savedGroups);
+
+        if (llmOptions.IsConfigured)
+        {
+            var (created, message) = SemanticKernelLlmClient.Create(llmOptions);
+            if (created is null)
+            {
+                Console.WriteLine($"⚠️  {message}");
+            }
+            else
+            {
+                llmClient = created;
+                llm = created;
+
+                Console.WriteLine(message);
+                Console.WriteLine($"    每週額度：{budget.Describe()}");
+                Console.WriteLine("    對話記憶：只在記憶體（每個頻道各自一份，不同伺服器不相通）");
+            }
+        }
+        else
+        {
+            Console.WriteLine("⏸️  AI 聊天未啟用（沒有設定 LLM_API_KEY）");
+        }
+
+        Console.WriteLine();
+
         var services = new SimpleServiceProvider()
             .Add(data)
             .Add(subs)
             .Add(sessions)
             .Add(runtime)
             .Add(cache)
-            .Add(savedGroups);
+            .Add(savedGroups)
+            .Add(llmOptions)
+            .Add(conversations)
+            .Add(budget);
+
+        // ★ ILlmClient 一定要註冊（沒設定時給空物件）：
+        //   Discord.Net 要求模組的每個建構子參數都解析得到，否則**連 Bot 都啟動不了**。
+        services.Add<ILlmClient>(llm ?? DisabledLlmClient.Instance);
 
         // ── 3) Discord ────────────────────────────────────
+        // 意圖（intents）：
+        //   * Guilds        —— 斜線指令與元件互動
+        //   * GuildMessages + MessageContent —— AI 聊天要讀訊息內容
+        //     ⚠️ MessageContent 是**特權意圖**，必須同時在 Discord Developer Portal
+        //        開啟（Bot → Privileged Gateway Intents → Message Content Intent），
+        //        否則閘道會用 4014 把我們踢掉（見 OnLog 的提示）。
+        //   * DirectMessages —— 只有允許私訊時才要
+        var intents = GatewayIntents.Guilds;
+
+        if (cfg.EnableMessageContentIntent)
+        {
+            intents |= GatewayIntents.GuildMessages | GatewayIntents.MessageContent;
+            if (llmOptions.AllowDm) intents |= GatewayIntents.DirectMessages;
+        }
+
         var client = new DiscordSocketClient(new DiscordSocketConfig
         {
-            GatewayIntents = GatewayIntents.Guilds,   // 斜線指令與元件互動不需要更多
+            GatewayIntents = intents,
             MessageCacheSize = 0,
             LogLevel = cfg.Verbose ? LogSeverity.Verbose : LogSeverity.Info
         });
@@ -157,9 +216,55 @@ public static class Program
             LogLevel = cfg.Verbose ? LogSeverity.Verbose : LogSeverity.Info
         });
 
-        await interactions.AddModuleAsync<BusModule>(services);
-        await interactions.AddModuleAsync<BusComponentModule>(services);
-        await interactions.AddModuleAsync<SayModule>(services);
+        // 一個模組註冊失敗**不可以**讓整個 Bot 起不來：
+        // 公車功能是主要功能，AI 聊天是額外的（曾經因為 ILlmClient 沒註冊，
+        // 這裡直接丟例外 → Bot 完全啟動不了）。
+        async Task RegisterModuleAsync<TModule>(string label) where TModule : class
+        {
+            try
+            {
+                await interactions.AddModuleAsync<TModule>(services);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️  模組 {label} 註冊失敗（這個指令群組不會出現）：" +
+                                  $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        await RegisterModuleAsync<BusModule>("bus");
+        await RegisterModuleAsync<BusComponentModule>("bus（按鈕／選單）");
+        await RegisterModuleAsync<SayModule>("say");
+        await RegisterModuleAsync<ChatModule>("ai");
+
+        // ── AI 聊天：接上訊息事件 ───────────────────────────
+        LlmChatService? chat = null;
+
+        if (llm is not null)
+        {
+            // 真正的規則（切段／額度／呼叫）在 Core 的 ChatOrchestrator，
+            // 這裡只負責「Discord 的部分」。
+            var orchestrator = new ChatOrchestrator(llm, llmOptions, conversations, budget);
+            chat = new LlmChatService(client, orchestrator, llmOptions);
+
+            client.MessageReceived += message =>
+            {
+                // 事件處理不能被例外中斷（Discord.Net 會把例外往上丟，可能影響連線）
+                _ = Task.Run(() => chat.HandleAsync(message));
+                return Task.CompletedTask;
+            };
+
+            BotStatus.Llm = () => chat.Describe();
+
+            if (cfg.EnableMessageContentIntent)
+                Console.WriteLine("▶️  AI 聊天已接上（@ 它、或回覆它的訊息就會回話）");
+            else
+                Console.WriteLine("⚠️  AI 聊天需要 Message Content 意圖，但被 --no-message-intent 關掉了 → 不會回話");
+        }
+        else
+        {
+            BotStatus.Llm = () => "未啟用（沒有 LLM_API_KEY）";
+        }
 
         client.Log += msg => OnLog(msg, cfg.Verbose);
         interactions.Log += msg => OnLog(msg, cfg.Verbose);
@@ -322,6 +427,33 @@ public static class Program
 
         BotStatus.Poller = runtime.PollerDescription;
 
+        // ── 4b) 對話記憶的清掃 ─────────────────────────────
+        // 每個頻道各自一份記憶，長時間掛著會慢慢累積（Bot 可能連續跑好幾天）。
+        // 每 30 分鐘清一次「超過 TTL 沒動」的頻道。
+        if (chat is not null)
+        {
+            _ = Task.Run(async () =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    try { await Task.Delay(TimeSpan.FromMinutes(30), cts.Token); }
+                    catch (OperationCanceledException) { return; }
+
+                    try
+                    {
+                        var removed = chat.Purge(DateTimeOffset.UtcNow);
+                        if (removed > 0)
+                            Console.WriteLine($"[llm] 清掉 {removed} 個太久沒動的頻道記憶" +
+                                              $"（目前追蹤 {chat.ChannelCount} 個）");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[llm] 清理對話記憶失敗：{ex.GetType().Name}");
+                    }
+                }
+            }, cts.Token);
+        }
+
         // ── 防休眠（Render 免費層閒置約 15 分鐘就會把服務停掉）──
         KeepAliveLoop? keepAlive = null;
         if (!string.IsNullOrWhiteSpace(cfg.AppUrl))
@@ -351,6 +483,12 @@ public static class Program
         health?.Dispose();
         await client.StopAsync();
         await client.LogoutAsync();
+
+        // 把還沒寫下去的每週用量補寫（不然重啟前的那幾次呼叫就不算錢了）
+        budget.Flush(DateTimeOffset.UtcNow);
+        chat?.Dispose();
+        llmClient?.Dispose();
+
         savedGroups.Dispose();
         cts.Dispose();
         _stop = null;
@@ -383,6 +521,8 @@ public static class Program
         Console.WriteLine($"  MongoDB　　　：{cfg.MongoPreview}");
         Console.WriteLine($"  健康檢查端點 ：{(cfg.EnableHealthEndpoint ? $"埠 {cfg.Port}（/ 與 /health）" : "已停用（--no-health）")}");
         Console.WriteLine($"  防休眠　　　 ：{(string.IsNullOrWhiteSpace(cfg.AppUrl) ? "未設定（沒有 APP_URL）" : $"每 {cfg.KeepAliveMinutes} 分鐘 ping {cfg.AppUrl}")}");
+        Console.WriteLine($"  AI 聊天　　　：{cfg.Llm.Describe()}");
+        Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
         Console.WriteLine();
     }
 
@@ -406,6 +546,8 @@ public static class Program
         Console.WriteLine("     /bus status   查看 Bot 狀態");
         Console.WriteLine("     /say <內容>   讓 Bot 幫你說一句話（無用小功能；" +
                           $"可用 {SayModule.AllowListVariable} 限制使用者）");
+        Console.WriteLine("     /ai status    AI 聊天狀態（模型、每週 token 用量、這個頻道的記憶）");
+        Console.WriteLine("     /ai forget    忘掉這個頻道的 AI 對話記憶");
         Console.WriteLine("──────────────────────────────────────────────────────────");
         Console.WriteLine();
     }
@@ -453,6 +595,26 @@ public static class Program
 
     private static Task OnLog(LogMessage msg, bool verbose)
     {
+        // 「沒開特權意圖」是**連不上**最常見的原因，而且 Discord.Net 只會給一行
+        // 看不出所以然的訊息（Disconnected: Disallowed intent(s)），
+        // 所以在這裡翻譯成「去哪個網頁按什麼」。
+        var text0 = msg.Message ?? "";
+        if (text0.Contains("Disallowed intent", StringComparison.OrdinalIgnoreCase)
+            || text0.Contains("4014"))
+        {
+            Console.WriteLine();
+            Console.WriteLine("❌ Discord 拒絕了連線：要求了沒有被允許的特權意圖（4014 Disallowed intent）");
+            Console.WriteLine();
+            Console.WriteLine("   這是因為 AI 聊天需要「Message Content Intent」，而它必須**手動開啟**：");
+            Console.WriteLine("     1. https://discord.com/developers/applications → 選你的 Application");
+            Console.WriteLine("     2. 左側 Bot → Privileged Gateway Intents → 打開 **Message Content Intent**");
+            Console.WriteLine("     3. 按 Save Changes，然後重新啟動 Bot（Render 會自動重啟）");
+            Console.WriteLine();
+            Console.WriteLine("   不想開的話也可以只用公車功能（AI 聊天會關掉）：");
+            Console.WriteLine("     dotnet run --project src\\TcBusBot.Discord -- --no-message-intent");
+            Console.WriteLine();
+        }
+
         // 預設只印錯誤，避免洗版；--verbose 時全部印出（排查連線問題用）
         if (!verbose && msg.Severity is not (LogSeverity.Error or LogSeverity.Critical))
             return Task.CompletedTask;

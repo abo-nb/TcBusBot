@@ -2897,6 +2897,114 @@ Render 會在啟動後不久探測，等到 Discord 連上（本來就要好幾�
 
 ---
 
+## 20. AI 聊天（OpenAI 相容 API ＋ Semantic Kernel）
+
+### 20.1 為什麼用 Semantic Kernel、又只用到最上層
+
+需求是「接 LLM，且用 OpenAI 相容 API」。選 SK 的理由是它把
+「換服務」變成改兩個環境變數：
+
+```csharp
+builder.AddOpenAIChatCompletion(modelId, endpoint: new Uri(baseUrl), apiKey, httpClient);
+```
+
+連接器支援自訂 `endpoint`，所以 DeepSeek／OpenAI／OpenRouter／自架 Ollama 都是同一段程式碼。
+
+**刻意不用 plugin / function calling / planner**：那些在其他 OpenAI 相容服務上支援程度不一，
+一旦換服務就會壞掉。這裡只用到 `Kernel` ＋ `IChatCompletionService` ＋ `ChatHistory`。
+
+### 20.2 分層：規則放 Core、Discord 只負責貼訊息
+
+```
+TcBusBot.Core/Chat/
+  LlmOptions            設定（連同「時間門檻 ↔ token 估算 ↔ 每週上限」的關聯）
+  ChatTurn              一則訊息（誰說的／什麼時候／訊息 ID／被回覆誰）
+  ConversationStore     對話段落（記憶體；key = (GuildId, ChannelId)）
+  TopicSwitchDetector   「換話題了沒」的提示詞與**寬鬆解析**
+  TokenEstimator        估算 token（事前擋額度用）＋ ContextBuilder 裁上下文
+  WeeklyTokenBudget     每週額度（UTC 週一 00:00 重置）＋ 持久化
+  ILlmClient            ← 介面（測試與「沒啟用」都用得到）
+  SemanticKernelLlmClient  ← SK 實作
+  DisabledLlmClient     ← 沒設定金鑰時的空物件（見 20.6）
+  ChatOrchestrator      完整流程：決定上下文 → 檢查額度 → 呼叫 → 回覆
+
+TcBusBot.Discord/
+  LlmChatService        @ 提及／回覆的判定、正在輸入、分段貼回頻道
+  Modules/ChatModule    /ai status、/ai forget
+```
+
+**為什麼把流程搬到 Core**：切段、隔離、額度就是**規則本身**。
+留在 Discord 類別裡就只能靠「真的在 Discord 上打字」驗證；
+搬到 Core 之後，離線測試（`selftest` 第 20 節）與實際 Bot 跑的是同一份程式碼。
+
+### 20.3 上下文決定的三條規則
+
+| 順位 | 條件 | 行為 |
+| --- | --- | --- |
+| 1 | 使用者**回覆**了某則訊息 | 回到那一則所屬的段落（即使很舊、即使超過時間門檻）；被回覆的內容一定進上下文 |
+| 2 | 距離上次說話 > `LLM_SEGMENT_GAP_MINUTES` | 直接開新段落，**不呼叫 LLM**（不用花錢就能判斷的事不要花錢） |
+| 3 | 其他 | 問 LLM「接續（SAME）還是換話題（NEW）」，只花約 100~300 tokens |
+
+- 判斷失敗或回答看不懂 → **沿用目前段落**（突然失憶比多帶一點上下文更糟）
+- 解析刻意寬鬆：抓**最後出現**的 NEW／SAME（推理模型常常多講幾句），
+  實測回覆就是一個字 `NEW`
+- 上下文另外受 `LLM_MAX_CONTEXT_TURNS`／`LLM_MAX_CONTEXT_TOKENS` 限制，
+  但**被回覆的那一則保證不會被裁掉**
+- **不同伺服器不相通**：記憶的 key 是 `(GuildId, ChannelId)`，
+  `FindByMessage` 只在同一個頻道裡找 —— 跨伺服器連索引都不共用
+
+### 20.4 每週 token 上限（全域）
+
+- 判斷式：`已用 + 這次的估算輸入 >= 上限` → **送出前**就拒絕（不是先花錢再說）
+- 重置：`UTC 週一 00:00`（`WeekStartUtc`），`ResetAt` 顯示給使用者
+- 記帳來源：**API 回報的 `usage`**，取不到才用 <see cref="TokenEstimator"/> 估算並標示
+- 全域額度的代價是「一個伺服器吵起來會用掉大家的」，所以另外記 `ByGuild`，
+  `/ai status` 列得出來是誰在花
+
+**用量一定要持久化**：借訂閱組的後端鏈（MongoDB → SQLite → 文字檔 → 記憶體），
+存成一個小文件（`ILlmStateStore` / Mongo 的 `blobs` 集合 / SQLite 的 `blobs` 表 /
+文字模式的 `llm_state.json`）。重啟就歸零的每週上限等於沒有上限。
+
+### 20.5 用量讀取（有實測數據）
+
+SK 把 API 的 `usage` 放進 `ChatMessageContent.Metadata["Usage"]`，但**型別隨版本而異**，
+所以用屬性名稱反射讀（`InputTokenCount` / `PromptTokens`、`OutputTokenCount` / `CompletionTokens`）。
+
+實測（SK 1.66 ＋ OpenAI SDK 2.x 打 DeepSeek 相容端點）：
+
+```
+Usage type = OpenAI.Chat.ChatTokenUsage
+   InputTokenCount (Int32) = 47
+   OutputTokenCount (Int32) = 137
+   TotalTokenCount (Int32) = 184
+```
+
+### 20.6 踩到的坑：`ILlmClient` 沒註冊 → 整個 Bot 啟動失敗
+
+`ChatModule` 的建構子有 `ILlmClient` 參數。Discord.Net 建立模組時會挑
+「參數最多」的建構子，而且要求**每個參數型別都解析得到**；
+沒設定金鑰時容器裡沒有 `ILlmClient` → 模組建不起來 → **`AddModuleAsync` 直接丟例外**。
+
+**這不是「AI 功能不能用」，而是 Bot 完全起不來。**兩個修正：
+
+1. 永遠註冊 `ILlmClient`（沒設定時是 `DisabledLlmClient` 空物件）
+2. `Program.cs` 的每個 `AddModuleAsync` 都包 try/catch ——
+   一個選配功能的模組壞掉不該拖垮主要功能
+
+這個 bug 是 `--dryrun` 的**指令樹檢查**抓到旳（它離線把模組組起來建樹），
+不是上線後才發現 —— 這就是那段檢查存在的理由。
+
+### 20.7 驗收方式
+
+| 項目 | 怎麼驗 |
+| --- | --- |
+| 切段／回覆規則／伺服器隔離／週窗口／估算／分段 | `tcbus selftest` 第 20 節（**49 項**，完全離線） |
+| 指令樹（`/ai status`、`/ai forget`）與 LLM 設定檢查 | `--dryrun`（離線建樹 ＋ 設定合理性） |
+| SK 真的能接上、能拿到 usage、話題判斷真的有效 | **實測真實 API**：6 種情境（首句／接續／換話題／隔 2 小時／回覆舊訊息／換伺服器）＋ 額度擋下（0 次 API 呼叫）＋ 重啟後用量一致 |
+| 實測數據 | 單次對話約 175~880 tokens（含話題判斷 267~281）；`ByGuild` 分開記帳正確 |
+
+---
+
 ## 附錄：本方案可直接查核的官方來源
 
 | 主題 | 來源 |

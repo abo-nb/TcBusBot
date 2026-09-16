@@ -199,7 +199,7 @@ public enum SaveGroupResult
 /// 給了連線字串之後，手機、電腦、雲端主機看的是同一份訂閱組。
 /// 連不上時**不會硬撐**：記錄警告並退回下面的本機儲存，讓 Bot 還能用。
 /// </summary>
-public sealed class SavedGroupStore : IDisposable
+public sealed class SavedGroupStore : IDisposable, TcBusBot.Core.Chat.ILlmStateStore
 {
     public const int MaxGroupsPerUser = 20;
     public const int MaxNameLength = 40;
@@ -406,6 +406,16 @@ public sealed class SavedGroupStore : IDisposable
 
     /// <summary>記錄一次「被使用」，讓常用的組排在前面。</summary>
     public void Touch(long id, ulong userId) => _repo.Touch(id, userId);
+
+    // ── 通用小型狀態（ILlmStateStore）─────────────────────
+    //
+    // 借用同一條後端鏈（MongoDB → SQLite → 文字檔 → 記憶體）來放「跨重啟要保留」的
+    // 極少量資料。目前只有 LLM 的每週 token 用量 —— 那個絕對不能因為重啟就歸零，
+    // 否則每週上限形同虛設。
+
+    public string? GetBlob(string key) => _repo.LoadBlob(key);
+
+    public void SetBlob(string key, string json) => _repo.SaveBlob(key, json);
 
     public void Dispose()
     {

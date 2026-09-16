@@ -1,0 +1,341 @@
+using System.Collections.Concurrent;
+using Discord;
+using Discord.WebSocket;
+using TcBusBot.Core.Chat;
+
+namespace TcBusBot.Discord;
+
+/// <summary>
+/// AI 聊天的接線：**@ 它、或回覆它的訊息**就會回話。
+///
+/// 這個類別只做「Discord 的事」——判斷有沒有被叫到、顯示「正在輸入…」、
+/// 把文字貼回頻道。所有規則（時間切段、回覆舊訊息、伺服器隔離、每週額度、估 token）
+/// 都在 <see cref="ChatOrchestrator"/>，因為那些必須能在沒有網路、
+/// 沒有金鑰的情況下測試。
+///
+/// ── 幾個刻意的決定 ─────────────────────────────────────
+///
+/// 1. **只認 @ 提及與回覆**：不做「看到訊息就回」。除了洗頻，也因為 Bot 讀得到
+///    訊息內容是有隱私代價的（需要 Message Content 特權意圖），
+///    必須讓使用者明確表達「這句是對 Bot 說的」。
+///
+/// 2. **不同伺服器不相通**：對話記憶的 key 是 (伺服器, 頻道)，
+///    連索引都是分開的，所以 A 伺服器的話題不可能出現在 B 伺服器的上下文裡。
+///
+/// 3. **同一頻道一次只處理一則**：正在想的時候再問會直接告訴使用者「還在想」，
+///    而不是排隊等 30 秒 —— 排隊會讓 token 用量失控（排了十則就燒十次）。
+///
+/// 4. **回覆用 Discord 的回覆**：這樣使用者「回覆 Bot 的那則訊息」就能自然接話。
+/// </summary>
+public sealed class LlmChatService : IDisposable
+{
+    /// <summary>Discord 單一訊息上限 2000 字；留一點空間。</summary>
+    private const int MaxChunkChars = 1900;
+
+    private readonly DiscordSocketClient _client;
+    private readonly ChatOrchestrator _chat;
+    private readonly LlmOptions _options;
+
+    private readonly ConcurrentDictionary<ulong, SemaphoreSlim> _channelGates = new();
+    private readonly ConcurrentDictionary<ulong, DateTimeOffset> _lastAskedAt = new();
+
+    /// <summary>「訊息內容是空的」只提醒一次（那幾乎一定是沒開 Message Content 意圖）。</summary>
+    private static int _emptyContentWarned;
+
+    private int _handled;
+    private int _failed;
+    private int _refused;
+
+    public LlmChatService(DiscordSocketClient client, ChatOrchestrator chat, LlmOptions options)
+    {
+        _client = client;
+        _chat = chat;
+        _options = options;
+    }
+
+    public int Handled => _handled;
+    public int Failed => _failed;
+    public int Refused => _refused;
+    public int ChannelCount => _chat.Conversations.ChannelCount;
+
+    public string Describe()
+        => $"{_options.Describe()}｜已回 {_handled} 則／失敗 {_failed}／額度擋下 {_refused}｜" +
+           $"{_chat.Budget.Describe()}";
+
+    // ─────────────────────────────────────────────────────
+    //  入口
+    // ─────────────────────────────────────────────────────
+
+    public async Task HandleAsync(SocketMessage message)
+    {
+        try
+        {
+            await HandleCoreAsync(message);
+        }
+        catch (Exception ex)
+        {
+            // Discord 的事件處理**絕對不能**把例外丟出去（可能影響連線）
+            _failed++;
+            Console.WriteLine("[llm] 非預期錯誤：");
+            Console.WriteLine(ex.ToString());
+            await SafeReplyAsync(message, "❌ 我這邊出錯了（詳細訊息在 Bot 的 console）。");
+        }
+    }
+
+    private async Task HandleCoreAsync(SocketMessage message)
+    {
+        // 只處理真人打的訊息（Bot 之間互相回話會無限循環）
+        if (message is not SocketUserMessage userMessage) return;
+        if (userMessage.Author.IsBot || userMessage.Author.IsWebhook) return;
+
+        var botId = _client.CurrentUser?.Id ?? 0;
+        var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id ?? 0;
+
+        // 私訊預設不回（沒有「@ 機器人」這個動作，容易被誤觸）
+        if (guildId == 0 && !_options.AllowDm) return;
+
+        var raw = message.Content ?? "";
+        var referenced = userMessage.ReferencedMessage;
+
+        var mentioned = botId != 0 && userMessage.MentionedUsers.Any(u => u.Id == botId);
+
+        // 回覆也算「對 Bot 說話」：回覆 Bot 的訊息、回覆提到 Bot 的訊息、
+        // 或回覆任何一則**我們記得過的**訊息（= 想把那段話題拉回來）
+        var replyAddressed = referenced is not null
+                             && (referenced.Author.Id == botId
+                                 || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
+                                 || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id));
+
+        if (!mentioned && !replyAddressed) return;
+
+        // 沒開 Message Content 意圖時，Discord 會把「沒有 @ 到 Bot」的訊息內容清空
+        if (raw.Length == 0 && !mentioned)
+        {
+            if (Interlocked.Exchange(ref _emptyContentWarned, 1) == 0)
+                Console.WriteLine("[llm] ⚠️ 收到「回覆了 Bot 但內容是空的」的訊息 —— " +
+                                  "幾乎一定是沒開 Message Content Intent（見啟動說明）");
+
+            return;
+        }
+
+        var text = StripMention(raw, botId).Trim();
+
+        if (text.Length == 0)
+        {
+            await SafeReplyAsync(userMessage, "要問什麼呢？（直接 @ 我然後打訊息就好）");
+            return;
+        }
+
+        // 冷卻：同一個人連續問會把額度燒掉
+        var now = DateTimeOffset.UtcNow;
+        if (_options.UserCooldownSeconds > 0
+            && _lastAskedAt.TryGetValue(userMessage.Author.Id, out var last)
+            && now - last < TimeSpan.FromSeconds(_options.UserCooldownSeconds))
+        {
+            return;
+        }
+        _lastAskedAt[userMessage.Author.Id] = now;
+
+        // 同一頻道一次只回一則
+        var gate = _channelGates.GetOrAdd(message.Channel.Id, _ => new SemaphoreSlim(1, 1));
+        if (!await gate.WaitAsync(TimeSpan.Zero))
+        {
+            Console.WriteLine($"[llm] 略過一則（{DescribeWhere(guildId, message)} 還在想上一題）");
+            return;
+        }
+
+        try
+        {
+            await AnswerAsync(userMessage, guildId, text, referenced);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task AnswerAsync(
+        SocketUserMessage message, ulong guildId, string text, IMessage? referenced)
+    {
+        var incoming = new ChatTurn(
+            ChatRole.User,
+            message.Author.Username,
+            message.Author.Id,
+            message.Id,
+            text,
+            message.Timestamp.ToUniversalTime());
+
+        var replyTarget = referenced is null ? null : ToTurn(referenced, _client.CurrentUser?.Id ?? 0);
+        var where = DescribeWhere(guildId, message);
+
+        // 呼叫期間讓 Discord 顯示「正在輸入…」（推理模型可能要想十幾秒）
+        using var typingCts = new CancellationTokenSource();
+        var typing = KeepTypingAsync(message.Channel, typingCts.Token);
+
+        ChatAnswer answer;
+        try
+        {
+            answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget);
+        }
+        finally
+        {
+            typingCts.Cancel();
+            try { await typing; } catch (Exception) { /* 只是打字動畫 */ }
+        }
+
+        // ── log（每一則都留下「為什麼這樣回答」與用量）──────
+        Console.WriteLine(
+            $"[llm] {where}｜{answer.DecisionReason}｜上下文 {answer.ContextTurns} 則" +
+            $"（丟掉 {answer.DroppedTurns}，約 {answer.EstimatedContextTokens} tokens）");
+
+        if (answer.Refused)
+        {
+            _refused++;
+            Console.WriteLine($"[llm] ⛔ 額度不足：{answer.Error}");
+        }
+        else if (answer.Ok)
+        {
+            _handled++;
+            Console.WriteLine(
+                $"[llm] → {answer.Model}｜in {answer.InputTokens} / out {answer.OutputTokens} tokens" +
+                $"（{(answer.UsageReported ? "API 回報" : "估算")}）｜話題判斷 {answer.TopicDetectTokens} tokens｜" +
+                $"{answer.Elapsed.TotalSeconds:0.0}s｜{_chat.Budget.Describe()}");
+        }
+        else
+        {
+            _failed++;
+            Console.WriteLine($"[llm] ✘ 失敗：{answer.Error}");
+        }
+
+        // ── 貼回頻道（分段；第一段用「回覆」讓使用者可以接著回）──
+        var chunks = Split(answer.Text, MaxChunkChars);
+        IMessage? sent = null;
+
+        for (var i = 0; i < chunks.Count; i++)
+        {
+            sent = i == 0
+                ? await message.ReplyAsync(chunks[i])
+                : await message.Channel.SendMessageAsync(chunks[i]);
+        }
+
+        // 把 Bot 的回覆記進同一段（附上真正的訊息 ID）
+        if (answer.Ok && answer.Decision is { } decision && sent is not null)
+        {
+            _chat.RecordReply(
+                decision,
+                answer.Text,
+                sent.Id,
+                _client.CurrentUser?.Id ?? 0,
+                _client.CurrentUser?.Username ?? "Bot",
+                DateTimeOffset.UtcNow);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  小工具
+    // ─────────────────────────────────────────────────────
+
+    private static ChatTurn ToTurn(IMessage message, ulong botId)
+        => new(
+            message.Author.Id == botId ? ChatRole.Assistant : ChatRole.User,
+            message.Author.Username,
+            message.Author.Id,
+            message.Id,
+            message.Content ?? "",
+            message.Timestamp.ToUniversalTime());
+
+    /// <summary>把「@Bot」那個 mention 拿掉（Discord 給的是 &lt;@123&gt; / &lt;@!123&gt;）。</summary>
+    private static string StripMention(string content, ulong botId)
+    {
+        if (botId == 0) return content;
+
+        return content
+            .Replace($"<@{botId}>", "", StringComparison.Ordinal)
+            .Replace($"<@!{botId}>", "", StringComparison.Ordinal);
+    }
+
+    private static string DescribeWhere(ulong guildId, SocketMessage message)
+    {
+        var where = guildId == 0
+            ? "私訊"
+            : $"#{(message.Channel as SocketGuildChannel)?.Name ?? message.Channel.Id.ToString()}";
+
+        return $"{guildId}/{where} {message.Author.Username}：{Preview(message.Content ?? "")}";
+    }
+
+    private static string Preview(string text)
+    {
+        var flat = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return flat.Length <= 60 ? flat : flat[..60] + "…";
+    }
+
+    /// <summary>每隔幾秒戳一次「正在輸入…」，讓使用者知道 Bot 還在工作。</summary>
+    private static async Task KeepTypingAsync(IMessageChannel channel, CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                await channel.TriggerTypingAsync();
+                await Task.Delay(TimeSpan.FromSeconds(7), token);
+            }
+        }
+        catch (Exception)
+        {
+            // 只是打字動畫，失敗不影響任何事
+        }
+    }
+
+    /// <summary>超過 Discord 上限的長回覆切成幾段（盡量切在換行處）。</summary>
+    public static List<string> Split(string text, int maxChars)
+    {
+        var chunks = new List<string>();
+        var remaining = (text ?? "").Trim();
+
+        while (remaining.Length > maxChars)
+        {
+            var cut = remaining.LastIndexOf('\n', Math.Min(maxChars, remaining.Length - 1));
+
+            // 找不到適合的換行就硬切（總比送不出去好）
+            if (cut < maxChars / 2) cut = maxChars;
+
+            chunks.Add(remaining[..cut].TrimEnd());
+            remaining = remaining[cut..].TrimStart();
+        }
+
+        if (remaining.Length > 0) chunks.Add(remaining);
+        return chunks;
+    }
+
+    private async Task SafeReplyAsync(SocketMessage message, string text)
+    {
+        try
+        {
+            foreach (var chunk in Split(text, MaxChunkChars))
+                await message.Channel.SendMessageAsync(chunk);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[llm] 回覆訊息失敗：{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>清掉太久沒動的頻道記憶（由輪詢迴圈定時呼叫）。</summary>
+    public int Purge(DateTimeOffset now)
+    {
+        var removed = _chat.Conversations.Purge(now);
+
+        // 順便把冷卻表縮一下，長時間掛機才不會一直長大
+        var stale = _lastAskedAt.Where(kv => now - kv.Value > TimeSpan.FromHours(1))
+                                .Select(kv => kv.Key).ToList();
+        foreach (var key in stale) _lastAskedAt.TryRemove(key, out _);
+
+        return removed;
+    }
+
+    public void Dispose()
+    {
+        foreach (var gate in _channelGates.Values) gate.Dispose();
+        _channelGates.Clear();
+    }
+}
