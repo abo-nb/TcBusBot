@@ -1465,8 +1465,36 @@ public static class DryRun
         if (!cfg.EnableMessageContentIntent)
             Problem("有設定 LLM 但 Message Content 意圖被關掉了（--no-message-intent）→ 收不到訊息內容，AI 不會回話");
         else
-            Console.WriteLine("  ✔ 會要求 Message Content 意圖（⚠️ 必須同時在 Developer Portal 打開，" +
-                              "否則閘道會用 4014 拒絕連線）");
+            Console.WriteLine("  ✔ 會要求 Message Content 意圖（開機時會先問 Discord 一次，沒被允許就不要求）");
+
+        // ── 特權意圖的判斷（決定要不要向 Discord 要 Message Content）──
+        //    這段位元運算錯了會導致「要了沒被允許的意圖 → 閘道 4014 → 連不上」，
+        //    所以就算只是幾個 bit 也要測。
+        void Expect(string label, bool ok)
+        {
+            if (ok) Console.WriteLine($"  ✔ {label}");
+            else Problem(label);
+        }
+
+        Expect("flags bit18（未驗證 Bot）→ 判定為已開啟 Message Content",
+            MessageContentIntentProbe.MessageContentEnabled(1L << 18));
+        Expect("flags bit19（已驗證 Bot）→ 判定為已開啟",
+            MessageContentIntentProbe.MessageContentEnabled(1L << 19));
+        Expect("★ flags=0 → 判定為沒有開啟（這時就不該要求這個意圖）",
+            !MessageContentIntentProbe.MessageContentEnabled(0));
+        Expect("其他 bit 不會被誤判（例如 Presence 的 bit12）",
+            !MessageContentIntentProbe.MessageContentEnabled(1L << 12));
+
+        using (var doc = System.Text.Json.JsonDocument.Parse("""{"flags":262144}"""))
+            Expect("解析數字型 flags", MessageContentIntentProbe.ParseFlags(doc.RootElement) == 262144);
+
+        using (var doc = System.Text.Json.JsonDocument.Parse("""{"flags":"262144"}"""))
+            Expect("解析字串型 flags（Discord 有時會給字串）",
+                MessageContentIntentProbe.ParseFlags(doc.RootElement) == 262144);
+
+        using (var doc = System.Text.Json.JsonDocument.Parse("""{"id":"1"}"""))
+            Expect("沒有 flags 欄位 → 0（保守判斷成沒開）",
+                MessageContentIntentProbe.ParseFlags(doc.RootElement) == 0);
     }
 
     /// <summary>

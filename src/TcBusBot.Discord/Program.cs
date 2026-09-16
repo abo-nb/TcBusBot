@@ -120,12 +120,37 @@ public static class Program
         //        否則閘道會用 4014 把我們踢掉（見 OnLog 的提示）。
         //   * DirectMessages —— 只有允許私訊時才要
         var intents = GatewayIntents.Guilds;
+        var wantsMessageContent = cfg.EnableMessageContentIntent;
 
-        if (cfg.EnableMessageContentIntent)
+        // ★ 先問 Discord「這個應用程式有沒有被允許 Message Content 意圖」再做決定。
+        //
+        //   為什麼要問：沒被允許卻硬要，閘道會用 4014 把連線踢掉，
+        //   而 Discord.Net 只會印一行看不出原因的 WebSocketException，
+        //   加上先前的流程會直接結束行程 → Render 變成 502 + 不斷重啟。
+        //   問得到的答案（application flags 的 bit 18／19）是可靠的；
+        //   問不到就照使用者的設定走（不偷偷降級）。
+        if (wantsMessageContent && !dryRun)
+        {
+            var granted = await MessageContentIntentProbe.CheckAsync(cfg.Token, log: Console.WriteLine);
+
+            if (granted == false)
+            {
+                MessageContentIntentProbe.PrintHowToEnable(Console.WriteLine);
+                wantsMessageContent = false;
+            }
+        }
+
+        if (wantsMessageContent)
         {
             intents |= GatewayIntents.GuildMessages | GatewayIntents.MessageContent;
-            if (cfg.Llm.AllowDm) intents |= GatewayIntents.DirectMessages;
         }
+        else if (cfg.Llm.IsConfigured)
+        {
+            // 沒有特權意圖也要收訊息事件：Discord 對「@ 提及 Bot」的訊息會例外附上內容
+            intents |= GatewayIntents.GuildMessages;
+        }
+
+        if (cfg.Llm.AllowDm) intents |= GatewayIntents.DirectMessages;
 
         var client = new DiscordSocketClient(new DiscordSocketConfig
         {
@@ -219,8 +244,16 @@ public static class Program
         client.Log += msg => OnLog(msg, cfg.Verbose);
         interactions.Log += msg => OnLog(msg, cfg.Verbose);
 
+        // 輪詢迴圈要在 Ready 事件裡用到，所以在接事件之前先拿到（同一個 singleton）
+        var runtime = provider.GetRequiredService<BotRuntime>();
+
         var registered = false;
         var readyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // 連不上時「先不要啟動輪詢」：輪詢會送通知，沒有連線只會一直失敗。
+        // 這裡記下來，等 Ready 真的發生時再啟動（第一次上線、或之後重連成功都適用）。
+        var startPollerOnReady = false;
+        var pollerStarted = false;
 
         client.Ready += async () =>
         {
@@ -230,6 +263,21 @@ public static class Program
             // ⚠️ 要放在 `if (registered) return;` **之前** —— 否則重新連線後
             //    這個值就不會再更新（第一次是 true，之後若斷線重連也不會反映）。
             BotStatus.DiscordReady = true;
+            BotStatus.DiscordError = null;
+
+            // 第一次連上（或中斷後重連）才啟動輪詢
+            if (startPollerOnReady && !pollerStarted && api is not null && cfg.EnablePoller)
+            {
+                pollerStarted = true;
+                runtime.PollerDescription = $"啟用中，每 {cfg.PollIntervalSeconds} 秒一次";
+                BotStatus.Poller = runtime.PollerDescription;
+
+                var token = _stop?.Token ?? CancellationToken.None;
+                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds);
+                _ = Task.Run(() => poller.RunAsync(token), token);
+
+                Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
+            }
 
             if (registered) return;
             registered = true;
@@ -314,12 +362,14 @@ public static class Program
             Console.WriteLine("  • 系統時間偏差過大導致 TLS 失敗");
             Console.WriteLine();
             Console.WriteLine($"原始錯誤：{ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine();
+            Console.WriteLine("⚠️  服務不會結束：健康檢查端點照常運作，並在背景每分鐘重試連線。");
 
+            BotStatus.DiscordError = Describe(ex);
             try { await client.LogoutAsync(); } catch { }
-            return 1;
         }
 
-        // ── 等 Ready：連不上就不要呆呆掛著 ──────────────────
+        // ── 等 Ready ───────────────────────────────────────
         // Discord.Net 的 LoginAsync / StartAsync 不會因為閘道連不上而丟例外，
         // 錯誤只在背景重試。所以這裡主動等一下，逾時就給出可行的診斷。
         var ready = await Task.WhenAny(
@@ -334,13 +384,17 @@ public static class Program
             Console.WriteLine("  1. 這台機器連得到 discord.com 嗎？（防火牆／公司代理／封閉沙箱會擋）");
             Console.WriteLine("     測試：curl https://discord.com/api/v10/gateway");
             Console.WriteLine("  2. Token 是否正確且未被重設？");
-            Console.WriteLine("  3. Bot 是否已加入至少一個伺服器？（沒有也不影響連線，但就沒有東西可測）");
+            Console.WriteLine("  3. 有沒有要求未經允許的特權意圖？（Message Content —— 見上面「[意圖]」那幾行）");
             Console.WriteLine("  4. 加 --verbose 可以看到 Discord.Net 的連線日誌：");
             Console.WriteLine("     dotnet run --project src\\TcBusBot.Discord -- --verbose");
             Console.WriteLine();
+            Console.WriteLine("⚠️  服務不會結束 —— 之前這裡直接 return 2，在 Render 上會變成");
+            Console.WriteLine("    502 ＋ 不斷重啟，而且只留下一行看不出原因的 WebSocketException。");
+            Console.WriteLine("    現在：健康檢查端點照常運作（/health 會寫出 discordReady:false 與原因），");
+            Console.WriteLine("    並在背景每分鐘重試；Portal 打開意圖之後會自己接回來，不用重新部署。");
+            Console.WriteLine();
 
-            try { await client.StopAsync(); await client.LogoutAsync(); } catch { }
-            return 2;
+            BotStatus.DiscordError = $"等 {cfg.ConnectTimeoutSeconds} 秒仍未連上閘道";
         }
 
         // ── 4) 即時輪詢（只有真的拿得到即時資料時才啟動）──
@@ -359,14 +413,24 @@ public static class Program
             // 有些平台（Android）沒有主控台中斷事件
         }
 
-        var runtime = provider.GetRequiredService<BotRuntime>();
-
         if (api is not null && cfg.EnablePoller)
         {
-            runtime.PollerDescription = $"啟用中，每 {cfg.PollIntervalSeconds} 秒一次";
-            var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds);
-            _ = Task.Run(() => poller.RunAsync(cts.Token), cts.Token);
-            Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
+            if (BotStatus.DiscordReady)
+            {
+                runtime.PollerDescription = $"啟用中，每 {cfg.PollIntervalSeconds} 秒一次";
+                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds);
+                _ = Task.Run(() => poller.RunAsync(cts.Token), cts.Token);
+                pollerStarted = true;
+                Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
+            }
+            else
+            {
+                // 沒連上 Discord 就啟動輪詢只會一直失敗（通知送不出去），
+                // 所以等 Ready 事件發生時再啟動（見上面的 client.Ready）
+                startPollerOnReady = true;
+                runtime.PollerDescription = "等待連上 Discord…（連上後會自動啟動）";
+                Console.WriteLine("⏸️  即時輪詢先不啟動 —— 還沒連上 Discord，連上之後會自動開始。");
+            }
         }
         else
         {
@@ -378,6 +442,44 @@ public static class Program
         }
 
         BotStatus.Poller = runtime.PollerDescription;
+
+        // ── 4a) 連不上時在背景重試（不要讓整個服務死掉）──────
+        //   Render 需要一個活著的服務；先前的流程在等不到 Ready 時直接結束行程，
+        //   結果是 502 ＋ 不斷重啟，而使用者只看得到一行 WebSocketException。
+        //   這裡每分鐘試一次重新登入；Portal 打開意圖之後會自己接回來，不用重新部署。
+        if (!BotStatus.DiscordReady)
+        {
+            _ = Task.Run(async () =>
+            {
+                var attempt = 0;
+
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    try { await Task.Delay(TimeSpan.FromMinutes(1), cts.Token); }
+                    catch (OperationCanceledException) { return; }
+
+                    if (BotStatus.DiscordReady) continue;
+
+                    attempt++;
+                    try
+                    {
+                        if (attempt == 1 || attempt % 5 == 0)
+                            Console.WriteLine($"[連線] 第 {attempt} 次重試連上 Discord…");
+
+                        await client.LoginAsync(TokenType.Bot, cfg.Token);
+                        await client.StartAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        var why = Describe(ex);
+                        BotStatus.DiscordError = why;
+
+                        if (attempt == 1 || attempt % 5 == 0)
+                            Console.WriteLine($"[連線] 重試失敗：{why}");
+                    }
+                }
+            }, cts.Token);
+        }
 
         // ── 4b) 對話記憶的清掃 ─────────────────────────────
         // 每個頻道各自一份記憶，長時間掛著會慢慢累積（Bot 可能連續跑好幾天）。
@@ -547,24 +649,32 @@ public static class Program
 
     private static Task OnLog(LogMessage msg, bool verbose)
     {
-        // 「沒開特權意圖」是**連不上**最常見的原因，而且 Discord.Net 只會給一行
-        // 看不出所以然的訊息（Disconnected: Disallowed intent(s)），
-        // 所以在這裡翻譯成「去哪個網頁按什麼」。
+        // ⚠️ Discord.Net 3.18 對「閘道被拒絕」只會印
+        //    `WebSocketException: WebSocket connection was closed` ——
+        //    完全看不出原因（我把組件字串翻過一次，沒有 "Disallowed intent" 這種訊息）。
+        //    所以這裡把關閉相關的日誌連同例外細節一起印出來，方便對照。
         var text0 = msg.Message ?? "";
-        if (text0.Contains("Disallowed intent", StringComparison.OrdinalIgnoreCase)
-            || text0.Contains("4014"))
+        var error0 = msg.Exception?.Message ?? "";
+
+        var looksLikeGatewayProblem =
+            text0.Contains("Disconnected", StringComparison.OrdinalIgnoreCase)
+            || error0.Contains("WebSocket connection was closed", StringComparison.OrdinalIgnoreCase)
+            || error0.Contains("WebSocketException", StringComparison.OrdinalIgnoreCase)
+            || text0.Contains("Disallowed intent", StringComparison.OrdinalIgnoreCase)
+            || text0.Contains("4014");
+
+        if (looksLikeGatewayProblem)
         {
-            Console.WriteLine();
-            Console.WriteLine("❌ Discord 拒絕了連線：要求了沒有被允許的特權意圖（4014 Disallowed intent）");
-            Console.WriteLine();
-            Console.WriteLine("   這是因為 AI 聊天需要「Message Content Intent」，而它必須**手動開啟**：");
-            Console.WriteLine("     1. https://discord.com/developers/applications → 選你的 Application");
-            Console.WriteLine("     2. 左側 Bot → Privileged Gateway Intents → 打開 **Message Content Intent**");
-            Console.WriteLine("     3. 按 Save Changes，然後重新啟動 Bot（Render 會自動重啟）");
-            Console.WriteLine();
-            Console.WriteLine("   不想開的話也可以只用公車功能（AI 聊天會關掉）：");
-            Console.WriteLine("     dotnet run --project src\\TcBusBot.Discord -- --no-message-intent");
-            Console.WriteLine();
+            Console.WriteLine($"[閘道] {msg.Severity}: {text0}" +
+                              (msg.Exception is null
+                                  ? ""
+                                  : $" ｜ {msg.Exception.GetType().Name}: {error0}" +
+                                    (msg.Exception.InnerException is { } inner
+                                        ? $" ／ {inner.GetType().Name}: {inner.Message}"
+                                        : "")));
+
+            if (!BotStatus.DiscordReady && BotStatus.DiscordError is null)
+                BotStatus.DiscordError = $"{msg.Exception?.GetType().Name ?? "閘道"}：{error0}";
         }
 
         // 預設只印錯誤，避免洗版；--verbose 時全部印出（排查連線問題用）

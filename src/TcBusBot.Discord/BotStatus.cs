@@ -16,6 +16,16 @@ internal static class BotStatus
     public static readonly DateTimeOffset StartedAt = DateTimeOffset.UtcNow;
 
     public static bool DiscordReady { get; set; }
+
+    /// <summary>
+    /// 連不上 Discord 時的原因（連上就清空）。
+    ///
+    /// 為什麼要這個：以前連不上就直接結束行程 → Render 只看到 502，
+    /// 使用者也只能從一行 WebSocketException 猜原因。現在服務會活著，
+    /// 這個欄位讓 `/health` 直接說出「為什麼連不上」。
+    /// </summary>
+    public static string? DiscordError { get; set; }
+
     public static string StorageMode { get; set; } = "（尚未初始化）";
     public static string DataSource { get; set; } = "（尚未載入）";
     public static string Poller { get; set; } = "（尚未啟動）";
@@ -48,6 +58,7 @@ internal static class BotStatus
                 uptimeSeconds = (int)(DateTimeOffset.UtcNow - StartedAt).TotalSeconds,
                 startedAt = StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
                 discordReady = DiscordReady,
+                discordError = DiscordError,
                 storage = StorageMode,
                 dataSource = DataSource,
                 poller = Poller,
