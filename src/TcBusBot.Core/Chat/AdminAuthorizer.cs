@@ -5,10 +5,53 @@ public sealed record AdminCheck(
     bool IsAdmin,
     bool KeyPresent,
     bool KeyExpected,
-    string CleanedContent)
+    string CleanedContent,
+    OwnerGrant? Grant = null)
 {
     /// <summary>有帶 key 但不在名單裡（要記 log，因為可能是有人在亂試）。</summary>
     public bool UnauthorizedAttempt => KeyPresent && !IsAdmin;
+}
+
+/// <summary>
+/// **主人授權的憑證**（unforgeable capability）。
+///
+/// 為什麼需要一個「物件」而不是一個 bool：
+/// 「全域設定」（所有伺服器都適用的規則）一旦被寫進去，影響的是**每一台伺服器**，
+/// 所以不能只靠「提示詞叫模型要聽主人的話」——模型抽風、被提示注入、或未來改壞程式碼，
+/// 都會讓傷害擴散出去。這個型別把「有授權」變成**程式碼層級的通行證**：
+///
+///   * 建構子私有、唯一的發放點是 <see cref="AdminAuthorizer.Check"/>
+///     （也就是「發話者在名單裡 ＋ 訊息帶對 key」的那一次判斷）
+///   * 所有會動到全域設定的方法都**必須**收這個型別當參數 →
+///     編譯器就擋掉了「沒有授權卻想寫全域設定」的程式碼路徑
+///   * 它只代表「這一則訊息被驗證過」，不儲存、不序列化，
+///     所以模型沒辦法自己造一個出來（它也看不到、拿不到）
+///
+/// 換句話說：**安全不依賴模型的表現**。
+/// </summary>
+public sealed class OwnerGrant
+{
+    private OwnerGrant(ulong userId, DateTimeOffset issuedAt, int keyLength)
+    {
+        UserId = userId;
+        IssuedAt = issuedAt;
+        KeyLength = keyLength;
+    }
+
+    /// <summary>被驗證的發話者。</summary>
+    public ulong UserId { get; }
+
+    public DateTimeOffset IssuedAt { get; }
+
+    /// <summary>當時使用的 key 長度（只記長度，**絕不記內容**，方便之後對照是不是換過 key）。</summary>
+    public int KeyLength { get; }
+
+    /// <summary>只有 <see cref="AdminAuthorizer"/>（同一個組件）發得出來。</summary>
+    internal static OwnerGrant Issue(ulong userId, DateTimeOffset issuedAt, int keyLength)
+        => new(userId, issuedAt, keyLength);
+
+    public override string ToString()
+        => $"主人授權憑證（{UserId}，{IssuedAt.ToLocalTime():MM-dd HH:mm} 簽發）";
 }
 
 /// <summary>
@@ -24,13 +67,17 @@ public sealed record AdminCheck(
 /// ⚠️ **key 一定會被移除**（不管有沒有授權成功）：
 ///    * 不從內容裡拿掉的話，key 會進到對話記憶、提示詞與 console log
 ///    * 尤其「有人拿別人的 key 亂打」時，更不該讓它留在歷史裡
+///
+/// ⚠️ 這個判斷**在模型執行之前**完成（見 <see cref="ChatOrchestrator.AskAsync"/> 的第 0 步），
+///    而且工具清單是照這個結果組的 —— 所以提示注入沒辦法讓模型「升級」成主人。
 /// </summary>
 public static class AdminAuthorizer
 {
     /// <summary>訊息裡的 key 被拿掉之後，若什麼都不剩就補這一句（讓模型知道「有東西被移除了」）。</summary>
     public const string KeyStrippedPlaceholder = "（已收到授權指令）";
 
-    public static AdminCheck Check(ulong userId, string? content, LlmOptions options)
+    public static AdminCheck Check(
+        ulong userId, string? content, LlmOptions options, DateTimeOffset? now = null)
     {
         var text = content ?? "";
         var keyExpected = options.AdminEnabled;
@@ -56,7 +103,10 @@ public static class AdminAuthorizer
 
         var isAdmin = Array.IndexOf(options.AdminUserIds, userId) >= 0;
 
-        return new AdminCheck(isAdmin, true, keyExpected, cleaned);
+        // ★ 只有「名單內 ＋ key 正確」才簽發憑證 —— 沒有憑證就動不了全域設定。
+        var grant = isAdmin ? OwnerGrant.Issue(userId, now ?? DateTimeOffset.UtcNow, key.Length) : null;
+
+        return new AdminCheck(isAdmin, true, keyExpected, cleaned, grant);
     }
 }
 

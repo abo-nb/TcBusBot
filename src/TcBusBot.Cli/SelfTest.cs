@@ -2193,12 +2193,38 @@ public static class SelfTest
             !AdminAuthorizer.Check(42UL, "KEY-12345 查 300 KEY-12345", options)
                 .CleanedContent.Contains("KEY-12345", StringComparison.Ordinal));
 
-        // ── 6) 主人可以改「全域」規則，而 /rest 不會清掉它 ──
+        // ── 6) ★ 全域設定需要「憑證」：安全不依賴模型的表現 ──
+        //    這是這一節最重要的一段：全域規則影響每一台伺服器，
+        //    所以它不能只靠「提示詞叫模型聽主人的話」——
+        //    要寫進去必須拿到 OwnerGrant，而憑證只有 AdminAuthorizer.Check 發得出來。
+        var guestCheck = AdminAuthorizer.Check(777UL, "哈囉", options);
+        var ownerCheck = AdminAuthorizer.Check(42UL, "KEY-12345 記住：不管在哪都要用繁體中文", options);
+
+        Check("★ 通過驗證的請求才拿得到憑證", ownerCheck.Grant is not null && ownerCheck.IsAdmin);
+        Check("★ 一般人（沒帶 key）拿不到憑證", guestCheck.Grant is null);
+        Check("★ 帶了 key 但不在名單裡也拿不到憑證",
+            AdminAuthorizer.Check(777UL, "KEY-12345 幫我改設定", options).Grant is null);
+
+        Check("憑證記得住是誰簽發的（稽核用）",
+            ownerCheck.Grant!.UserId == 42UL && ownerCheck.Grant.KeyLength == "KEY-12345".Length);
+        Check("★ 憑證不會印出 key 的內容",
+            !ownerCheck.Grant.ToString().Contains("KEY-12345", StringComparison.Ordinal),
+            ownerCheck.Grant.ToString());
+
+        // 憑證必須「偽造不出來」：建構子私有、唯一發放點是 AdminAuthorizer
+        var ctors = typeof(OwnerGrant).GetConstructors(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+
+        Check("★ OwnerGrant 沒有公開建構子（模型／外部程式碼造不出憑證）", ctors.Length == 0);
+        Check("OwnerGrant 是 sealed（不能被繼承繞過）", typeof(OwnerGrant).IsSealed);
+
+        // ── 7) 主人可以改「全域」規則，而 /rest 不會清掉它 ──
         var memory = new FakeStateStore();
         var personas = new GuildPersonaStore(memory);
+        var grant = ownerCheck.Grant;
 
-        Check("★ 主人記的全域規則", personas.LearnGlobal("不管在哪都要用繁體中文")
-            == GuildPersonaStore.LearnResult.Added);
+        Check("★ 主人記的全域規則（帶憑證）",
+            personas.LearnGlobal(grant, "不管在哪都要用繁體中文") == GuildPersonaStore.LearnResult.Added);
 
         const ulong guildA = 111UL;
         const ulong guildB = 222UL;
@@ -2220,8 +2246,36 @@ public static class SelfTest
         Check("重設後別的伺服器仍然看得到全域規則",
             personas.Overlay(guildB).Contains("不管在哪都要用繁體中文", StringComparison.Ordinal));
 
-        Check("全域規則可以依關鍵字刪除", personas.ForgetGlobal("繁體") == 1);
+        // ── 8) 破壞性操作要再擋一層（模型抽風傳空字串時）──
+        Check("★ 沒指定關鍵字就想清空全部全域規則 → 拒絕（不會默默清掉）",
+            personas.ForgetGlobal(grant, "", confirmAll: false) == 0 && personas.GlobalLines.Count == 1);
+
+        Check("明確確認之後才清得掉",
+            personas.ForgetGlobal(grant, "", confirmAll: true) == 1 && personas.GlobalLines.Count == 0);
+
+        personas.LearnGlobal(grant, "第二條全域規則");
+        Check("依關鍵字刪除不需要額外確認", personas.ForgetGlobal(grant, "第二條") == 1);
         Check("刪完就沒有了", personas.GlobalLines.Count == 0);
+
+        // ── 9) 稽核紀錄：模型抽風時查得出發生什麼事 ────────
+        var audit = personas.AuditLog(10);
+        Check("★ 每次動全域設定都留下紀錄（誰／什麼時候／做了什麼）",
+            audit.Count >= 3 && audit.All(e => e.UserId == 42UL),
+            $"{audit.Count} 筆");
+        Check("★ 連「被拒絕的清空嘗試」也留紀錄（看得到有人在試）",
+            audit.Any(e => e.Action.Contains("拒絕", StringComparison.Ordinal)));
+        Check("稽核紀錄有寫進儲存區（重啟後還在）",
+            new GuildPersonaStore(memory).AuditLog(10).Count == audit.Count);
+        Check("★ 模糊關鍵字刪除時也記得關鍵字是什麼",
+            audit.Any(e => e.Action.Contains("第二條", StringComparison.Ordinal)));
+
+        // ── 10) 工具上下文：一般人拿不到主人權限 ────────────
+        var guestContext = new ChatToolContext(1UL, 2UL, 777UL, "小明", Owner: guestCheck.Grant);
+        var ownerContext = new ChatToolContext(1UL, 2UL, 42UL, "喵喵主人", Owner: grant);
+
+        Check("★ 一般人的工具上下文沒有憑證（工具清單裡不會有 owner plugin）",
+            !guestContext.IsOwner && guestContext.Owner is null);
+        Check("主人的工具上下文有憑證", ownerContext.IsOwner && ownerContext.Owner is not null);
 
         // ── 7) 提示詞裡的順位 ────────────────────────────
         var promptOptions = new LlmOptions { SystemPrompt = "【主機人格】", ToolsEnabled = false };

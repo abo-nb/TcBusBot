@@ -1157,7 +1157,7 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget", "learned" };
+            var expectedAi = new[] { "status", "forget", "learned", "audit" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)

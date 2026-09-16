@@ -8,10 +8,20 @@ public sealed record ChatToolContext(
     ulong ChannelId,
     ulong UserId,
     string UserName,
-    bool IsOwner = false)
+    OwnerGrant? Owner = null)
 {
     /// <summary>私訊（沒有伺服器）。</summary>
     public bool IsDirectMessage => GuildId == 0;
+
+    /// <summary>
+    /// 這是不是通過驗證的主人。
+    ///
+    /// ⚠️ 刻意用「有沒有憑證」而不是一個 bool：要動**全域設定**的程式碼
+    /// 必須拿到 <see cref="OwnerGrant"/>（見 <see cref="GuildPersonaStore.LearnGlobal"/>），
+    /// 而憑證只有 <see cref="AdminAuthorizer.Check"/> 發得出來 ——
+    /// 所以「模型抽風亂叫工具」不可能寫進全域設定，未來的程式碼改壞了也一樣。
+    /// </summary>
+    public bool IsOwner => Owner is not null;
 
     public string Describe()
         => $"{(IsDirectMessage ? "私訊" : $"伺服器 {GuildId}")}／頻道 {ChannelId}／{UserName}（{UserId}）" +

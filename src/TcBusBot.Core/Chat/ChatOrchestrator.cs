@@ -235,7 +235,7 @@ public sealed class ChatOrchestrator
 
         // ── 2) 額度夠嗎？（送出之前就要知道）───────────────
         var toolContext = new ChatToolContext(
-            guildId, channelId, incoming.AuthorId, incoming.AuthorName, IsOwner: admin.IsAdmin);
+            guildId, channelId, incoming.AuthorId, incoming.AuthorName, Owner: admin.Grant);
 
         var toolLog = new ToolCallLog();
         var plugins = _options.ToolsEnabled ? _tools.CreateFor(toolContext, toolLog) : [];

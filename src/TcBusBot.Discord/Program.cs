@@ -607,6 +607,7 @@ public static class Program
                           $"可用 {SayModule.AllowListVariable} 限制使用者）");
         Console.WriteLine("     /ai status    AI 聊天狀態（模型、每週 token 用量、這個頻道的記憶）");
         Console.WriteLine("     /ai learned   看我學到了哪些規矩（這個伺服器專屬）");
+        Console.WriteLine("     /ai audit     看最近的主人操作紀錄（只有主人看得到）");
         Console.WriteLine("     /ai forget    忘掉這個頻道的 AI 對話記憶");
         Console.WriteLine("     /rest         重設這個伺服器學到的規矩（提示詞恢復預設）");
         Console.WriteLine("──────────────────────────────────────────────────────────");

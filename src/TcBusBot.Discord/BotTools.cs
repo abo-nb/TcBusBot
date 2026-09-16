@@ -288,10 +288,13 @@ public sealed class BotToolProvider : IChatToolProvider
 
         // 主人專用的工具另外包一個 plugin：它的說明裡寫著「只有主人能用」，
         // 沒有授權的對話看不到這些函式（模型連「有這個能力」都不知道）。
-        if (context.IsOwner)
+        //
+        // ⚠️ 這裡傳的是**憑證物件**（OwnerGrant），不是 bool ——
+        //    沒有憑證就**建構不出** OwnerTools，所以全域設定在型別層級就被鎖住了。
+        if (context.Owner is { } grant)
         {
             plugins.Add(KernelPluginFactory.CreateFromObject(
-                new OwnerTools(_personas, log), "owner"));
+                new OwnerTools(_personas, grant, log), "owner"));
         }
 
         return plugins;
@@ -321,11 +324,17 @@ public sealed class BotToolProvider : IChatToolProvider
 public sealed class OwnerTools
 {
     private readonly GuildPersonaStore _personas;
+    private readonly OwnerGrant _grant;
     private readonly ToolCallLog _log;
 
-    public OwnerTools(GuildPersonaStore personas, ToolCallLog log)
+    /// <summary>
+    /// ⚠️ <paramref name="grant"/> 是**必要參數**：沒有通過驗證就拿不到憑證，
+    /// 也就建構不出這個類別（全域設定在型別層級就被鎖住）。
+    /// </summary>
+    public OwnerTools(GuildPersonaStore personas, OwnerGrant grant, ToolCallLog log)
     {
         _personas = personas;
+        _grant = grant;
         _log = log;
     }
 
@@ -335,7 +344,7 @@ public sealed class OwnerTools
     public string RememberGlobalRule(
         [Description("要記住的那一句話")] string rule)
     {
-        var result = _personas.LearnGlobal(rule);
+        var result = _personas.LearnGlobal(_grant, rule);
 
         _log.Record("remember_global_rule",
             result == GuildPersonaStore.LearnResult.Added ? GuildPersonaStore.Clean(rule) : result.ToString(),
@@ -367,15 +376,42 @@ public sealed class OwnerTools
     }
 
     [KernelFunction("forget_global_rule")]
-    [Description("刪掉符合關鍵字的全域規則（主人指定、所有伺服器都適用）。")]
+    [Description("刪掉符合關鍵字的全域規則（主人指定、所有伺服器都適用）。" +
+                 "**關鍵字留白會刪掉全部**，所以那種情況必須把 confirm_all 設成 true，" +
+                 "否則我不會動手（避免不小心把主人的規則全部清掉）。")]
     public string ForgetGlobalRule(
-        [Description("要比對的關鍵字")] string keyword)
+        [Description("要比對的關鍵字（留白＝全部，需搭配 confirm_all=true）")] string keyword,
+        [Description("關鍵字留白時必須設 true 才會真的清空全部")] bool confirmAll = false)
     {
-        var removed = _personas.ForgetGlobal(keyword);
-        _log.Record("forget_global_rule", $"{keyword}（刪了 {removed} 條）", changedState: removed > 0);
+        var removed = _personas.ForgetGlobal(_grant, keyword, confirmAll);
+        _log.Record("forget_global_rule",
+            $"{keyword}（刪了 {removed} 條）" + (confirmAll ? "［確認清空］" : ""),
+            changedState: removed > 0);
+
+        if (removed == 0 && keyword.Trim().Length == 0 && !confirmAll)
+        {
+            return "⚠️ 你沒有指定關鍵字，那代表要**清空全部**全域規則 —— " +
+                   "這種破壞性操作需要明確確認：請把 confirm_all 設成 true 再呼叫一次。" +
+                   "（或改用關鍵字指定要刪哪一條）";
+        }
 
         return removed == 0
             ? $"找不到符合「{keyword}」的全域規則。"
             : $"✅ 已刪掉 {removed} 條全域規則。";
+    }
+
+    [KernelFunction("list_owner_audit")]
+    [Description("列出最近的主人操作紀錄（誰、什麼時候、對全域設定做了什麼）。" +
+                 "使用者問「你剛剛改了什麼」時用這個。")]
+    public string ListOwnerAudit(
+        [Description("要列幾筆，預設 10")] int limit = 10)
+    {
+        var entries = _personas.AuditLog(limit);
+        _log.Record("list_owner_audit", $"{entries.Count} 筆");
+
+        return entries.Count == 0
+            ? "目前沒有主人操作紀錄。"
+            : $"最近 {entries.Count} 筆主人操作：\n" +
+              string.Join("\n", entries.Select(e => $"• {e.Describe()}"));
     }
 }

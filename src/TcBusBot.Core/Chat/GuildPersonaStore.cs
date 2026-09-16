@@ -146,10 +146,47 @@ public sealed class GuildPersonaStore
         => LearnInto(Key(guildId), text, evict: true);
 
     /// <summary>
-    /// 加一條**全域**規則（只有通過主人授權的請求能用）。
-    /// 不會被 <see cref="Reset"/> 清掉 —— 那是伺服器層級的重設。
+    /// 加一條**全域**規則（所有伺服器都適用）。
+    ///
+    /// ⚠️ **必須傳入 <see cref="OwnerGrant"/>** —— 這是刻意的設計：
+    /// 全域設定影響每一台伺服器，所以把「有沒有授權」變成**編譯器檢查得到的參數**，
+    /// 而不是靠提示詞叫模型「要聽主人的話」。就算模型抽風、被提示注入，
+    /// 或是未來有人改壞了工具掛載的邏輯，沒有憑證就是寫不進去。
     /// </summary>
-    public LearnResult LearnGlobal(string? text) => LearnInto(GlobalKey, text, evict: false);
+    public LearnResult LearnGlobal(OwnerGrant grant, string? text)
+    {
+        var result = LearnInto(GlobalKey, text, evict: false);
+
+        if (result == LearnResult.Added)
+            Audit(grant, "新增全域規則", Clean(text));
+
+        return result;
+    }
+
+    /// <summary>
+    /// 刪掉符合關鍵字的全域規則（主人限定）。
+    ///
+    /// ⚠️ 關鍵字留白＝清掉**全部**全域規則，這種破壞性動作用
+    /// <paramref name="confirmAll"/> 再擋一層 —— 模型只要不小心傳了空字串，
+    /// 就會把主人累積的規則全部清掉。
+    /// </summary>
+    public int ForgetGlobal(OwnerGrant grant, string? match, bool confirmAll = false)
+    {
+        var needle = (match ?? "").Trim();
+
+        if (needle.Length == 0 && !confirmAll)
+        {
+            Audit(grant, "⚠️ 拒絕清空全部全域規則（沒有確認）", "");
+            return 0;
+        }
+
+        var removed = ForgetIn(GlobalKey, needle);
+
+        if (removed > 0)
+            Audit(grant, needle.Length == 0 ? "清空全部全域規則" : $"刪除全域規則（關鍵字：{needle}）", $"{removed} 條");
+
+        return removed;
+    }
 
     private LearnResult LearnInto(string key, string? text, bool evict)
     {
@@ -188,9 +225,6 @@ public sealed class GuildPersonaStore
     /// <summary>依關鍵字刪掉符合的規則（找不到就回傳 0）。</summary>
     public int Forget(ulong guildId, string? match) => ForgetIn(Key(guildId), match);
 
-    /// <summary>依關鍵字刪掉全域規則（主人限定）。</summary>
-    public int ForgetGlobal(string? match) => ForgetIn(GlobalKey, match);
-
     private int ForgetIn(string key, string? match)
     {
         var needle = (match ?? "").Trim();
@@ -199,9 +233,20 @@ public sealed class GuildPersonaStore
         {
             if (!_lines.TryGetValue(key, out var list)) return 0;
 
-            var removed = needle.Length == 0
-                ? list.Count
-                : list.RemoveAll(l => l.Contains(needle, StringComparison.OrdinalIgnoreCase));
+            int removed;
+
+            if (needle.Length == 0)
+            {
+                // ⚠️ 這裡以前只回傳 `list.Count` 卻**沒有真的清掉**：
+                //    呼叫端（模型）會以為刪了 N 條，實際上規則還在。
+                //    「留白＝刪掉全部」必須真的刪。
+                removed = list.Count;
+                list.Clear();
+            }
+            else
+            {
+                removed = list.RemoveAll(l => l.Contains(needle, StringComparison.OrdinalIgnoreCase));
+            }
 
             if (removed > 0) SaveLocked();
             return removed;
@@ -238,8 +283,61 @@ public sealed class GuildPersonaStore
             ? "還沒學到東西（可以教它，例如「講話再簡短一點」或「<表情> 是 什麼意思」）"
             : $"已學到 {count}/{MaxLinesPerGuild} 條（這個伺服器專用）";
 
-        return global == 0 ? local : $"{local}｜另有 {global} 條全域規則（主人指定）";
+        var auditNote = _audit.Count == 0 ? "" : $"｜主人操作紀錄 {_audit.Count} 筆";
+
+        return (global == 0 ? local : $"{local}｜另有 {global} 條全域規則（主人指定）") + auditNote;
     }
+
+    // ─────────────────────────────────────────────────────
+    //  主人操作紀錄（audit log）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 每一次「動到全域設定」的紀錄。
+    ///
+    /// 為什麼要記：全域規則影響每一台伺服器，而它是由**模型呼叫工具**寫進去的 ——
+    /// 模型抽風（亂叫工具）時，光看回覆看不出發生什麼事。
+    /// 有了這份紀錄，誰、什麼時候、改了什麼都查得到，
+    /// 而且它**會被持久化**（重啟後還在），不是只有 console 上的幾行。
+    /// </summary>
+    public sealed record AuditEntry(
+        [property: JsonPropertyName("at")] DateTimeOffset At,
+        [property: JsonPropertyName("user")] ulong UserId,
+        [property: JsonPropertyName("action")] string Action,
+        [property: JsonPropertyName("text")] string Text)
+    {
+        public string Describe()
+            => $"{At.ToLocalTime():MM-dd HH:mm}　主人 {UserId}　{Action}" +
+               (Text.Length == 0 ? "" : $"：{Text}");
+    }
+
+    private readonly List<AuditEntry> _audit = new();
+
+    /// <summary>最多留幾筆（舊的一直丟掉，避免無限長大）。</summary>
+    public const int MaxAuditEntries = 200;
+
+    public IReadOnlyList<AuditEntry> AuditLog(int limit = 10)
+    {
+        lock (_gate) return _audit.TakeLast(Math.Max(1, limit)).Reverse().ToList();
+    }
+
+    /// <summary>記一筆主人操作（同時寫進 console，讓主機端也看得到）。</summary>
+    private void Audit(OwnerGrant grant, string action, string text)
+    {
+        var entry = new AuditEntry(DateTimeOffset.UtcNow, grant.UserId, action, Truncate(text, 200));
+
+        lock (_gate)
+        {
+            _audit.Add(entry);
+            while (_audit.Count > MaxAuditEntries) _audit.RemoveAt(0);
+            SaveLocked();
+        }
+
+        BotLog.Warn($"[主人] {entry.Describe()}");
+    }
+
+    private static string Truncate(string text, int max)
+        => text.Length <= max ? text : text[..max] + "…";
 
     // ─────────────────────────────────────────────────────
     //  持久化（與每週用量同一條後端鏈）
@@ -247,8 +345,17 @@ public sealed class GuildPersonaStore
 
     public string Serialize()
     {
-        lock (_gate) return JsonSerializer.Serialize(_lines, Json);
+        lock (_gate) return JsonSerializer.Serialize(Snapshot(), Json);
     }
+
+    /// <summary>要存下來的內容（規則 ＋ 主人操作紀錄）。</summary>
+    private Persisted Snapshot()
+        => new(_lines, _audit.TakeLast(MaxAuditEntries).ToList());
+
+    /// <summary>存檔格式（舊版的「純字典」也讀得進來）。</summary>
+    private sealed record Persisted(
+        [property: JsonPropertyName("lines")] Dictionary<string, List<string>> Lines,
+        [property: JsonPropertyName("audit")] List<AuditEntry> Audit);
 
     private void Load()
     {
@@ -259,15 +366,31 @@ public sealed class GuildPersonaStore
             var json = _store.GetBlob(BlobKey);
             if (string.IsNullOrWhiteSpace(json)) return;
 
-            var loaded = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(json, Json);
-            if (loaded is null) return;
+            // 先試新格式（含 audit），再試舊格式（只有 lines 的純字典）
+            Persisted? current = null;
+            Dictionary<string, List<string>>? legacy = null;
+
+            try { current = JsonSerializer.Deserialize<Persisted>(json, Json); }
+            catch (JsonException) { /* 往下試舊格式 */ }
+
+            if (current?.Lines is null && current?.Audit is null)
+            {
+                try { legacy = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(json, Json); }
+                catch (JsonException) { /* 兩種都不是 → 當成空的 */ }
+            }
 
             lock (_gate)
             {
                 _lines.Clear();
-                foreach (var (key, value) in loaded)
+                _audit.Clear();
+
+                foreach (var (key, value) in current?.Lines ?? legacy ?? [])
                     if (value is { Count: > 0 }) _lines[key] = value.Take(MaxLinesPerGuild).ToList();
-            }        }
+
+                if (current?.Audit is { Count: > 0 })
+                    _audit.AddRange(current.Audit.TakeLast(MaxAuditEntries));
+            }
+        }
         catch (Exception ex)
         {
             BotLog.Warn($"[人格] 讀不到學到的規則（{ex.GetType().Name}），這次從空的開始");
@@ -285,7 +408,7 @@ public sealed class GuildPersonaStore
 
         try
         {
-            _store.SetBlob(BlobKey, JsonSerializer.Serialize(_lines, Json));
+            _store.SetBlob(BlobKey, JsonSerializer.Serialize(Snapshot(), Json));
         }
         catch (Exception ex)
         {

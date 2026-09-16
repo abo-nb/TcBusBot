@@ -135,6 +135,43 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private static string Truncate(string text, int max)
         => text.Length <= max ? text : text[..max] + "…";
 
+    [SlashCommand("audit", "看最近的主人操作紀錄（誰改了全域設定；只有主人看得到）")]
+    public async Task AuditAsync()
+    {
+        // 唯讀、不洩漏 key，所以**不需要**在訊息裡帶 key ——
+        // 主人在任何頻道都能查（但仍然只有名單上的人看得到）。
+        var isAdmin = _options.AdminUserIds.Contains(Context.User.Id);
+
+        if (!isAdmin)
+        {
+            await RespondAsync(
+                "這個指令只有主人能看（`LLM_ADMIN_IDS` 名單上的人）。\n" +
+                "它會揭露誰對**全域設定**做了什麼，屬於管理資訊。",
+                ephemeral: true);
+            return;
+        }
+
+        var entries = _personas.AuditLog(10);
+
+        if (entries.Count == 0)
+        {
+            await RespondAsync("目前沒有任何主人操作紀錄（沒有人改過全域設定）。", ephemeral: true);
+            return;
+        }
+
+        var lines = string.Join("\n", entries.Select(e => $"`{e.At.ToLocalTime():MM-dd HH:mm}` {e.Describe()}"));
+        if (lines.Length > 4000) lines = lines[..4000] + "…";
+
+        await RespondAsync(
+            embed: new EmbedBuilder()
+                .WithColor(new Color(0x5A, 0x5A, 0x5A))
+                .WithTitle("📝 主人操作紀錄")
+                .WithDescription(lines)
+                .WithFooter($"最近 {entries.Count} 筆｜每次動到全域設定都會留下紀錄（含被拒絕的嘗試）")
+                .Build(),
+            ephemeral: true);
+    }
+
     [SlashCommand("forget", "忘掉這個頻道的 AI 對話記憶（不影響公車訂閱）")]
     public async Task ForgetAsync()
     {
