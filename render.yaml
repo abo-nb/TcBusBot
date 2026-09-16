@@ -82,6 +82,9 @@ services:
       # 超過這個分鐘數沒說話就當成新的段落（不帶舊上下文）
       - key: LLM_SEGMENT_GAP_MINUTES
         value: "30"
+      # 讓 LLM 用工具真的幫使用者訂閱公車（設 false 就只剩聊天）
+      - key: LLM_TOOLS
+        value: "true"
 
       - key: DOTNET_ENVIRONMENT
         value: Production

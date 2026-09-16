@@ -232,6 +232,10 @@ public sealed class BotConfig
         var allowDm = SettingResolver.Resolve(args, "--llm-dm", file, ["LLM_ALLOW_DM"]).Value;
         if (!string.IsNullOrWhiteSpace(allowDm)) cfg.Llm.AllowDm = !IsFalsy(allowDm!);
 
+        var tools = SettingResolver.Resolve(args, "--llm-tools", file, ["LLM_TOOLS"]).Value;
+        if (!string.IsNullOrWhiteSpace(tools)) cfg.Llm.ToolsEnabled = !IsFalsy(tools!);
+        if (args.Contains("--no-llm-tools")) cfg.Llm.ToolsEnabled = false;
+
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
         cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;
         if (args.Contains("--no-message-intent")) cfg.EnableMessageContentIntent = false;

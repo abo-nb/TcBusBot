@@ -27,6 +27,12 @@ public sealed class LlmOptions
     /// <summary>時間沒超過門檻時，要不要再讓 LLM 判斷「是不是換話題了」。</summary>
     public bool TopicDetect { get; set; } = true;
 
+    /// <summary>
+    /// 要不要讓 LLM 用工具**真的動手**（訂閱公車、取消訂閱…）。
+    /// 關掉就只剩聊天 —— 模型不會有任何改變資料的能力。
+    /// </summary>
+    public bool ToolsEnabled { get; set; } = true;
+
     /// <summary>帶進提示詞的歷史上限（則）。</summary>
     public int MaxContextTurns { get; set; } = 20;
 

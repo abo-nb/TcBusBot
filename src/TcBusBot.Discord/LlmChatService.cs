@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Discord;
 using Discord.WebSocket;
 using TcBusBot.Core.Chat;
+using TcBusBot.Core.Subscriptions;
 
 namespace TcBusBot.Discord;
 
@@ -35,6 +36,7 @@ public sealed class LlmChatService : IDisposable
     private readonly DiscordSocketClient _client;
     private readonly ChatOrchestrator _chat;
     private readonly LlmOptions _options;
+    private readonly BusSessionStore _sessions;
 
     private readonly ConcurrentDictionary<ulong, SemaphoreSlim> _channelGates = new();
     private readonly ConcurrentDictionary<ulong, DateTimeOffset> _lastAskedAt = new();
@@ -46,11 +48,16 @@ public sealed class LlmChatService : IDisposable
     private int _failed;
     private int _refused;
 
-    public LlmChatService(DiscordSocketClient client, ChatOrchestrator chat, LlmOptions options)
+    public LlmChatService(
+        DiscordSocketClient client,
+        ChatOrchestrator chat,
+        LlmOptions options,
+        BusSessionStore sessions)
     {
         _client = client;
         _chat = chat;
         _options = options;
+        _sessions = sessions;
     }
 
     public int Handled => _handled;
@@ -200,6 +207,10 @@ public sealed class LlmChatService : IDisposable
                 $"[llm] → {answer.Model}｜in {answer.InputTokens} / out {answer.OutputTokens} tokens" +
                 $"（{(answer.UsageReported ? "API 回報" : "估算")}）｜話題判斷 {answer.TopicDetectTokens} tokens｜" +
                 $"{answer.Elapsed.TotalSeconds:0.0}s｜{_chat.Budget.Describe()}");
+
+            if (answer.ToolCalls.Count > 0)
+                Console.WriteLine($"[llm] 🔧 工具呼叫：{string.Join("、", answer.ToolCalls)}" +
+                                  (answer.ToolChangedState ? "（有動到資料）" : ""));
         }
         else
         {
@@ -208,14 +219,27 @@ public sealed class LlmChatService : IDisposable
         }
 
         // ── 貼回頻道（分段；第一段用「回覆」讓使用者可以接著回）──
-        var chunks = Split(answer.Text, MaxChunkChars);
+        // 模型如果**真的動了資料**，就在後面附一行「我實際做了什麼」：
+        // 模型常常講得比做得多，這句話讓使用者能核對。
+        var replyText = answer.Text;
+
+        if (answer.Ok && answer.ToolChangedState)
+            replyText += "\n\n-# 🔧 我實際做了：" + string.Join("、", answer.ToolCalls);
+
+        // LLM 做的破壞性操作也要能一鍵還原（取消訂閱 → 掛「↩️ 復原」按鈕）
+        var components = BuildUndoComponents(message);
+
+        var chunks = Split(replyText, MaxChunkChars);
         IMessage? sent = null;
 
         for (var i = 0; i < chunks.Count; i++)
         {
+            var isLast = i == chunks.Count - 1;
+
             sent = i == 0
-                ? await message.ReplyAsync(chunks[i])
-                : await message.Channel.SendMessageAsync(chunks[i]);
+                ? await message.ReplyAsync(chunks[i], components: isLast ? components : null)
+                : await message.Channel.SendMessageAsync(
+                    chunks[i], components: isLast ? components : null);
         }
 
         // 把 Bot 的回覆記進同一段（附上真正的訊息 ID）
@@ -234,6 +258,40 @@ public sealed class LlmChatService : IDisposable
     // ─────────────────────────────────────────────────────
     //  小工具
     // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 如果模型剛剛取消了訂閱，就把它推進這個頻道的復原堆疊、並回傳「↩️ 復原」按鈕。
+    ///
+    /// 為什麼要這樣做：`/bus end` 有復原按鈕，但**模型自己決定要取消**的時候，
+    /// 使用者只看到一句「已幫你取消全部訂閱」—— 那太無助了。
+    /// 既然被移除的內容已經抄下來了（<see cref="BusTools.PendingUndo"/>），
+    /// 就把它變成同一顆按鈕：AI 做的事情與人按按鈕做的事情，復原方式一致。
+    /// </summary>
+    private MessageComponent? BuildUndoComponents(SocketUserMessage message)
+    {
+        if (_chat.Tools is not BusToolProvider busTools) return null;
+        if (busTools.TakePendingUndo() is not { Count: > 0 } removed) return null;
+
+        var session = _sessions.GetOrCreate(message.Author.Id, message.Channel.Id);
+
+        session.Undo.Push(new UndoEndedTracking(
+            Description: $"AI 取消全部訂閱（{removed.Count} 組）",
+            Removed: removed,
+            PreviousSessionGroupId: session.CreatedGroupId));
+
+        session.CreatedGroupId = null;
+        session.Origin = null;
+        session.Destination = null;
+        session.LastRoutes.Clear();
+        session.ResetPicks();
+
+        Console.WriteLine($"[llm] 🔧 已把「取消 {removed.Count} 組訂閱」推進復原堆疊" +
+                          $"（{removed.Sum(r => r.Subscriptions.Count)} 筆）");
+
+        return new ComponentBuilder()
+            .WithButton($"↩️ 復原（把 {removed.Count} 組訂閱放回來）", Cid.Undo, ButtonStyle.Primary)
+            .Build();
+    }
 
     private static ChatTurn ToTurn(IMessage message, ulong botId)
         => new(

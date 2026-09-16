@@ -244,8 +244,54 @@ public static class Program
         {
             // 真正的規則（切段／額度／呼叫）在 Core 的 ChatOrchestrator，
             // 這裡只負責「Discord 的部分」。
-            var orchestrator = new ChatOrchestrator(llm, llmOptions, conversations, budget);
-            chat = new LlmChatService(client, orchestrator, llmOptions);
+            var actions = new BusActionService(data, subs);
+
+            // 到站時間需要 BotRuntime（TDX 查詢在 Discord 這一層），
+            // 所以用一個 delegate 把它接進工具裡；純文字格式化放在這裡。
+            async Task<string> ArrivalsAsync(ChatToolContext ctx, string? route, CancellationToken ct)
+            {
+                var groups = subs.GetGroupsByUser(ctx.UserId).ToList();
+
+                if (groups.Count == 0)
+                    return "使用者目前沒有任何訂閱，所以沒有到站時間可以查。" +
+                           "（可以問他要不要用 subscribe_bus 訂閱）";
+
+                var group = groups[^1];
+                var result = await runtime.BuildEtaTableAsync(group, DateTimeOffset.UtcNow);
+
+                var rows = result.Rows.AsEnumerable();
+                if (!string.IsNullOrWhiteSpace(route))
+                {
+                    var filtered = rows.Where(r =>
+                        r.Subscription.RouteName.Contains(route!, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                    if (filtered.Count > 0) rows = filtered;
+                }
+
+                var lines = rows.Take(15).Select(r =>
+                {
+                    var when = r.LiveSeconds is { } sec
+                        ? $"約 {Math.Round(sec / 60.0)} 分鐘"
+                        : r.StatusText;
+                    return $"• {r.Subscription.RouteName}（{(r.Subscription.Direction == 0 ? "去程" : "返程")}）" +
+                           $"{r.Subscription.BoardStopName}：{when}";
+                });
+
+                var header = result.Simulation ? "（⚠️ 這是模擬資料，主機沒有 TDX 金鑰）\n" : "";
+                var error = result.Error is null ? "" : $"\n⚠️ 查詢部分失敗：{result.Error}";
+
+                return header + $"{group.DescribeRoute()} 的到站狀況：\n" +
+                       string.Join("\n", lines) + error;
+            }
+
+            IChatToolProvider toolProvider = llmOptions.ToolsEnabled
+                ? new BusToolProvider(actions, subs, ArrivalsAsync)
+                : NoChatTools.Instance;
+
+            var orchestrator = new ChatOrchestrator(llm, llmOptions, conversations, budget, toolProvider);
+            chat = new LlmChatService(client, orchestrator, llmOptions, sessions);
+
+            Console.WriteLine($"    工具　　：{(llmOptions.ToolsEnabled ? toolProvider.Describe() : "未啟用（LLM_TOOLS=false）")}");
 
             client.MessageReceived += message =>
             {

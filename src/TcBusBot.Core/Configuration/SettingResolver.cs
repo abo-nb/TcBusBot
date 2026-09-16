@@ -14,6 +14,21 @@ namespace TcBusBot.Core.Configuration;
 public static class SettingResolver
 {
     /// <summary>
+    /// 這次啟動**問過**的所有環境變數名稱（含別名）。
+    ///
+    /// 為什麼要記這個：`env-vars.csv` 是給人看的環境變數清單，
+    /// 但「加了新變數卻忘了更新文件」是遲早會發生的事。
+    /// 有了這份清單，`--dryrun` 就能自動比對「程式用到的」與「文件寫的」，
+    /// 少了或多了都會被指出來（見 DryRun.AuditEnvCsv）。
+    /// </summary>
+    public static IReadOnlyCollection<string> SeenKeys
+    {
+        get { lock (Seen) return Seen.ToArray(); }
+    }
+
+    private static readonly HashSet<string> Seen = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// 解析一個設定值，並回報它是從哪裡來的（啟動橫幅會印出來，方便查「為什麼沒生效」）。
     ///
     /// <paramref name="keys"/> 是別名清單，依序檢查（例：`DISCORD_TOKEN`、`DISCORD_BOT_TOKEN`…）。
@@ -22,6 +37,8 @@ public static class SettingResolver
     public static (string? Value, string Source) Resolve(
         string[] args, string cliName, IReadOnlyDictionary<string, string> file, params string[] keys)
     {
+        lock (Seen) foreach (var key in keys) Seen.Add(key);
+
         // 1) 命令列最優先
         var cli = TakeOption(args, cliName);
         if (!string.IsNullOrWhiteSpace(cli)) return (cli.Trim(), $"命令列 {cliName}");

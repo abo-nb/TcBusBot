@@ -54,6 +54,13 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .WithColor(enabled ? new Color(0x2B, 0x6C, 0xB0) : new Color(0x5A, 0x5A, 0x5A))
             .AddField("啟用", enabled ? "✅ 已啟用" : "❌ 未啟用（主機沒有設定 LLM_API_KEY）", inline: false)
             .AddField("模型", enabled ? $"{_options.Model} @ {_options.EndpointHost}" : "—", inline: false)
+            .AddField("工具（可以真的動手）",
+                !enabled
+                    ? "—"
+                    : _options.ToolsEnabled
+                        ? "✅ 已啟用：查站牌／查路線／訂閱公車／列出訂閱／取消訂閱／到站時間"
+                        : "❌ 已關閉（LLM_TOOLS=false）→ 只會聊天，不會動到你的訂閱",
+                inline: false)
             .AddField("每週額度",
                 _budget.Limit <= 0
                     ? $"不限（已用 {_budget.Usage.TotalTokens:N0} tokens）"

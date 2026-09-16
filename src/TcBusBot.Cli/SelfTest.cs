@@ -95,6 +95,9 @@ public static class SelfTest
         Section("20. AI 聊天：時間切段、回覆舊訊息、伺服器隔離、每週 token 額度");
         TestChat();
 
+        Section("21. LLM 工具：用一句話訂閱公車（口語站名 → 真的建立訂閱）");
+        TestBusActions(data, origin, dest);
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -1393,6 +1396,136 @@ public static class SelfTest
 
         if (remaining.Length > 0) chunks.Add(remaining);
         return chunks;
+    }
+
+    /// <summary>
+    /// LLM 工具的公車操作層（<see cref="BusActionService"/>）。
+    ///
+    /// 這是「模型幫使用者訂公車」真正會出事的地方，而且出事的代價是**訂錯路線**：
+    ///   * 模型給的是口語站名（「台中火車站」「靜宜」），要展開成正確的候選站牌集合
+    ///   * 站名找不到時**不能**硬訂（回報失敗，讓模型去問使用者）
+    ///   * 只能動「那個人」的訂閱（工具參數裡沒有任何「幫誰訂」的欄位）
+    ///   * 取消要能還原（回傳被移除的內容）
+    ///
+    /// 全程不需要 LLM、不需要網路 —— 模型講什麼都只是字串輸入。
+    /// </summary>
+    private static void TestBusActions(TaichungBusDataService data, LocationTarget origin, LocationTarget dest)
+    {
+        const ulong me = 555UL;
+        const ulong other = 556UL;
+
+        var subs = Subs();
+        var actions = new BusActionService(data, subs);
+
+        // ── 1) 口語站名 → 正確的候選站牌 ──────────────────
+        var search = actions.SearchStops("台中火車站");
+        Check("★ 查站牌：打「台中火車站」找得到（口語 + 台/臺）",
+            search.Contains("臺中車站", StringComparison.Ordinal), search.Split('\n')[0]);
+
+        var abbreviated = actions.SearchStops("台中科大");
+        Check("★ 查站牌：縮寫「台中科大」也找得到",
+            abbreviated.Contains("科技大學", StringComparison.Ordinal), abbreviated.Split('\n')[0]);
+
+        var missing = actions.SearchStops("不存在的站XYZ");
+        Check("★ 查不到的站名會老實說找不到，並給範例",
+            missing.Contains("找不到", StringComparison.Ordinal) &&
+            missing.Contains("例如", StringComparison.Ordinal));
+
+        Check("太短的關鍵字會被擋掉（避免亂命中）",
+            actions.SearchStops("中").Contains("太短", StringComparison.Ordinal));
+
+        // ── 2) 查路線（不建立訂閱）────────────────────────
+        var routeText = actions.FindRoutes("臺中車站", "靜宜大學");
+        Check("★ 查路線：找得到且**不會**建立訂閱",
+            routeText.Contains("路線", StringComparison.Ordinal) && subs.GroupCount == 0,
+            routeText.Split('\n')[0]);
+
+        var reverseText = actions.FindRoutes("靜宜大學", "臺中車站");
+        Check("反方向也查得出來（方向不同 → 路線不同）",
+            reverseText.Contains("路線", StringComparison.Ordinal), reverseText.Split('\n')[0]);
+
+        // ── 3) 訂閱：真的建立，而且與面板同一套邏輯 ─────────
+        var subscribe = actions.Subscribe(me, "台中車站", "靜宜大學", notifyMinutes: 7,
+                                          guildId: 111UL, channelId: 222UL);
+
+        Check("★ 用一句話就訂閱成功", subscribe.Ok, subscribe.Message.Split('\n')[0]);
+
+        // 「與面板同一套邏輯」的硬證據：把「臺中車站」這一組站牌直接餵給同一條路線匹配，
+        // 得到的候選上車站數量必須與工具建立的一模一樣（面板就是這樣做的）。
+        var expectedSubs = data
+            .FindRoutes(data.TargetFromStops(new[] { "TXG12251", "TXG11020" }), dest)
+            .Sum(r => r.BoardChoices.Count);
+
+        Check($"★ 訂閱內容與面板相同（{expectedSubs} 筆候選上車站）",
+            subscribe.Group?.SubscriptionIds.Count == expectedSubs,
+            $"{subscribe.Group?.SubscriptionIds.Count} 筆");
+        Check("提前通知時間有帶進去", subscribe.Group?.NotifyBeforeMinutes == 7);
+        Check("訊息裡有列出上車站（使用者才知道在哪等）",
+            subscribe.Message.Contains("上車", StringComparison.Ordinal));
+        Check("訂閱屬於正確的使用者",
+            subs.GetGroupsByUser(me).Count() == 1 && subscribe.Group!.UserId == me);
+
+        // 重複訂閱是合法的（兩段不同的行程），但要是**不同的**群組
+        var second = actions.Subscribe(me, "靜宜大學", "臺中車站", notifyMinutes: 10);
+        Check("★ 再訂一次反向行程 → 另一個群組（不會蓋掉前一個）",
+            second.Ok && subs.GetGroupsByUser(me).Count() == 2);
+
+        // ── 4) 站名錯誤時不能硬訂 ─────────────────────────
+        var beforeBad = subs.GroupCount;
+        var badOrigin = actions.Subscribe(me, "不存在的站XYZ", "靜宜大學");
+        Check("★ 起點找不到 → 不建立訂閱，並回報失敗", !badOrigin.Ok && subs.GroupCount == beforeBad);
+        Check("失敗訊息有提示模型去查正確站名",
+            badOrigin.Message.Contains("search_stops", StringComparison.Ordinal) ||
+            badOrigin.Message.Contains("正確的站名", StringComparison.Ordinal));
+
+        var badDest = actions.Subscribe(me, "臺中車站", "不存在的站XYZ");
+        Check("★ 終點找不到 → 不建立訂閱", !badDest.Ok && subs.GroupCount == beforeBad);
+
+        // 沒有直達路線時也不能硬訂
+        var noRoute = actions.Subscribe(me, "臺中車站", "臺中車站");
+        Check("★ 沒有可搭路線 → 不建立訂閱（同站到同站）", !noRoute.Ok, noRoute.Message.Split('\n')[0]);
+
+        // ── 5) 列出訂閱（模型用來確認）────────────────────
+        var list = actions.ListSubscriptions(me);
+        Check("★ 列得出自己的訂閱", list.Contains("2 組訂閱", StringComparison.Ordinal),
+            list.Split('\n')[0]);
+        Check("別人的訂閱看不到（工具只作用在那個人身上）",
+            actions.ListSubscriptions(other).Contains("沒有任何訂閱", StringComparison.Ordinal));
+
+        // ── 6) 取消要能還原 ──────────────────────────────
+        var idsBefore = subs.GetGroupsByUser(me).Select(g => g.Id).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var subCountBefore = subs.SubscriptionCount;
+
+        var cancel = actions.CancelAll(me);
+        Check("★ 取消全部訂閱",
+            cancel.GroupCount == idsBefore.Count && cancel.SubscriptionCount == subCountBefore,
+            $"{cancel.GroupCount} 組、{cancel.SubscriptionCount} 筆");
+        Check("取消後就不再查詢任何上車站",
+            subs.GetAllEnabledBoardStopUids().Count == 0,
+            $"{subs.GetAllEnabledBoardStopUids().Count} 個");
+        Check("★ 取消會回傳被移除的內容（呼叫端才能掛「復原」）",
+            cancel.Removed.Count == idsBefore.Count &&
+            cancel.Removed.Sum(r => r.Subscriptions.Count) == subCountBefore);
+
+        var undo = new UndoStack();
+        undo.Push(new UndoEndedTracking("AI 取消全部訂閱", cancel.Removed, null));
+        undo.Undo(subs, store: null!, me);
+
+        Check("★ 復原後 id 完全相同（AI 做的破壞性操作也救得回來）",
+            subs.GetGroupsByUser(me).Select(g => g.Id).OrderBy(x => x, StringComparer.Ordinal)
+                .SequenceEqual(idsBefore));
+        Check("復原後訂閱數回到原本的值", subs.SubscriptionCount == subCountBefore,
+            $"{subs.SubscriptionCount}");
+
+        var cancelEmpty = actions.CancelAll(other);
+        Check("沒有訂閱時取消 → 老實說沒有東西可以取消",
+            cancelEmpty.GroupCount == 0 && cancelEmpty.Message.Contains("沒有", StringComparison.Ordinal));
+
+        // ── 7) 工具只影響自己：別的伺服器的使用者互不干擾 ──
+        var otherSub = actions.Subscribe(other, "臺中車站", "靜宜大學");
+        Check("另一個使用者的訂閱是分開的", otherSub.Ok && subs.GetGroupsByUser(other).Count() == 1);
+        Check("自己的訂閱不會因為別人訂閱而增加",
+            subs.GetGroupsByUser(me).Count() == 2, $"{subs.GetGroupsByUser(me).Count()} 組");
     }
 
     /// <summary>

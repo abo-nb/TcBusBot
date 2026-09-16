@@ -1,5 +1,7 @@
 namespace TcBusBot.Core.Chat;
 
+using Microsoft.SemanticKernel;
+
 /// <summary>一次要送給 LLM 的內容。</summary>
 public sealed record LlmRequest(
     string SystemPrompt,
@@ -9,6 +11,15 @@ public sealed record LlmRequest(
     double Temperature,
     string? Tag = null)
 {
+    /// <summary>
+    /// 這次可以用的工具（Semantic Kernel 的 plugin）。
+    ///
+    /// 為什麼放在 request 而不是 kernel：工具需要**這一次互動的上下文**
+    /// （誰在問、在哪個頻道），是同一個使用者一次性的東西 ——
+    /// 塞進共用的 kernel 會變成跨使用者污染（A 的訂閱被 B 的工具呼叫建立）。
+    /// </summary>
+    public IReadOnlyList<KernelPlugin> Plugins { get; init; } = [];
+
     /// <summary>這次呼叫大概會用掉多少輸入 token（事前估算，用來擋額度）。</summary>
     public int EstimatedInputTokens
         => TokenEstimator.Estimate(SystemPrompt)

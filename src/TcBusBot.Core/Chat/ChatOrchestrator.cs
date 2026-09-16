@@ -19,6 +19,12 @@ public sealed record ChatAnswer(
     TimeSpan Elapsed)
 {
     public int TotalTokens => InputTokens + OutputTokens + TopicDetectTokens;
+
+    /// <summary>這次模型實際呼叫了哪些工具（給 log 與「我做了什麼」用）。</summary>
+    public IReadOnlyList<string> ToolCalls { get; init; } = [];
+
+    /// <summary>工具有沒有動到使用者的資料（決定要不要顯示「我做了什麼」與復原按鈕）。</summary>
+    public bool ToolChangedState { get; init; }
 }
 
 /// <summary>
@@ -33,28 +39,62 @@ public sealed record ChatAnswer(
 /// </summary>
 public sealed class ChatOrchestrator
 {
+    /// <summary>
+    /// 工具啟用時**附加**在系統提示後面的規則。
+    ///
+    /// 為什麼要另外加這一段：系統提示是使用者自己用 `LLM_SYSTEM_PROMPT` 寫的，
+    /// 如果他寫的是「你是貓娘助理」這種人格設定，模型不會知道「可以真的幫人訂閱公車」。
+    /// 這段是**能力說明**，跟人格無關，所以由程式補上（而不是要求使用者記得寫）。
+    /// </summary>
+    public const string ToolInstructions = """
+
+        ── 工具（你可以真的動手）──────────────────
+        你有工具可以實際幫使用者操作，呼叫工具之後**一定要**把結果老實講出來：
+        • 使用者說「幫我訂 X 到 Y 的公車」→ 呼叫 subscribe_bus（站名先問清楚或用 search_stops 查）
+        • 要確認已經訂了什麼 → list_subscriptions
+        • 使用者說「不想搭了／全部取消」→ cancel_all_subscriptions
+        • 只是想知道有什麼車 → find_routes（不會建立訂閱）
+        • 問「還要多久」→ next_arrivals（需要 TDX 金鑰；查不到就明講）
+        規則：
+        1. 站名不確定時**先問**，不要自己猜一個看起來像的（猜錯會訂到錯的路線）。
+        2. 工具回報失敗（找不到站牌、沒有直達路線）時，把原因講清楚，不要假裝成功。
+        3. 呼叫完工具後用一兩句話總結「你做了什麼」，不要貼出工具的原始輸出。
+        4. 沒有工具能做的事（例如即時動態、票價）就說你查不到，不要編。
+        """;
+
     private readonly ILlmClient _llm;
     private readonly LlmOptions _options;
     private readonly ConversationStore _conversations;
     private readonly WeeklyTokenBudget _budget;
     private readonly TopicSwitchDetector _detector;
+    private readonly IChatToolProvider _tools;
 
     public ChatOrchestrator(
         ILlmClient llm,
         LlmOptions options,
         ConversationStore conversations,
-        WeeklyTokenBudget budget)
+        WeeklyTokenBudget budget,
+        IChatToolProvider? tools = null)
     {
         _llm = llm;
         _options = options;
         _conversations = conversations;
         _budget = budget;
+        _tools = tools ?? NoChatTools.Instance;
         _detector = new TopicSwitchDetector(llm, options);
     }
 
     public ConversationStore Conversations => _conversations;
 
     public WeeklyTokenBudget Budget => _budget;
+
+    public IChatToolProvider Tools => _tools;
+
+    /// <summary>這次要送出的系統提示（使用者設定的 ＋ 工具說明）。</summary>
+    public string EffectiveSystemPrompt
+        => _options.ToolsEnabled && _tools is not NoChatTools
+            ? _options.SystemPrompt + ToolInstructions
+            : _options.SystemPrompt;
 
     /// <summary>
     /// 回答一則訊息。
@@ -127,13 +167,20 @@ public sealed class ChatOrchestrator
         var trimmed = ContextBuilder.Trim(decision.Context, _options, decision.ReplyTarget);
 
         // ── 2) 額度夠嗎？（送出之前就要知道）───────────────
+        var toolContext = new ChatToolContext(guildId, channelId, incoming.AuthorId, incoming.AuthorName);
+        var toolLog = new ToolCallLog();
+        var plugins = _options.ToolsEnabled ? _tools.CreateFor(toolContext, toolLog) : [];
+
         var request = new LlmRequest(
-            SystemPrompt: _options.SystemPrompt,
+            SystemPrompt: EffectiveSystemPrompt,
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,
             Temperature: _options.Temperature,
-            Tag: "chat");
+            Tag: "chat")
+        {
+            Plugins = plugins
+        };
 
         var check = _budget.Check(request.EstimatedInputTokens, DateTimeOffset.UtcNow);
         if (!check.Allowed)
@@ -177,7 +224,11 @@ public sealed class ChatOrchestrator
                 TopicDetectTokens: detectTokens,
                 UsageReported: reply.UsageReported,
                 Model: reply.Model,
-                Elapsed: DateTimeOffset.UtcNow - startedAt);
+                Elapsed: DateTimeOffset.UtcNow - startedAt)
+            {
+                ToolCalls = toolLog.Calls,
+                ToolChangedState = toolLog.ChangedState
+            };
         }
         catch (LlmException ex)
         {
@@ -196,7 +247,11 @@ public sealed class ChatOrchestrator
                 TopicDetectTokens: detectTokens,
                 UsageReported: false,
                 Model: _options.Model,
-                Elapsed: DateTimeOffset.UtcNow - startedAt);
+                Elapsed: DateTimeOffset.UtcNow - startedAt)
+            {
+                ToolCalls = toolLog.Calls,
+                ToolChangedState = toolLog.ChangedState
+            };
         }
     }
 

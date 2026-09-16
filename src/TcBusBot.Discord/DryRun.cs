@@ -4,6 +4,7 @@ using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
 using TcBusBot.Core.Bus;
+using TcBusBot.Core.Configuration;
 using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Models;
 using TcBusBot.Core.Realtime;
@@ -446,6 +447,9 @@ public static class DryRun
 
         // ── LLM 設定（不連線，只驗設定本身合不合理）─────────
         AuditLlmConfig(cfg);
+
+        // ── 環境變數清單（env-vars.csv 與程式是否一致）────────
+        AuditEnvCsv();
 
         // ── 總結 ───────────────────────────────────────────
         Console.WriteLine();
@@ -1478,6 +1482,124 @@ public static class DryRun
         else
             Console.WriteLine("  ✔ 會要求 Message Content 意圖（⚠️ 必須同時在 Developer Portal 打開，" +
                               "否則閘道會用 4014 拒絕連線）");
+    }
+
+    /// <summary>
+    /// `env-vars.csv` 與程式是否一致（**雙向**檢查）。
+    ///
+    /// 為什麼要做：環境變數清單是給人看的文件，而「加了新變數、忘了寫進文件」
+    /// 一定會發生 —— 而且發現的時候通常是在別台機器上「怎麼設定沒生效」。
+    /// 這裡兩邊都對一次：
+    ///   * 程式問過的變數 → 文件一定要有
+    ///   * 文件寫的變數 → 程式一定要用到（不然就是過期的說明）
+    /// </summary>
+    private static void AuditEnvCsv()
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 環境變數清單檢查  env-vars.csv ↔ 程式實際用到的鍵");
+
+        var path = FindUpwards("env-vars.csv");
+
+        if (path is null)
+        {
+            Console.WriteLine("  ℹ 找不到 env-vars.csv（在容器裡執行時是正常的，略過）");
+            return;
+        }
+
+        // 程式這次啟動問過的鍵（SettingResolver 會記錄），加上幾個「不是透過 Resolver 讀」的
+        var used = new HashSet<string>(SettingResolver.SeenKeys, StringComparer.Ordinal)
+        {
+            "TCBUS_ENV",          // BotConfig 直接讀
+            "TCBUS_ENV_FILE",
+            SayModule.AllowListVariable   // SayModule 直接讀（每次呼叫都重讀，故意不快取）
+        };
+
+        // 這些是「平台用的」而不是程式讀的，寫在文件裡是給部署的人看的
+        var external = new HashSet<string>(StringComparer.Ordinal) { "DOTNET_ENVIRONMENT" };
+
+        var documented = new HashSet<string>(StringComparer.Ordinal);
+        var aliases = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var line in File.ReadAllLines(path, Encoding.UTF8))
+        {
+            var text = line.Trim().TrimStart('\uFEFF');
+            if (text.Length == 0) continue;
+
+            var cells = SplitCsv(text);
+            if (cells.Count == 0) continue;
+
+            // 標頭列（欄位名）不是變數；CSV 被引號包住時 cells[0] 會是 "變數名稱"
+            if (cells[0].Trim('"') == "變數名稱") continue;
+            if (cells[0].Length == 0) continue;
+
+            documented.Add(cells[0]);
+
+            // 別名欄的寫法：A / B / C
+            if (cells.Count > 1)
+                foreach (var alias in cells[1].Split('/', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var name = alias.Trim();
+                    if (name.Length > 0 && name != "（無）") aliases.Add(name);
+                }
+        }
+
+        var missing = used.Where(k => !documented.Contains(k) && !aliases.Contains(k)).OrderBy(x => x).ToList();
+        var stale = documented.Where(k => !used.Contains(k) && !external.Contains(k)).OrderBy(x => x).ToList();
+
+        Console.WriteLine($"  文件：{documented.Count} 個變數｜程式用到：{used.Count} 個");
+
+        if (missing.Count > 0)
+            Problem($"env-vars.csv 少了程式會讀的變數：{string.Join("、", missing)}");
+        else
+            Console.WriteLine("  ✔ 程式用到的每個變數都寫在 env-vars.csv 裡");
+
+        if (stale.Count > 0)
+            Console.WriteLine($"  ℹ 文件裡有 {stale.Count} 個程式沒用到的變數（可能是別的平台用的，" +
+                              $"或說明過期了）：{string.Join("、", stale)}");
+    }
+
+    /// <summary>從目前目錄往上找檔案（DryRun 常常在容器或別的目錄被執行）。</summary>
+    private static string? FindUpwards(string fileName)
+    {
+        var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
+
+        for (var i = 0; i < 8 && dir is not null; i++)
+        {
+            var candidate = Path.Combine(dir.FullName, fileName);
+            if (File.Exists(candidate)) return candidate;
+            dir = dir.Parent;
+        }
+
+        return null;
+    }
+
+    /// <summary>夠用的 CSV 解析（支援雙引號包住、內部有逗號與 "" 逃脫）。</summary>
+    private static List<string> SplitCsv(string line)
+    {
+        var cells = new List<string>();
+        var current = new StringBuilder();
+        var quoted = false;
+
+        for (var i = 0; i < line.Length; i++)
+        {
+            var ch = line[i];
+
+            if (quoted)
+            {
+                if (ch == '"')
+                {
+                    if (i + 1 < line.Length && line[i + 1] == '"') { current.Append('"'); i++; }
+                    else quoted = false;
+                }
+                else current.Append(ch);
+            }
+            else if (ch == '"') quoted = true;
+            else if (ch == ',') { cells.Add(current.ToString()); current.Clear(); }
+            else current.Append(ch);
+        }
+
+        cells.Add(current.ToString());
+        return cells;
     }
 
     /// <summary>與 BotRuntime.DescribeStatus 相同邏輯（DryRun 無法直接呼叫 private 方法）。</summary>

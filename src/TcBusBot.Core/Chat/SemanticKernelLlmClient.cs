@@ -99,12 +99,28 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
             MaxTokens = request.MaxTokens
         };
 
+        // ── 工具（function calling）────────────────────────
+        // 只有真的有工具時才啟用：不然模型會浪費一輪在想要不要呼叫工具。
+        // 用 FunctionChoiceBehavior.Auto()：模型決定要不要呼叫、SK 負責執行、
+        // 把結果餵回去、再由模型產生最終回覆 —— 這整段都在**一次**
+        // GetChatMessageContentsAsync 裡完成（對外看起來是一次呼叫）。
+        var kernel = _kernel;
+
+        if (request.Plugins.Count > 0)
+        {
+            // ⚠️ 一定要 Clone：plugin 帶著「這次互動的上下文」，
+            //    加到共用的 kernel 上會跨使用者污染。
+            kernel = _kernel.Clone();
+            kernel.Plugins.AddRange(request.Plugins);
+            settings.FunctionChoiceBehavior = FunctionChoiceBehavior.Auto();
+        }
+
         var sw = Stopwatch.StartNew();
 
         try
         {
             var result = await _chat.GetChatMessageContentsAsync(
-                history, settings, _kernel, cancellationToken);
+                history, settings, kernel, cancellationToken);
 
             sw.Stop();
 
