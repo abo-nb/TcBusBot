@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 470 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞…）
+    └─ SelfTest.cs                      ★ 494 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 470 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 494 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3311,6 +3311,64 @@ tcbus route（CLI） → 同一條路徑（以前是第三套實作：取 groups
 > 順便修掉：「車站前(和平路)」這種**前綴命中**在規則上算「精確」（所以會直接採用），
 > 而「路口」這種只符合子字串的會被判定成模糊 → 測試因此改成
 > **動態找出一個真的沒有精確命中的關鍵字**來驗，而不是寫死一個猜測。
+
+### 20.15 UI 動作：讓模型幫使用者「按按鈕」
+
+問題：使用者講的話（「幫我開面板、起點台中車站、找路線」）與面板上的按鈕**是同一件事**，
+但模型只能請使用者自己去點 —— 明明它已經知道該按哪一顆。
+
+作法：把面板的動作也做成工具（`Discord/UiTools.cs`），**操作的是同一份面板狀態**：
+
+```
+open_panel              → 開出設定面板（留在使用者的頻道）
+set_origin              → 設定起點（站名 → StopPicks → 整個站區）
+set_destination         → 設定目的地
+search_panel_routes     → 按「搜尋路線」
+subscribe_panel_routes  → 按「✅ 訂閱這 N 條路線」（會回傳「↩️ 復原」要用的復原資訊）
+undo_last_action        → 按「↩️ 復原」（「訂錯了」「取消剛剛那個」）
+```
+
+三個刻意的設計：
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 工具**改的是使用者畫面上那個面板**（`BusSessionStore` 的同一個 instance） | 否則會出現「AI 說訂好了、使用者畫面上還是舊的」—— 那是兩套影子狀態，比不能按更糟 |
+| 站牌解析**一律走 `StopPicks`**（與面板、CLI 同一份） | 見 §20.14：兩個入口各算一次候選就是同名站牌找不到的根因 |
+| `subscribe_panel_routes` 會把「復原資訊」一併回傳給 Discord 那一層 | 模型按下訂閱後，畫面上真的出現「↩️ 復原」按鈕（使用者不用因為是 AI 按的就少了退路） |
+
+`LLM_UI_ACTIONS=false` 可以整組關掉（`BotToolProvider` 不掛 `ui` plugin —— 模型連有這個能力都不知道）。
+
+### 20.16 偷聽模式（回完話後再聽幾句）
+
+問題：每句話都要 @ 它很煩；但**永久監聽**又會變成「一直在插話、一直在花錢」。
+
+作法：回完話後開一個**有上限的窗口**，窗口內沒被 @ 的訊息才需要判斷：
+
+```
+AskAsync(addressed: false)
+  ├─ 沒有窗口？            → 直接 Ignored（不問模型、不回話、不花錢）
+  ├─ 有窗口：
+  │   ├─ 訊息 @ 了別人？    → 直接停止偷聽（deterministic，不花錢）
+  │   └─ 否則問一次極短判斷（max_tokens=8、temperature=0）
+  │        ├─ YES → 照常回答（窗口繼續，扣 1 則）
+  │        └─ NO  → 停止偷聽、什麼都不送
+  └─ 窗口用完（則數或秒數先到）→ 自動關閉，回到「等 @」
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 「沒有窗口就忽略」放在 **Core 的 `AskAsync`**，不只放在 Discord 那一層 | 呼叫端忘記檢查時，「沒有人對它說話」仍然不該觸發任何回答與花費（測試直接驗 **LLM 呼叫 0 次**） |
+| @ 別人 → 停止偷聽由**程式判斷**，不問模型 | 這是唯一 100% 確定「不是在跟我說話」的訊號；給模型判斷只會多花錢又可能判錯 |
+| 判斷「不確定 → NO」 | 少回一句話沒關係，**插話**才是使用者會生氣的 |
+| 兩個上限（`LLM_EAVESDROP_MESSAGES`／`LLM_EAVESDROP_SECONDS`） | 只限則數 → 沒人講話時窗口永遠開著；只限時間 → 洗頻時會被連發 |
+| 關掉 (`false` 或上限 `0`) 時 `StartListening` 直接不開窗口 | 關閉＝真的沒有窗口，而不是「有窗口但不判斷」 |
+
+驗收：
+
+| 檢查 | 在哪 |
+| --- | --- |
+| 解析（YES／NO／多講幾句取最後一句／看不懂→不插話）、窗口（則數、秒數、主動停止、上限 0）、**沒窗口時 LLM 呼叫 0 次**、判斷 YES 後照常回答、判斷 NO 後回到等 @ | `tcbus selftest` 第 28 節（**24 項**，用假 LLM 數呼叫次數） |
+| 實機：偷聽中的問題被回答（`search_routes`）、`@別人`→ 不問模型就停止、停止後再說一句 → 完全忽略 | 真實 API ＋ 真實 Discord |
 
 ---
 
