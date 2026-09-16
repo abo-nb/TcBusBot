@@ -581,6 +581,11 @@ public static class Program
                           (cfg.Llm.AdminEnabled
                               ? "（⚠️ key 要打在訊息裡，請在私訊或私人頻道使用）"
                               : ""));
+        Console.WriteLine($"  面板動作　　 ：{(cfg.Llm.UiActions ? "模型可以幫使用者按按鈕（開面板／設起訖／找路線／訂閱／復原）" : "關閉")}");
+        Console.WriteLine($"  偷聽模式　　 ：{(cfg.Llm.Eavesdrop
+            ? $"回完話後再聽 {cfg.Llm.EavesdropMaxMessages} 則／{cfg.Llm.EavesdropSeconds} 秒" +
+              "（判斷不是對它說的就停止、回到等 @）"
+            : "關閉")}");
         Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
         Console.WriteLine();
     }

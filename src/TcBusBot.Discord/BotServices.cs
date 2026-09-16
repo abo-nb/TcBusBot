@@ -89,7 +89,9 @@ internal static class BotServices
                     sp.GetRequiredService<BusActionService>(),
                     sp.GetRequiredService<SubscriptionService>(),
                     sp.GetRequiredService<GuildPersonaStore>(),
-                    ArrivalsAsync(sp))
+                    ArrivalsAsync(sp),
+                    cfg.Llm.UiActions ? sp.GetRequiredService<BusSessionStore>() : null,
+                    cfg.Llm.UiActions ? sp.GetRequiredService<SavedGroupStore>() : null)
                 : NoChatTools.Instance);
 
         services.AddSingleton(sp => new ChatOrchestrator(
@@ -98,7 +100,11 @@ internal static class BotServices
             sp.GetRequiredService<ConversationStore>(),
             sp.GetRequiredService<WeeklyTokenBudget>(),
             sp.GetRequiredService<IChatToolProvider>(),
-            sp.GetRequiredService<GuildPersonaStore>()));
+            sp.GetRequiredService<GuildPersonaStore>())
+        {
+            // 偷聽判斷的提示詞要用 Bot 自己的名字
+            BotName = client.CurrentUser?.Username ?? "Bot"
+        });
 
         services.AddSingleton<LlmChatService>();
 

@@ -45,6 +45,9 @@ public sealed class ChannelConversation
     /// <summary>由舊到新（加入順序）；「目前這一段」看 <see cref="LastActivityAt"/> 決定。</summary>
     public List<ConversationSegment> Segments { get; } = new();
 
+    /// <summary>偷聽窗口（沒有在偷聽時是 null）。</summary>
+    public ListenWindow? Listen { get; set; }
+
     public ConversationSegment? Current
         => Segments.Count == 0 ? null : Segments.MaxBy(s => s.LastActivityAt);
 
@@ -87,7 +90,15 @@ public sealed record ConversationSnapshot(
     DateTimeOffset? CurrentStartedAt,
     DateTimeOffset? CurrentLastActivityAt,
     string CurrentReason,
-    TimeSpan? Idle);
+    TimeSpan? Idle,
+    int ListenRemaining = 0,
+    TimeSpan? ListenTimeLeft = null);
+
+/// <summary>偷聽窗口的狀態。</summary>
+public sealed record ListenWindow(DateTimeOffset Until, int RemainingMessages)
+{
+    public bool Expired(DateTimeOffset now) => now >= Until || RemainingMessages <= 0;
+}
 
 /// <summary>
 /// 對話記憶（**只在記憶體**）。
@@ -233,13 +244,94 @@ public sealed class ConversationStore
         if (!_map.TryGetValue((guildId, channelId), out var conv)) return null;
 
         var current = conv.Current;
+        var listen = PeekListening(guildId, channelId, now);
+
         return new ConversationSnapshot(
             SegmentCount: conv.Segments.Count,
             CurrentTurnCount: current?.TurnCount ?? 0,
             CurrentStartedAt: current?.StartedAt,
             CurrentLastActivityAt: current?.LastActivityAt,
             CurrentReason: current?.Reason ?? "",
-            Idle: current is null ? null : now - current.LastActivityAt);
+            Idle: current is null ? null : now - current.LastActivityAt,
+            ListenRemaining: listen?.RemainingMessages ?? 0,
+            ListenTimeLeft: listen is null ? null : listen.Until - now);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  偷聽窗口
+    //
+    //  使用者要的是「回完話之後順便聽一下」：如果接下來幾句是在跟它講話，
+    //  就繼續回；如果判斷不是對它說的，就**停止偷聽並回到等 @ 的模式**。
+    //
+    //  兩個上限缺一不可：只限則數會被「慢慢講」拖著一直花錢判斷，
+    //  只限時間則會被連續灌訊息。所以兩者都有（先到先停）。
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 開始（或重新開始）偷聽這個頻道。
+    ///
+    /// ⚠️ 頻道還沒有任何對話紀錄時也要能開（用 GetOrAdd）——
+    /// 不然「第一次回話就直接被偷聽」這種最常見的情況會開不起來。
+    /// </summary>
+    public void StartListening(
+        ulong guildId, ulong channelId, int seconds, int maxMessages, DateTimeOffset? now = null)
+    {
+        if (seconds <= 0 || maxMessages <= 0) return;
+
+        var conv = _map.GetOrAdd((guildId, channelId), key => new ChannelConversation
+        {
+            GuildId = key.GuildId,
+            ChannelId = key.ChannelId
+        });
+
+        conv.Listen = new ListenWindow((now ?? DateTimeOffset.UtcNow).AddSeconds(seconds), maxMessages);
+    }
+
+    /// <summary>目前是否在偷聽（過期或被用完就自動清掉並回傳 null）。</summary>
+    public ListenWindow? PeekListening(ulong guildId, ulong channelId, DateTimeOffset now)
+    {
+        if (!_map.TryGetValue((guildId, channelId), out var conv) || conv.Listen is null) return null;
+
+        if (conv.Listen.Expired(now))
+        {
+            conv.Listen = null;
+            return null;
+        }
+
+        return conv.Listen;
+    }
+
+    /// <summary>
+    /// 消耗一次偷聽額度（每一則被偷聽的訊息都要呼叫，不管最後有沒有回覆）。
+    /// 回傳**還剩多少**；<c>null</c> 代表這次消耗把窗口用完了（已經自動停止）。
+    /// </summary>
+    public ListenWindow? ConsumeListen(ulong guildId, ulong channelId, DateTimeOffset now)
+    {
+        var window = PeekListening(guildId, channelId, now);
+        if (window is null) return null;
+
+        var remaining = window.RemainingMessages - 1;
+
+        if (remaining <= 0)
+        {
+            StopListening(guildId, channelId);
+            return null;
+        }
+
+        if (_map.TryGetValue((guildId, channelId), out var conv))
+            conv.Listen = window with { RemainingMessages = remaining };
+
+        return conv.Listen;
+    }
+
+    /// <summary>停止偷聽（回到「等 @」的模式），回傳停掉的那個窗口（沒在偷聽時是 null）。</summary>
+    public ListenWindow? StopListening(ulong guildId, ulong channelId)
+    {
+        if (!_map.TryGetValue((guildId, channelId), out var conv) || conv.Listen is null) return null;
+
+        var window = conv.Listen;
+        conv.Listen = null;
+        return window;
     }
 
     /// <summary>清掉太久沒動的頻道；回傳清了幾個。</summary>

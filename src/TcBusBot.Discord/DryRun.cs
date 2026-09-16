@@ -446,6 +446,9 @@ public static class DryRun
         // ── 面板與 LLM 共用同一份站牌解析 ────────────────────
         AuditStopPicks(data);
 
+        // ── 模型「幫使用者按按鈕」（UI 動作）──────────────────
+        AuditUiTools(data);
+
         // ── DI 容器（與真正的 Bot 用同一份註冊程式碼）──────────
         using var client = new DiscordSocketClient(new DiscordSocketConfig
         {
@@ -1725,6 +1728,142 @@ public static class DryRun
             .SelectMany(menu => menu.Options)
             .Select(o => o.Value)
             .ToList();
+
+    /// <summary>
+    /// **模型「幫使用者按按鈕」**（`ui` plugin）的離線驗證。
+    ///
+    /// 這一組工具動的是**同一個面板 session**（跟使用者自己按按鈕看到的是同一份），
+    /// 所以最怕的是「工具說它設好了、其實 session 沒動」—— 那樣使用者之後按
+    /// 「搜尋路線」會發現什麼都沒有。這裡就直接把整條路徑走一遍：
+    /// 開面板 → 設起訖 → 找路線 → 訂閱 → 復原，
+    /// 並且**每一步都驗 session 與元件真的建得出來**。
+    /// </summary>
+    private static void AuditUiTools(TaichungBusDataService data)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 面板動作檢查  模型幫使用者按按鈕（ui plugin）");
+
+        var subs = new SubscriptionService();
+        var sessions = new BusSessionStore();
+
+        using var savedGroups = new SavedGroupStore(":memory:");
+
+        var context = new TcBusBot.Core.Chat.ChatToolContext(1UL, 2UL, 3UL, "小明");
+        var log = new TcBusBot.Core.Chat.ToolCallLog();
+
+        var tools = new UiTools(
+            new BusActionService(data, subs), subs, sessions, savedGroups, context, log);
+
+        var session = sessions.GetOrCreate(3UL, 2UL);
+
+        // ① 開面板 → 要附上面板元件
+        Console.WriteLine($"  {tools.OpenPanel().Split('\n')[0]}");
+
+        if (tools.PendingUi?.Kind != UiRequest.Panel)
+            Problem("open_panel 沒有要求附上面板元件");
+        else
+            BusUi.PanelComponents(session);   // 建得出來就代表真正的按鈕沒問題
+
+        // ② 設定起訖 → session 真的要變
+        var originMessage = tools.SetOrigin("臺中車站");
+        var destMessage = tools.SetDestination("靜宜大學");
+
+        Console.WriteLine($"  起點：{originMessage.Split('\n')[0]}");
+        Console.WriteLine($"  目的地：{destMessage.Split('\n')[0]}");
+
+        if (session.Origin is null || session.Destination is null)
+            Problem("set_origin / set_destination 沒有真的寫進面板 session");
+        else if (!session.Ready)
+            Problem("設完起訖之後 session 還是沒 ready");
+        else
+            Console.WriteLine($"  ✔ session：{session.Origin.DisplayName} → {session.Destination.DisplayName}" +
+                              $"（{session.Origin.CandidateStopUids.Count}／" +
+                              $"{session.Destination.CandidateStopUids.Count} 個候選站牌）");
+
+        // ③ 找路線 → 要附上路線元件
+        var routesMessage = tools.SearchPanelRoutes();
+        Console.WriteLine($"  {routesMessage.Split('\n')[0]}");
+
+        if (session.LastRoutes.Count == 0)
+            Problem("search_panel_routes 沒有把路線寫進 session");
+        else if (tools.PendingUi?.Kind != UiRequest.Routes)
+            Problem("search_panel_routes 沒有要求附上路線元件");
+        else
+            BusUi.RouteComponents(session.LastRoutes);
+
+        // ④ 訂閱指定的路線（模擬使用者說「訂 300 就好」）
+        var subscribeMessage = tools.SubscribePanelRoutes("300");
+        Console.WriteLine($"  {subscribeMessage.Split('\n')[0]}");
+
+        if (subs.GetGroupsByUser(3UL).Count() == 0)
+            Problem("subscribe_panel_routes 沒有真的建立訂閱");
+        else if (session.CreatedGroupId is null)
+            Problem("訂閱之後 session 沒有指向那一組（面板狀態會跟實際不一致）");
+        else if (tools.PendingUi?.Kind != UiRequest.Etas)
+            Problem("訂閱之後應該附上到站時間元件");
+        else
+            Console.WriteLine($"  ✔ 已建立 {subs.SubscriptionCount} 筆訂閱，面板指向 {session.CreatedGroupId}");
+
+        // ⑤ 復原（等於按「↩️ 復原」）→ 訂閱要被撤掉
+        var groupId = session.CreatedGroupId!;
+        session.Undo.Push(new UndoAppliedSubscriptions("剛剛的訂閱", [groupId], null));
+
+        var undoMessage = tools.UndoLastAction();
+        Console.WriteLine($"  {undoMessage.Split('\n')[0]}");
+
+        if (!tools.UndoApplied)
+            Problem("undo_last_action 沒有真的執行復原");
+        else if (subs.GetGroup(groupId) is not null)
+            Problem("復原之後訂閱群組應該要消失");
+        else
+            Console.WriteLine("  ✔ 復原成功：訂閱已撤銷");
+
+        // ⑥ 站名找不到／模糊時不可以亂設
+        var vagueSession = new BusSession { UserId = 9UL, ChannelId = 8UL };
+        sessions.GetOrCreate(9UL, 8UL).Origin = null;
+
+        var vagueTools = new UiTools(new BusActionService(data, subs), subs, sessions, savedGroups,
+                                     new TcBusBot.Core.Chat.ChatToolContext(1UL, 8UL, 9UL, "小華"),
+                                     new TcBusBot.Core.Chat.ToolCallLog());
+
+        vagueTools.SetOrigin("路口");
+        var vague = sessions.GetOrCreate(9UL, 8UL);
+
+        if (vague.Origin is not null)
+            Problem("模糊的站名（「路口」）被設成起點了 —— 應該拒絕並要使用者說清楚");
+        else
+            Console.WriteLine("  ✔ 模糊站名不會亂設（回報候選讓模型去問使用者）");
+
+        Console.WriteLine("  ℹ 工具清單：" + tools.GetType().Name + "（5 個：開面板／設起訖／找路線／訂閱／復原）");
+
+        // ── 「說做了但其實沒做」的誠實檢查 ────────────────
+        //    實測真的發生過：使用者說「訂錯了幫我復原」，模型回「復原好了」卻沒呼叫工具。
+        //    使用者不會知道設定根本沒動，所以回覆要自己加上警告。
+        var claims = new[]
+        {
+            "復原好了，剛剛那筆訂閱已經取消",
+            "已經幫你訂閱 300 了",
+            "設定好了，起點是臺中車站",
+            "記好了，以後都會簡短一點"
+        };
+
+        foreach (var claim in claims)
+            if (!LlmChatService.ClaimsAnAction(claim))
+                Problem($"「{claim}」看起來像聲稱做完了，但沒有被認出來（使用者會被誤導）");
+
+        var neutral = new[]
+        {
+            "300 大約 3 分鐘到站",
+            "我查不到即時到站時間，可以試試 /bus next",
+            "你要從哪一站上車？"
+        };
+
+        foreach (var text in neutral)
+            if (LlmChatService.ClaimsAnAction(text))
+                Problem($"「{text}」只是普通回覆，卻被當成「聲稱做了動作」");
+
+        Console.WriteLine("  ✔ 誠實檢查：聲稱做完了卻沒呼叫工具時會加警告（一般回覆不會誤判）");
+    }
 
     /// <summary>
     /// **DI 容器檢查**：用與真正的 Bot 完全相同的註冊程式碼（<see cref="BotServices.Create"/>）

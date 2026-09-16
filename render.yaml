@@ -98,6 +98,16 @@ services:
         sync: false
       - key: LLM_ADMIN_KEY
         sync: false
+      # 讓模型幫使用者按面板按鈕（開面板／設起訖／找路線／訂閱／復原）
+      - key: LLM_UI_ACTIONS
+        value: "true"
+      # 偷聽模式：回完話後再聽幾句，判斷不是對它說的就停止
+      - key: LLM_EAVESDROP
+        value: "true"
+      - key: LLM_EAVESDROP_MESSAGES
+        value: "3"
+      - key: LLM_EAVESDROP_SECONDS
+        value: "120"
 
       - key: DOTNET_ENVIRONMENT
         value: Production

@@ -25,6 +25,15 @@ public sealed record ChatAnswer(
 
     /// <summary>工具有沒有動到使用者的資料（決定要不要顯示「我做了什麼」與復原按鈕）。</summary>
     public bool ToolChangedState { get; init; }
+
+    /// <summary>
+    /// 這一則被**忽略**了（偷聽時判斷「不是在對我說話」→ 不回話、停止偷聽）。
+    /// 呼叫端看到這個就什麼都不要送。
+    /// </summary>
+    public bool Ignored { get; init; }
+
+    /// <summary>偷聽判斷的說明（log 用）。</summary>
+    public string? IgnoreReason { get; init; }
 }
 
 /// <summary>
@@ -75,6 +84,13 @@ public sealed class ChatOrchestrator
         7. **表情**：你可以直接使用這個伺服器的自訂表情，寫法是 `<:名稱:ID>`。
            名稱與 ID **只能用在對話裡真的出現過的那些**（絕對不要自己編一個），
            也可以先問使用者某個表情是什麼意思，然後用 remember_rule 記下來。
+        8. **面板動作**：使用者要你「開面板」「設定起點／目的地」「找路線」「訂閱」
+           「復原」時，用 `open_panel` / `set_origin` / `set_destination` /
+           `search_panel_routes` / `subscribe_panel_routes` / `undo_last_action`
+           真的去做（那跟他自己按按鈕是同一件事）。
+           ⚠️ **一定要真的呼叫工具才能說你做完了** —— 沒有呼叫就說「已復原」「已取消」
+           是騙人的，使用者會以為設定改了但其實沒有。聽到「復原」「弄錯了」「退回上一步」
+           這幾個字時，你的**第一個動作就是呼叫 `undo_last_action`**。
         """;
 
     /// <summary>
@@ -105,6 +121,15 @@ public sealed class ChatOrchestrator
     private readonly TopicSwitchDetector _detector;
     private readonly IChatToolProvider _tools;
     private readonly GuildPersonaStore _personas;
+
+    /// <summary>Bot 自己的顯示名稱（偷聽判斷的提示詞要用）。由呼叫端設定。</summary>
+    private string? _client;
+
+    public string BotName
+    {
+        get => _client ?? "Bot";
+        set => _client = value;
+    }
 
     public ChatOrchestrator(
         ILlmClient llm,
@@ -157,16 +182,73 @@ public sealed class ChatOrchestrator
     /// 呼叫端只要把 <see cref="ChatAnswer.Text"/> 貼出去就好 ——
     /// Discord 的事件處理裡丟例外有可能影響連線。
     /// </summary>
+    /// <param name="addressed">
+    /// 這一則有沒有明確對 Bot 說話（@ 提及或回覆）。
+    /// <c>false</c> 代表這是**偷聽到的**訊息：會先問 LLM「這是在跟我說話嗎」，
+    /// 不是就回傳 <see cref="ChatAnswer.Ignored"/> 並停止偷聽（呼叫端不要送任何訊息）。
+    /// </param>
     public async Task<ChatAnswer> AskAsync(
         ulong guildId,
         ulong channelId,
         ChatTurn incoming,
         ChatTurn? replyTarget,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool addressed = true)
     {
         var startedAt = DateTimeOffset.UtcNow;
+        var now = DateTimeOffset.UtcNow;
 
-        // ── 0) 主人授權（必須在「寫進對話記憶」之前）──────────
+        // ── 0a) 偷聽判斷（只在「偷聽到的訊息」時做）──────────
+        var listenTokens = 0;
+        var botName = _client ?? "Bot";
+
+        if (!addressed)
+        {
+            // ⚠️ 沒有偷聽窗口就**什麼都不做**。
+            //    這一關刻意放在 orchestrator（不只放在 Discord 那一層）：
+            //    呼叫端忘記檢查時，「沒有人對它說話」也不該觸發任何回答與花費。
+            if (_conversations.PeekListening(guildId, channelId, now) is null)
+                return Ignored(startedAt, "沒有在偷聽（沒有人對它說話）");
+
+            _conversations.ConsumeListen(guildId, channelId, now);
+
+            var draftForCheck = _conversations.Draft(guildId, channelId, incoming, replyTarget);
+            var detector = new AddresseeDetector(_llm, _options);
+
+            var estimate = TokenEstimator.Estimate(AddresseeDetector.SystemPrompt)
+                           + TokenEstimator.Estimate(
+                               AddresseeDetector.BuildUserPrompt(
+                                   draftForCheck.Current?.Turns ?? [], incoming, botName))
+                           + TokenEstimator.PerMessageOverhead * 2;
+
+            var listenCheck = _budget.Check(estimate, now);
+
+            if (!listenCheck.Allowed)
+            {
+                _budget.RecordRefusal(now);
+                _conversations.StopListening(guildId, channelId);
+
+                return Ignored(startedAt, $"額度不足，停止偷聽（{listenCheck.Reason}）");
+            }
+
+            var verdict = await detector.DetectAsync(
+                draftForCheck.Current?.Turns ?? [], incoming, botName, cancellationToken);
+
+            if (verdict.Usage is { } usage)
+            {
+                listenTokens = usage.TotalTokens;
+                _budget.Record(usage.InputTokens, usage.OutputTokens, guildId, DateTimeOffset.UtcNow);
+            }
+
+            if (!verdict.Addressed)
+            {
+                // ★ 不是在跟我說話 → 停止偷聽、回到等 @ 的模式，而且**什麼都不送**
+                _conversations.StopListening(guildId, channelId);
+                return Ignored(startedAt, verdict.Detail);
+            }
+        }
+
+        // ── 0b) 主人授權（必須在「寫進對話記憶」之前）──────────
         //    ⚠️ key 一定要在這一刻就從內容裡拿掉：否則它會進到歷史、提示詞與 log。
         var admin = AdminAuthorizer.Check(incoming.AuthorId, incoming.Content, _options);
 
@@ -290,7 +372,7 @@ public sealed class ChatOrchestrator
                 EstimatedContextTokens: trimmed.EstimatedTokens,
                 InputTokens: reply.InputTokens,
                 OutputTokens: reply.OutputTokens,
-                TopicDetectTokens: detectTokens,
+                TopicDetectTokens: detectTokens + listenTokens,
                 UsageReported: reply.UsageReported,
                 Model: reply.Model,
                 Elapsed: DateTimeOffset.UtcNow - startedAt)
@@ -327,8 +409,42 @@ public sealed class ChatOrchestrator
     /// <summary>把 Bot 的回覆記進同一段（附上真正的訊息 ID）。</summary>
     public void RecordReply(
         ContextDecision decision, string text, ulong messageId, ulong botId, string botName, DateTimeOffset at)
-        => _conversations.RecordAssistant(decision, new ChatTurn(
+    {
+        _conversations.RecordAssistant(decision, new ChatTurn(
             ChatRole.Assistant, botName, botId, messageId, text, at));
+
+        // ★ 回完話之後開始（或重新開始）偷聽：接下來幾則沒 @ 它的訊息也聽一下，
+        //   由 LLM 判斷是不是在跟它講話（見 AddresseeDetector）。
+        if (_options.Eavesdrop)
+        {
+            _conversations.StartListening(
+                decision.Segment.GuildId, decision.Segment.ChannelId,
+                _options.EavesdropSeconds, _options.EavesdropMaxMessages);
+        }
+    }
+
+    /// <summary>被忽略的一則（偷聽時判斷不是對它說話）—— 呼叫端什麼都不要送。</summary>
+    private static ChatAnswer Ignored(DateTimeOffset startedAt, string reason)
+        => new(
+            Ok: false,
+            Text: "",
+            Error: null,
+            Refused: false,
+            Decision: null,
+            DecisionReason: reason,
+            ContextTurns: 0,
+            DroppedTurns: 0,
+            EstimatedContextTokens: 0,
+            InputTokens: 0,
+            OutputTokens: 0,
+            TopicDetectTokens: 0,
+            UsageReported: true,
+            Model: "",
+            Elapsed: DateTimeOffset.UtcNow - startedAt)
+        {
+            Ignored = true,
+            IgnoreReason = reason
+        };
 
     /// <summary>額度用完時要講的話（公車功能不受影響這件事一定要講）。</summary>
     public static string RefusalText(BudgetCheck check)

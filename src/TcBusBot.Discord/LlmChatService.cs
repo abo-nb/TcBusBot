@@ -156,33 +156,63 @@ public sealed class LlmChatService : IDisposable
 
         text = MentionFormatter.Expand(text, mentions, _options.ExposeUserIds);
 
+        var now = DateTimeOffset.UtcNow;
+
+        // ── 偷聽模式：這一則沒有 @ 它、也不是回覆它 ──────────
+        //   如果剛剛回過話（偷聽窗口還開著），就讓它聽一下並自己判斷是不是在跟它講話。
+        var addressed = mentioned || replyAddressed;
+
+        if (!addressed)
+        {
+            var listen = _chat.Conversations.PeekListening(guildId, message.Channel.Id, now);
+
+            if (listen is null) return;   // 沒在偷聽 → 當作沒看到（維持原本行為）
+
+            // ★ 決定性的規則（不花錢也不靠模型判斷）：
+            //   訊息 @ 了**別的真人**（不是 Bot）→ 那是在跟那個人說話，直接停止偷聽。
+            //   為什麼要這一條：模型對「你要不要一起去？」這種邀請常常誤判成在問它，
+            //   而「@ 了別人」是鐵證，不需要問 LLM。
+            if (userMessage.MentionedUsers.Any(u => u.Id != botId && !u.IsBot))
+            {
+                _chat.Conversations.StopListening(guildId, message.Channel.Id);
+                Console.WriteLine($"[llm] 👂 @ 了別人 → 停止偷聽、回到等 @｜{DescribeWhere(guildId, message)}");
+                return;
+            }
+
+            Console.WriteLine($"[llm] 👂 偷聽中（剩 {listen.RemainingMessages} 則／" +
+                              $"{Math.Max(0, (listen.Until - now).TotalSeconds):0} 秒）：{Preview(text)}");
+        }
+
         if (text.Length == 0)
         {
             await SafeReplyAsync(userMessage, "要問什麼呢？（直接 @ 我然後打訊息就好）");
             return;
         }
 
-        // 冷卻：同一個人連續問會把額度燒掉
-        var now = DateTimeOffset.UtcNow;
-        if (_options.UserCooldownSeconds > 0
+        // 冷卻：同一個人連續問會把額度燒掉（偷聽的訊息不算，因為那是別人講的話）
+        if (addressed && _options.UserCooldownSeconds > 0
             && _lastAskedAt.TryGetValue(userMessage.Author.Id, out var last)
             && now - last < TimeSpan.FromSeconds(_options.UserCooldownSeconds))
         {
             return;
         }
-        _lastAskedAt[userMessage.Author.Id] = now;
+
+        if (addressed) _lastAskedAt[userMessage.Author.Id] = now;
 
         // 同一頻道一次只回一則
         var gate = _channelGates.GetOrAdd(message.Channel.Id, _ => new SemaphoreSlim(1, 1));
         if (!await gate.WaitAsync(TimeSpan.Zero))
         {
-            Console.WriteLine($"[llm] 略過一則（{DescribeWhere(guildId, message)} 還在想上一題）");
+            // 偷聽到的訊息搶不到就**直接放棄**（不要回「我還在想」去打斷別人聊天）
+            if (addressed)
+                Console.WriteLine($"[llm] 略過一則（{DescribeWhere(guildId, message)} 還在想上一題）");
+
             return;
         }
 
         try
         {
-            await AnswerAsync(userMessage, guildId, text, referenced);
+            await AnswerAsync(userMessage, guildId, text, referenced, addressed);
         }
         finally
         {
@@ -191,7 +221,7 @@ public sealed class LlmChatService : IDisposable
     }
 
     private async Task AnswerAsync(
-        SocketUserMessage message, ulong guildId, string text, IMessage? referenced)
+        SocketUserMessage message, ulong guildId, string text, IMessage? referenced, bool addressed = true)
     {
         var incoming = new ChatTurn(
             ChatRole.User,
@@ -216,12 +246,20 @@ public sealed class LlmChatService : IDisposable
         ChatAnswer answer;
         try
         {
-            answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget);
+            answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget,
+                                          cancellationToken: default, addressed: addressed);
         }
         finally
         {
             typingCts.Cancel();
             try { await typing; } catch (Exception) { /* 只是打字動畫 */ }
+        }
+
+        // ── 偷聽時判斷「不是在跟我說話」→ 什麼都不送，回到等 @ 的模式 ──
+        if (answer.Ignored)
+        {
+            Console.WriteLine($"[llm] 👂 {answer.IgnoreReason}｜{where}");
+            return;
         }
 
         // ── log（每一則都留下「為什麼這樣回答」與用量）──────
@@ -259,9 +297,17 @@ public sealed class LlmChatService : IDisposable
 
         if (answer.Ok && answer.ToolChangedState)
             replyText += "\n\n-# 🔧 我實際做了：" + string.Join("、", answer.ToolCalls);
+        else if (answer.Ok && ClaimsAnAction(replyText))
+            replyText += "\n\n-# ⚠️ 我這次其實沒有真的呼叫工具 —— 上面說的動作可能沒有生效，" +
+                         "請再說一次（或直接告訴我要做什麼）。";
 
         // LLM 做的破壞性操作也要能一鍵還原（取消訂閱 → 掛「↩️ 復原」按鈕）
         var components = BuildUndoComponents(message);
+
+        // 模型要求「畫面上要出現什麼元件」（開面板／路線清單／到站時間）→ 附上真正的按鈕
+        var uiComponents = BuildUiComponents(guildId, message);
+
+        if (uiComponents is not null) components = uiComponents;
 
         var chunks = Split(replyText, MaxChunkChars);
         IMessage? sent = null;
@@ -305,6 +351,59 @@ public sealed class LlmChatService : IDisposable
     /// 既然被移除的內容已經抄下來了（<see cref="BusTools.PendingUndo"/>），
     /// 就把它變成同一顆按鈕：AI 做的事情與人按按鈕做的事情，復原方式一致。
     /// </summary>
+    /// <summary>
+    /// 模型要求「幫使用者按按鈕」時，把**真正的元件**附在回覆上。
+    ///
+    /// 為什麼一定要附真的元件：模型改的是同一個面板 session（<see cref="BusSession"/>），
+    /// 所以使用者看到的面板狀態是真的 —— 附上元件之後他可以接手自己點，
+    /// 不用再打一次 `/bus panel`。
+    /// </summary>
+    private MessageComponent? BuildUiComponents(ulong guildId, SocketUserMessage message)
+    {
+        if (_chat.Tools is not BotToolProvider provider) return null;
+        if (provider.TakePendingUi() is not { } request) return null;
+
+        var session = _sessions.GetOrCreate(message.Author.Id, message.Channel.Id);
+
+        Console.WriteLine($"[llm] 🖱 附上{request.Note}元件（模型幫使用者按按鈕）");
+
+        return request.Kind switch
+        {
+            UiRequest.Panel => BusUi.PanelComponents(session),
+            UiRequest.Routes => BusUi.RouteComponents(session.LastRoutes),
+            UiRequest.Etas => new ComponentBuilder()
+                .WithButton("🔄 重新整理", Cid.ShowEtas, ButtonStyle.Primary)
+                .WithButton("模擬一則通知", Cid.Simulate, ButtonStyle.Secondary)
+                .WithButton("📂 我的訂閱組", Cid.OpenGroups, ButtonStyle.Secondary)
+                .Build(),
+            _ => null
+        };
+    }
+
+    /// <summary>
+    /// 回覆裡「聲稱自己做了一個動作」但其實**一個工具都沒呼叫**嗎？
+    ///
+    /// 為什麼需要這個：模型有時候會直接說「已經幫你復原了」「訂閱已取消」，
+    /// 但根本沒有呼叫工具 —— 使用者看到會以為設定改了，實際上沒有。
+    /// （實測真的發生過：使用者說「訂錯了幫我復原」，它回「復原好了」但沒呼叫任何工具。）
+    ///
+    /// 這裡刻意只比對**明確的完成式動作詞**，避免一般回覆被誤標。
+    /// </summary>
+    public static bool ClaimsAnAction(string? reply)
+    {
+        if (string.IsNullOrWhiteSpace(reply)) return false;
+
+        string[] claims =
+        [
+            "已復原", "已經復原", "復原好了", "已取消", "已經取消", "取消好了",
+            "已訂閱", "已經訂閱", "訂好了", "已設定", "已經設定", "設定好了",
+            "已刪除", "已經刪除", "刪掉了", "已記住", "已經記住", "記好了",
+            "已經幫你", "已經幫您", "幫你訂了", "幫您訂了"
+        ];
+
+        return claims.Any(c => reply.Contains(c, StringComparison.Ordinal));
+    }
+
     private MessageComponent? BuildUndoComponents(SocketUserMessage message)
     {
         if (_chat.Tools is not BotToolProvider busTools) return null;

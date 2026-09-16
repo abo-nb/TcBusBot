@@ -257,27 +257,37 @@ public sealed class BotToolProvider : IChatToolProvider
     private readonly BusActionService _actions;
     private readonly SubscriptionService _subs;
     private readonly GuildPersonaStore _personas;
+    private readonly Core.Storage.SavedGroupStore? _savedGroups;
+    private readonly BusSessionStore? _sessions;
     private readonly Func<ChatToolContext, string?, CancellationToken, Task<string>>? _arrivals;
 
     /// <summary>最近一次提問的工具實例（用來拿 <see cref="BusTools.PendingUndo"/>）。</summary>
     private BusTools? _last;
 
+    /// <summary>最近一次提問的 UI 動作（模型要求附上按鈕時用）。</summary>
+    private UiTools? _lastUi;
+
     public BotToolProvider(
         BusActionService actions,
         SubscriptionService subs,
         GuildPersonaStore personas,
-        Func<ChatToolContext, string?, CancellationToken, Task<string>>? arrivals = null)
+        Func<ChatToolContext, string?, CancellationToken, Task<string>>? arrivals = null,
+        BusSessionStore? sessions = null,
+        Core.Storage.SavedGroupStore? savedGroups = null)
     {
         _actions = actions;
         _subs = subs;
         _personas = personas;
         _arrivals = arrivals;
+        _sessions = sessions;
+        _savedGroups = savedGroups;
     }
 
     public IReadOnlyList<KernelPlugin> CreateFor(ChatToolContext context, ToolCallLog log)
     {
         var tools = new BusTools(_actions, _subs, context, log, _arrivals);
         _last = tools;
+        _lastUi = null;
 
         var plugins = new List<KernelPlugin>
         {
@@ -285,6 +295,15 @@ public sealed class BotToolProvider : IChatToolProvider
             KernelPluginFactory.CreateFromObject(
                 new PersonaTools(_personas, context.GuildId, log), "persona")
         };
+
+        // 「幫使用者按按鈕」：只有在有了 session 與訂閱組儲存時才掛得上
+        if (_sessions is not null && _savedGroups is not null)
+        {
+            var ui = new UiTools(_actions, _subs, _sessions, _savedGroups, context, log);
+            _lastUi = ui;
+
+            plugins.Add(KernelPluginFactory.CreateFromObject(ui, "ui"));
+        }
 
         // 主人專用的工具另外包一個 plugin：它的說明裡寫著「只有主人能用」，
         // 沒有授權的對話看不到這些函式（模型連「有這個能力」都不知道）。
@@ -303,7 +322,8 @@ public sealed class BotToolProvider : IChatToolProvider
     public string Describe()
         => "公車工具 7 個（查站牌／查路線號碼／查路線／訂閱／列出訂閱／取消訂閱／到站時間）" +
            "＋ 記憶工具 3 個（記住規矩／列出規矩／忘記規矩）" +
-           "＋ 主人工具 3 個（全域規則，只在授權時提供）";
+           "＋ 面板工具 5 個（開面板／設起訖／找路線／訂閱／復原）" +
+           "＋ 主人工具 4 個（全域規則與稽核，只在授權時提供）";
 
     /// <summary>這一輪如果模型取消了訂閱，把內容交出來讓呼叫端掛「↩️ 復原」。</summary>
     public IReadOnlyList<(SubscriptionGroup Group, IReadOnlyList<Subscription> Subscriptions)>? TakePendingUndo()
@@ -311,6 +331,13 @@ public sealed class BotToolProvider : IChatToolProvider
         var pending = _last?.PendingUndo;
         if (_last is not null) _last = null;
         return pending;
+    }
+
+    /// <summary>這一輪模型有沒有要求「畫面上要出現什麼元件」（面板／路線／到站時間）。</summary>
+    public UiRequest? TakePendingUi()
+    {
+        var request = _lastUi?.PendingUi;
+        return request;
     }
 }
 

@@ -40,3 +40,7 @@
 "LLM_ALLOW_MENTIONS","（無）","選填","true","允許模型在回覆裡 @ 使用者（@everyone／身分組一律擋掉）","新增（AI 聊天）","AI 聊天"
 "LLM_ADMIN_IDS","LLM_OWNER_IDS","選填","（無）","後台指定的「主人」Discord ID（逗號分隔）；還要帶 LLM_ADMIN_KEY 才能下令","新增（AI 聊天）","AI 聊天"
 "LLM_ADMIN_KEY","LLM_OWNER_KEY","選填","（無）","主人授權用的特殊 key（沒設定＝主人機制關閉）；訊息裡帶到它才會被當成命令，且 key 會從訊息移除","新增（AI 聊天）","AI 聊天"
+"LLM_UI_ACTIONS","（無）","選填","true","讓模型幫使用者按面板的按鈕（開面板／設起訖／找路線／訂閱／復原），回覆會附上真正的元件","新增（AI 聊天）","AI 聊天"
+"LLM_EAVESDROP","（無）","選填","true","偷聽模式：回完話後再聽幾句沒 @ 它的訊息，判斷不是對它說的就停止、回到等 @（需要 Message Content 意圖）","新增（AI 聊天）","AI 聊天"
+"LLM_EAVESDROP_MESSAGES","（無）","選填","3","偷聽最多幾則（每一則都要花一次 LLM 判斷）","新增（AI 聊天）","AI 聊天"
+"LLM_EAVESDROP_SECONDS","（無）","選填","120","偷聽的時間窗（秒），超過就停止偷聽","新增（AI 聊天）","AI 聊天"

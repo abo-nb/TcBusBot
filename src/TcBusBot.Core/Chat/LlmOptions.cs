@@ -119,6 +119,32 @@ public sealed class LlmOptions
     };
 
 
+    /// <summary>
+    /// 要不要讓模型操作「面板的動作」（等於幫使用者按按鈕）。
+    ///
+    /// 使用者要的是「不用自己點那一串 設定起點→搜尋→勾選→確認→找路線→訂閱」，
+    /// 直接說「幫我把起點設成台中車站、然後訂 300 跟 304」。
+    /// 開啟後會多一組 `ui` 工具（開面板／設起訖／搜路線／訂閱／復原上一動作），
+    /// 而且回覆會**附上真正的按鈕**（面板、路線選單），使用者想接手點也可以。
+    /// </summary>
+    public bool UiActions { get; set; } = true;
+
+    /// <summary>
+    /// **偷聽模式**：回完話之後，接下來幾則「沒有 @ 它」的訊息也聽一下，
+    /// 由 LLM 判斷是不是在跟它講話 —— 不是就停止偷聽、回到「等 @」的模式。
+    ///
+    /// ⚠️ 需要 Message Content 特權意圖才做得到（沒有意圖時，非提及訊息的內容是空的）。
+    /// ⚠️ 每一則偷聽的訊息都會多花一次判斷的錢（約 200~300 tokens），
+    ///    所以有「最多幾則」與「幾秒內」兩個上限，而且會記進每週額度。
+    /// </summary>
+    public bool Eavesdrop { get; set; } = true;
+
+    /// <summary>偷聽最多幾則訊息（每一則都會消耗一次判斷）。</summary>
+    public int EavesdropMaxMessages { get; set; } = 3;
+
+    /// <summary>偷聽的時間窗（超過就停止，回到等 @）。</summary>
+    public int EavesdropSeconds { get; set; } = 120;
+
     /// <summary>帶進提示詞的歷史上限（則）。</summary>
     public int MaxContextTurns { get; set; } = 20;
 

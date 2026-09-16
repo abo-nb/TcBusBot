@@ -263,6 +263,22 @@ public sealed class BotConfig
         var mentions = SettingResolver.Resolve(args, "--llm-mentions", file, ["LLM_ALLOW_MENTIONS"]).Value;
         if (!string.IsNullOrWhiteSpace(mentions)) cfg.Llm.AllowMentions = !IsFalsy(mentions!);
 
+        // ── 面板動作與偷聽 ────────────────────────────────
+        var uiActions = SettingResolver.Resolve(args, "--llm-ui", file, ["LLM_UI_ACTIONS"]).Value;
+        if (!string.IsNullOrWhiteSpace(uiActions)) cfg.Llm.UiActions = !IsFalsy(uiActions!);
+        if (args.Contains("--no-llm-ui")) cfg.Llm.UiActions = false;
+
+        var eavesdrop = SettingResolver.Resolve(args, "--llm-eavesdrop", file, ["LLM_EAVESDROP"]).Value;
+        if (!string.IsNullOrWhiteSpace(eavesdrop)) cfg.Llm.Eavesdrop = !IsFalsy(eavesdrop!);
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-eavesdrop-messages", file,
+                ["LLM_EAVESDROP_MESSAGES"]).Value, out var evMsgs) && evMsgs is >= 0 and <= 20)
+            cfg.Llm.EavesdropMaxMessages = evMsgs;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-eavesdrop-seconds", file,
+                ["LLM_EAVESDROP_SECONDS"]).Value, out var evSec) && evSec is >= 0 and <= 3600)
+            cfg.Llm.EavesdropSeconds = evSec;
+
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
         cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;
         if (args.Contains("--no-message-intent")) cfg.EnableMessageContentIntent = false;

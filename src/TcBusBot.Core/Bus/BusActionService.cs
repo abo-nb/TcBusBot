@@ -175,11 +175,36 @@ public sealed class BusActionService
             return new SubscribeOutcome(false, $"終點：{DescribeUnresolved(destination, to)}",
                 null, null, null, []);
 
-        var routes = _data.FindRoutes(from.Target, to.Target);
+        return SubscribeTargets(userId, from.Target, to.Target, null, notifyMinutes, guildId, channelId);
+    }
+
+    /// <summary>
+    /// 用「已經解析好的起訖」訂閱 —— 給「模型幫你按按鈕」那條路用：
+    /// 面板已經把起訖存進 session 了，不需要再從關鍵字解析一次。
+    /// </summary>
+    public SubscribeOutcome SubscribeTargets(
+        ulong userId,
+        LocationTarget origin,
+        LocationTarget destination,
+        IReadOnlyList<RouteOption>? onlyRoutes = null,
+        int notifyMinutes = 10,
+        ulong? guildId = null,
+        ulong? channelId = null)
+    {
+        if (origin.CandidateStopUids.Count == 0 || destination.CandidateStopUids.Count == 0)
+            return new SubscribeOutcome(false, "起點或終點還沒有站牌，請先設定起訖。", null, null, null, []);
+
+        var routes = _data.FindRoutes(origin, destination);
+
+        if (onlyRoutes is { Count: > 0 })
+        {
+            var wanted = onlyRoutes.Select(r => (r.RouteUid, r.Direction)).ToHashSet();
+            routes = routes.Where(r => wanted.Contains((r.RouteUid, r.Direction))).ToList();
+        }
 
         if (routes.Count == 0)
             return new SubscribeOutcome(false,
-                $"「{from.Target.DisplayName}」到「{to.Target.DisplayName}」找不到可以直接搭的路線，" +
+                $"「{origin.DisplayName}」到「{destination.DisplayName}」找不到可以直接搭的路線，" +
                 "所以沒有建立訂閱。請告訴使用者這個結果（可以建議他換方向或轉乘）。",
                 null, null, null, []);
 
@@ -188,14 +213,12 @@ public sealed class BusActionService
 
         var group = _subs.CreateGroup(
             userId: userId,
-            origin: from.Target,
-            destination: to.Target,
+            origin: origin,
+            destination: destination,
             options: routes,
             notifyBeforeMinutes: notifyMinutes,
             guildId: guildId,
             channelId: channelId);
-
-        var warnings = new List<string>();
 
         var lines = _subs.GetSubscriptions(group).Take(10).Select(s =>
             $"• {s.RouteName}（{(s.Direction == 0 ? "去程" : "返程")}）" +
@@ -206,12 +229,31 @@ public sealed class BusActionService
             string.Join("\n", lines) +
             (group.SubscriptionIds.Count > 10 ? $"\n…還有 {group.SubscriptionIds.Count - 10} 筆" : "");
 
-        if (warnings.Count > 0)
-            message += "\n⚠️ " + string.Join("；", warnings) + "（如果不對請取消再重訂）";
-
         return new SubscribeOutcome(true, message, group,
-            from.Target.DisplayName, to.Target.DisplayName, warnings);
+            origin.DisplayName, destination.DisplayName, []);
     }
+
+    /// <summary>
+    /// 把「站名關鍵字」解析成候選站集合（面板／UI 動作共用同一套）。
+    /// 回傳 null 代表找不到、或模糊到不能自己挑（原因寫在 <paramref name="message"/>）。
+    /// </summary>
+    public LocationTarget? ResolveKeyword(string keyword, out string message)
+    {
+        var resolved = Resolve(keyword);
+
+        if (resolved.Uids.Count == 0)
+        {
+            message = DescribeUnresolved(keyword, resolved);
+            return null;
+        }
+
+        message = $"{resolved.Target.DisplayName}（{resolved.Uids.Count} 個候選站牌）";
+        return resolved.Target;
+    }
+
+    /// <summary>用「已經解析好的起訖」找路線（面板／UI 動作用）。</summary>
+    public IReadOnlyList<RouteOption> FindRoutesFor(LocationTarget origin, LocationTarget destination)
+        => _data.FindRoutes(origin, destination);
 
     // ─────────────────────────────────────────────────────
     //  查詢／取消自己的訂閱
