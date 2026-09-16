@@ -217,6 +217,7 @@ public static class Program
         await RegisterModuleAsync<BusComponentModule>("bus（按鈕／選單）");
         await RegisterModuleAsync<SayModule>("say");
         await RegisterModuleAsync<ChatModule>("ai");
+        await RegisterModuleAsync<ResetModule>("rest");
 
         // ── AI 聊天：接上訊息事件 ───────────────────────────
         LlmChatService? chat = null;
@@ -601,7 +602,9 @@ public static class Program
         Console.WriteLine("     /say <內容>   讓 Bot 幫你說一句話（無用小功能；" +
                           $"可用 {SayModule.AllowListVariable} 限制使用者）");
         Console.WriteLine("     /ai status    AI 聊天狀態（模型、每週 token 用量、這個頻道的記憶）");
+        Console.WriteLine("     /ai learned   看我學到了哪些規矩（這個伺服器專屬）");
         Console.WriteLine("     /ai forget    忘掉這個頻道的 AI 對話記憶");
+        Console.WriteLine("     /rest         重設這個伺服器學到的規矩（提示詞恢復預設）");
         Console.WriteLine("──────────────────────────────────────────────────────────");
         Console.WriteLine();
     }

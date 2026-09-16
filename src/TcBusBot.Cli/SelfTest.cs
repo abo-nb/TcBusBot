@@ -106,6 +106,12 @@ public static class SelfTest
         Section("23. 模型思考開關（LLM_REASONING：SK 送不出去，所以在 HTTP 層補）");
         TestReasoning();
 
+        Section("24. 可被馴服的提示詞（每個伺服器各自一份、可以重設）");
+        TestPersona();
+
+        Section("25. 公車查詢加強：路線號碼、轉乘（同名不同月台）");
+        TestBusSearchPlus(data, origin, dest);
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -1742,6 +1748,334 @@ public static class SelfTest
             capture(request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken));
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(responseBody) };
         }
+    }
+
+    /// <summary>
+    /// 「可以被馴服的提示詞」：<see cref="GuildPersonaStore"/>。
+    ///
+    /// 這裡最重要的是**邊界**：
+    ///   * 一個伺服器學到的東西**絕對不能**跑到別的伺服器（不然就是「別人家的人格被改掉」）
+    ///   * 不能被拿來塞爆提示詞（有條數與長度上限）
+    ///   * 重設要真的清乾淨，而且要把清掉的內容交出來（教了很多條的人才能複製回去）
+    /// </summary>
+    private static void TestPersona()
+    {
+        var memory = new FakeStateStore();
+        var store = new GuildPersonaStore(memory);
+
+        const ulong guildA = 111UL;
+        const ulong guildB = 222UL;
+
+        // ── 1) 學習與 overlay ─────────────────────────────
+        Check("一開始什麼都沒學到", store.Lines(guildA).Count == 0);
+        Check("沒學到東西時 overlay 是空的（不會多送沒用的提示詞）",
+            store.Overlay(guildA).Length == 0);
+
+        Check("★ 學第一條", store.Learn(guildA, "講話再簡短一點") == GuildPersonaStore.LearnResult.Added);
+
+        var learned = store.Learn(guildA, "自訂表情（委屈臉）代表委屈，看到就用撒嬌的語氣回");
+        Check("★ 可以學「自訂表情代表什麼」這種伺服器專屬知識",
+            learned == GuildPersonaStore.LearnResult.Added);
+
+        Check("★ overlay 真的包含學到的內容",
+            store.Overlay(guildA).Contains("講話再簡短一點", StringComparison.Ordinal)
+            && store.Overlay(guildA).Contains("委屈", StringComparison.Ordinal));
+
+        Check("★ overlay 有明確標示「這是後天學到的」",
+            store.Overlay(guildA).Contains("後天學到", StringComparison.Ordinal));
+
+        // ── 2) 伺服器之間完全隔離（最重要）─────────────────
+        Check("★ 別的伺服器看不到 A 學到的東西",
+            store.Lines(guildB).Count == 0 && store.Overlay(guildB).Length == 0);
+
+        store.Learn(guildB, "B 伺服器專屬：講話要很正式");
+        Check("★ 兩個伺服器各自記自己的",
+            store.Lines(guildA).Count == 2 && store.Lines(guildB).Count == 1,
+            $"{store.Lines(guildA).Count} / {store.Lines(guildB).Count}");
+        Check("★ A 的 overlay 不含 B 的內容（反之亦然）",
+            !store.Overlay(guildA).Contains("很正式", StringComparison.Ordinal)
+            && !store.Overlay(guildB).Contains("簡短", StringComparison.Ordinal));
+
+        // ── 3) 去重與清理 ────────────────────────────────
+        Check("★ 同一句學第二次 → 不重複加（AI 很常講兩遍）",
+            store.Learn(guildA, "講話再簡短一點") == GuildPersonaStore.LearnResult.Duplicate
+            && store.Lines(guildA).Count == 2);
+
+        Check("空白內容不會被記下來", store.Learn(guildA, "   ") == GuildPersonaStore.LearnResult.Empty);
+
+        store.Learn(guildA, "- 用條列式回答");
+        Check("★ 前面的條列符號會被清掉（提示詞的結構才不會亂）",
+            store.Lines(guildA)[^1] == "用條列式回答", store.Lines(guildA)[^1]);
+
+        store.Learn(guildA, "換行\n也要\n變成空白");
+        Check("★ 換行會被壓成一行",
+            store.Lines(guildA)[^1] == "換行 也要 變成空白", store.Lines(guildA)[^1]);
+
+        // ── 4) 上限 ──────────────────────────────────────
+        var longLine = new string('長', GuildPersonaStore.MaxLineLength + 1);
+        Check("★ 太長的一條會被拒絕（不讓它變成記事本）",
+            store.Learn(guildA, longLine) == GuildPersonaStore.LearnResult.TooLong);
+
+        var guildC = 333UL;
+        var added = 0;
+        var tooMany = GuildPersonaStore.LearnResult.Added;
+
+        for (var i = 0; i < GuildPersonaStore.MaxLinesPerGuild + 5; i++)
+        {
+            tooMany = store.Learn(guildC, $"規則 {i}");
+            if (tooMany == GuildPersonaStore.LearnResult.Added) added++;
+        }
+
+        Check($"★ 每個伺服器最多 {GuildPersonaStore.MaxLinesPerGuild} 條（再多會被擋）",
+            added == GuildPersonaStore.MaxLinesPerGuild
+            && tooMany == GuildPersonaStore.LearnResult.TooMany,
+            $"加了 {added} 條，最後一次：{tooMany}");
+
+        // ── 5) 忘記與重設 ────────────────────────────────
+        var before = store.Lines(guildA).Count;
+        Check("★ 用關鍵字刪掉符合的規則", store.Forget(guildA, "條列") == 1 && store.Lines(guildA).Count == before - 1);
+        Check("關鍵字找不到時回傳 0（不亂刪）", store.Forget(guildA, "不存在的關鍵字") == 0);
+
+        var removed = store.Reset(guildA);
+        Check("★ 重設會清掉這個伺服器的全部內容", store.Lines(guildA).Count == 0 && removed.Count > 0,
+            $"清掉 {removed.Count} 條");
+        Check("★ 重設會回傳被清掉的內容（教了很多條的人可以複製回去）",
+            removed.Any(l => l.Contains("講話再簡短一點", StringComparison.Ordinal)));
+        Check("★ 重設只影響那一個伺服器（B 的還在）", store.Lines(guildB).Count == 1);
+
+        // ── 6) 持久化（跨重啟）──────────────────────────
+        var reloaded = new GuildPersonaStore(memory);
+        Check("★ 學到的內容會寫進儲存區（重啟後還在）",
+            reloaded.Lines(guildB).Count == 1 && reloaded.Overlay(guildB).Contains("很正式", StringComparison.Ordinal));
+        Check("重設過的伺服器重啟後也是空的", reloaded.Lines(guildA).Count == 0);
+
+        // ── 7) 提示詞組裝順序 ────────────────────────────
+        var options = new LlmOptions { SystemPrompt = "【主機人格】", ToolsEnabled = false };
+        var orchestrator = new ChatOrchestrator(
+            new DisabledLlmClient(), options, new ConversationStore(options),
+            new WeeklyTokenBudget(options), NoChatTools.Instance, reloaded);
+
+        var prompt = orchestrator.EffectiveSystemPrompt(guildB);
+        Check("★ 系統提示＝主機人格（工具關閉時不加工具說明）＋這個伺服器學到的規則",
+            prompt.StartsWith("【主機人格】", StringComparison.Ordinal)
+            && prompt.Contains("很正式", StringComparison.Ordinal));
+        Check("★ 學到的規則放在最後（模型對最後的指示最聽話）",
+            prompt.IndexOf("【主機人格】", StringComparison.Ordinal)
+            < prompt.IndexOf("很正式", StringComparison.Ordinal));
+
+        var otherPrompt = orchestrator.EffectiveSystemPrompt(999UL);
+        Check("★ 沒有學過東西的伺服器拿到的是乾淨的提示詞",
+            otherPrompt == "【主機人格】", otherPrompt);
+    }
+
+    /// <summary>
+    /// 公車查詢加強：路線號碼查詢、以及**沒有直達時的轉乘建議**。
+    ///
+    /// 轉乘刻意用「站名」比對而不是 StopUID —— 台中同一條路上常有同名不同 UID 的月台
+    /// （去回程各一組、專用道與慢車道各一組），用 UID 比對幾乎找不到轉乘點。
+    /// 這裡用**自己造的資料集**驗演算法本身（fixture 是單一走廊，不一定有轉乘案例）。
+    /// </summary>
+    private static void TestBusSearchPlus(TaichungBusDataService realData, LocationTarget origin, LocationTarget dest)
+    {
+        // ── 1) 路線號碼查詢（真實 fixture）────────────────
+        var service = new BusActionService(realData, Subs());
+
+        var routes300 = service.SearchRoutes("300");
+        Check("★ 查得到 300（去回程分開列）",
+            routes300.Contains("300", StringComparison.Ordinal) &&
+            routes300.Contains("去程", StringComparison.Ordinal) &&
+            routes300.Contains("返程", StringComparison.Ordinal),
+            routes300.Split('\n')[0]);
+
+        var routes304 = service.SearchRoutes("304");
+        Check("★ 查得到 304", routes304.Contains("304", StringComparison.Ordinal));
+
+        Check("查不到的路線號碼會老實說找不到",
+            service.SearchRoutes("9999").Contains("找不到", StringComparison.Ordinal));
+
+        Check("空號碼不會爆", service.SearchRoutes("").Contains("請給我", StringComparison.Ordinal));
+
+        var stopsWithRoutes = service.SearchStops("臺中車站");
+        Check("★ 查站牌時會一併回報「有哪幾條路線經過」（模型才判斷得出是哪一個站）",
+            stopsWithRoutes.Contains("經過的路線", StringComparison.Ordinal), stopsWithRoutes.Split('\n')[1]);
+
+        // ── 2) 轉乘演算法（自造資料集）────────────────────
+        var data = BuildTransferFixture();
+
+        var fromA = data.TargetFromStops(new[] { "A1" });      // A 線起點
+        var toC = data.TargetFromStops(new[] { "C2" });        // C 線終點（A→C 沒有直達）
+
+        var direct = data.FindRoutes(fromA, toC);
+        Check("★ 這個資料集裡 A→C 沒有直達（前提）", direct.Count == 0, $"{direct.Count} 條直達");
+
+        var transfers = data.FindTransferRoutes(fromA, toC);
+        Check("★ 找得到「轉一次」的走法", transfers.Count > 0, $"{transfers.Count} 個建議");
+
+        if (transfers.Count > 0)
+        {
+            var t = transfers[0];
+            Check("★ 轉乘點是兩條路線共同經過的站",
+                t.TransferStopName == "共用站", t.TransferStopName);
+            Check("★ 第一段是 A 線、第二段是 C 線",
+                t.RouteNameA == "A 線" && t.RouteNameB == "C 線", $"{t.RouteNameA} → {t.RouteNameB}");
+            // A 線：起點A(1) → 中間A(2) → 共用站(3) → 搭 2 站到轉乘點
+            // C 線：共用站(1) → 中間C(2) → 終點C(3) → 再 2 站到目的地
+            Check("★ 站數計算正確（A 線 2 站到轉乘點、C 線再 2 站到目的地）",
+                t.StopsToTransfer == 2 && t.StopsAfterTransfer == 2,
+                $"{t.StopsToTransfer} + {t.StopsAfterTransfer}");
+            Console.WriteLine($"  ℹ {t.Describe()}");
+        }
+
+        // 反方向（C 線起點 → A 線終點）：因為方向不對，不該給出轉乘建議
+        var reverse = data.FindTransferRoutes(data.TargetFromStops(new[] { "C1" }), data.TargetFromStops(new[] { "A3" }));
+        Check("★ 方向不對時不會硬給建議（C1 → A3 需要逆向）", reverse.Count == 0, $"{reverse.Count} 個建議");
+
+        // 有直達時就不需要轉乘建議（FindRoutes 會直接回直達）
+        var directExists = data.FindRoutes(data.TargetFromStops(new[] { "A1" }), data.TargetFromStops(new[] { "X1" }));
+        Check("★ 有直達時回傳直達路線", directExists.Count == 1, $"{directExists.Count} 條");
+
+        // ── 3) 同名不同月台也要能轉乘 ─────────────────────
+        var sameNameData = BuildSameNamePlatformFixture();
+        var sameNameTransfers = sameNameData.FindTransferRoutes(
+            sameNameData.TargetFromStops(new[] { "P1" }),
+            sameNameData.TargetFromStops(new[] { "Q2" }));
+
+        Check("★ 同名但不同 StopUID 的月台也算同一個轉乘點（台中常態）",
+            sameNameTransfers.Count > 0 && sameNameTransfers[0].TransferStopName == "共用站",
+            $"{sameNameTransfers.Count} 個建議");
+
+        if (sameNameTransfers.Count > 0)
+            Console.WriteLine($"  ℹ 同名不同月台：{sameNameTransfers[0].Describe()}");
+
+        // ── 4) 不可以回「上車 0 站就轉乘」這種廢話 ──────────
+        //    真實資料上真的出現過：「搭 131 在干城站上車 → 在干城站下車（0 站），轉 303」
+        //    ——那不是轉乘，只是換月台。兩段都至少要搭 1 站。
+        var realCache = TcBusBot.Core.DataSources.StaticDataLoader.TryReadCache(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "cache"));
+
+        var checkedPairs = 0;
+        var badTransfers = new List<string>();
+
+        if (realCache is not null)
+        {
+            var real = new TaichungBusDataService();
+            real.Load(realCache.Stops, realCache.StopOfRoutes, realCache.Routes);
+
+            foreach (var (from, to) in new[] { ("干城站", "東海別墅"), ("靜宜大學", "逢甲大學"), ("新民高中", "霧峰") })
+            {
+                var f = TargetOf(real, from);
+                var t = TargetOf(real, to);
+                if (f is null || t is null) continue;
+
+                checkedPairs++;
+
+                foreach (var option in real.FindTransferRoutes(f, t, max: 3))
+                {
+                    if (option.StopsToTransfer < 1 || option.StopsAfterTransfer < 1)
+                        badTransfers.Add(option.Describe());
+                }
+            }
+        }
+
+        Check("★ 真實資料上不會給出「搭 0 站就轉乘」的建議" +
+              (checkedPairs == 0 ? "（沒有快取，略過）" : $"（檢查 {checkedPairs} 組起訖）"),
+            badTransfers.Count == 0,
+            badTransfers.FirstOrDefault() ?? "全部合法");
+    }
+
+    /// <summary>造一個「A→共用站→C」的資料集：A 與 C 沒有共同站牌（UID 不同），只有同名站。</summary>
+    private static TaichungBusDataService BuildTransferFixture() => BuildFixture(
+    [
+        ("A", 0, "A 線", ["A1", "A2", "X1"]),        // X1 = 共用站（UID 與 C 線不同）
+        ("C", 0, "C 線", ["X2", "C1", "C2"])         // X2 = 共用站（同名不同 UID）
+    ],
+    new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["A1"] = "起點A", ["A2"] = "中間A", ["X1"] = "共用站",
+        ["X2"] = "共用站", ["C1"] = "中間C", ["C2"] = "終點C"
+    });
+
+    private static TaichungBusDataService BuildSameNamePlatformFixture() => BuildFixture(
+    [
+        ("P", 0, "P 線", ["P1", "M1", "P2"]),
+        ("Q", 1, "Q 線", ["M9", "Q1", "Q2"])         // M9 與 M1 **同名**但不同 UID、不同方向
+    ],
+    new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["P1"] = "起點P",
+        ["M1"] = "共用站",                            // 同名
+        ["P2"] = "終點P",
+        ["M9"] = "共用站",                            // 同名、不同 StopUID（真實世界的常態）
+        ["Q1"] = "中間Q",
+        ["Q2"] = "終點Q"
+    });
+
+    /// <summary>把站名關鍵字變成候選集合（測試用；與 BusActionService 的規則一致：只取精確相符的群組）。</summary>
+    private static LocationTarget? TargetOf(TaichungBusDataService data, string keyword)
+    {
+        var groups = data.Search.SearchGrouped(keyword);
+        var precise = groups.Where(g => g.IsDefaultPick).ToList();
+        var picked = precise.Count > 0 ? precise : groups.Where(g => g.IsStrongMatch).Take(1).ToList();
+
+        var uids = picked.SelectMany(g => g.Hits).Select(h => h.Entry.StopUid)
+                         .Distinct(StringComparer.Ordinal).ToList();
+
+        return uids.Count == 0 ? null : data.TargetFromStops(uids);
+    }
+
+    /// <summary>用假的站牌／站序造一個可查詢的資料集（測演算法用，不需要 TDX）。</summary>
+    private static TaichungBusDataService BuildFixture(
+        (string RouteUid, int Direction, string Name, string[] Stops)[] routes,
+        Dictionary<string, string> stopNames)
+    {
+        var stops = stopNames.Select(kv => new BusStop
+        {
+            StopUID = kv.Key,
+            StopName = new LocalizedName(kv.Value, null),
+            StopPosition = new StopPosition(120.68, 24.14, null),
+            City = "Taichung",
+            CityCode = "TXG"
+        }).ToList();
+
+        var stopOfRoutes = routes.Select(r =>
+        {
+            var sor = new BusStopOfRoute
+            {
+                RouteUID = r.RouteUid,
+                RouteID = r.RouteUid,
+                RouteName = new LocalizedName(r.Name, null),
+                SubRouteUID = r.RouteUid,
+                SubRouteID = r.RouteUid,
+                SubRouteName = new LocalizedName(r.Name, null),
+                Direction = r.Direction,
+                City = "Taichung",
+                CityCode = "TXG",
+                Stops = r.Stops.Select((uid, i) => new StopOfRouteStop
+                {
+                    StopUID = uid,
+                    StopSequence = i + 1,
+                    // 站名要放在站序裡：FindTransferRoutes 是用「站名」比對轉乘點的
+                    StopName = new LocalizedName(stopNames[uid], null)
+                }).ToList()
+            };
+
+            return sor;
+        }).ToList();
+
+        var routeMetas = routes.Select(r => new BusRoute
+        {
+            RouteUID = r.RouteUid,
+            RouteID = r.RouteUid,
+            RouteName = new LocalizedName(r.Name, null),
+            HasSubRoutes = true,
+            City = "Taichung",
+            CityCode = "TXG",
+            SubRoutes = new List<BusSubRoute>()
+        }).ToList();
+
+        var data = new TaichungBusDataService();
+        data.Load(stops, stopOfRoutes, routeMetas);
+        return data;
     }
 
     /// <summary>

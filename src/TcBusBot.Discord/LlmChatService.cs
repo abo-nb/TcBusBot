@@ -289,7 +289,7 @@ public sealed class LlmChatService : IDisposable
     /// </summary>
     private MessageComponent? BuildUndoComponents(SocketUserMessage message)
     {
-        if (_chat.Tools is not BusToolProvider busTools) return null;
+        if (_chat.Tools is not BotToolProvider busTools) return null;
         if (busTools.TakePendingUndo() is not { Count: > 0 } removed) return null;
 
         var session = _sessions.GetOrCreate(message.Author.Id, message.Channel.Id);

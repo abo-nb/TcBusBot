@@ -22,6 +22,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly ConversationStore _conversations;
     private readonly WeeklyTokenBudget _budget;
     private readonly ILlmClient _llm;
+    private readonly GuildPersonaStore _personas;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -32,12 +33,14 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         LlmOptions options,
         ConversationStore conversations,
         WeeklyTokenBudget budget,
-        ILlmClient llm)
+        ILlmClient llm,
+        GuildPersonaStore personas)
     {
         _options = options;
         _conversations = conversations;
         _budget = budget;
         _llm = llm;
+        _personas = personas;
     }
 
     [SlashCommand("status", "看 AI 聊天的狀態：模型、這一週用掉多少 token、這個頻道的記憶")]
@@ -58,8 +61,11 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 !enabled
                     ? "—"
                     : _options.ToolsEnabled
-                        ? "✅ 已啟用：查站牌／查路線／訂閱公車／列出訂閱／取消訂閱／到站時間"
+                        ? "✅ 已啟用：查站牌／查路線號碼／查路線／訂閱公車／列出訂閱／取消訂閱／到站時間／記住規矩"
                         : "❌ 已關閉（LLM_TOOLS=false）→ 只會聊天，不會動到你的訂閱",
+                inline: false)
+            .AddField("這個伺服器學到的規矩",
+                _personas.Describe(guildId),
                 inline: false)
             .AddField("每週額度",
                 _budget.Limit <= 0
@@ -92,6 +98,42 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
 
         await RespondAsync(embed: embed.Build(), ephemeral: true);
     }
+
+    [SlashCommand("learned", "看我（這個伺服器）學到了哪些規矩與自訂表情的意思")]
+    public async Task LearnedAsync()
+    {
+        var guildId = Context.Guild?.Id ?? 0;
+        var lines = _personas.Lines(guildId);
+
+        if (lines.Count == 0)
+        {
+            await RespondAsync(
+                "這個伺服器還沒有學到任何規矩 —— 是預設的樣子。\n\n" +
+                "可以這樣教它：\n" +
+                "• `@我 講話再簡短一點`（它會用 remember_rule 記下來）\n" +
+                "• `@我 <自訂表情> 是 委屈`（表情名稱每個伺服器不一樣，只有這裡學到的才有意義）\n\n" +
+                "學到的內容**只對這個伺服器生效**，用 `/rest` 可以整個重設。",
+                ephemeral: true);
+            return;
+        }
+
+        var numbered = lines.Select((l, i) => $"`{i + 1}.` {Truncate(l, 200)}");
+        var description = string.Join("\n", numbered);
+
+        if (description.Length > 4000) description = description[..4000] + "…";
+
+        await RespondAsync(
+            embed: new EmbedBuilder()
+                .WithColor(new Color(0x2B, 0x6C, 0xB0))
+                .WithTitle("📚 這個伺服器學到的規矩")
+                .WithDescription(description)
+                .WithFooter($"共 {lines.Count}/{GuildPersonaStore.MaxLinesPerGuild} 條｜只對這個伺服器生效｜/rest 可以重設")
+                .Build(),
+            ephemeral: true);
+    }
+
+    private static string Truncate(string text, int max)
+        => text.Length <= max ? text : text[..max] + "…";
 
     [SlashCommand("forget", "忘掉這個頻道的 AI 對話記憶（不影響公車訂閱）")]
     public async Task ForgetAsync()

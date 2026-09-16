@@ -1104,6 +1104,7 @@ public static class DryRun
             interactions.AddModuleAsync<BusComponentModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<SayModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<ChatModule>(services).GetAwaiter().GetResult();
+            interactions.AddModuleAsync<ResetModule>(services).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -1153,7 +1154,7 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget" };
+            var expectedAi = new[] { "status", "forget", "learned" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)
@@ -1161,6 +1162,12 @@ public static class DryRun
             else
                 Console.WriteLine($"  ✔ /ai 的 {expectedAi.Length} 個子指令都在（{string.Join("、", expectedAi)}）");
         }
+
+        // ── /rest（重設這個伺服器學到的規矩）────────────────
+        if (commands.All(c => CommandPath(c) != "rest"))
+            Problem("找不到 /rest 指令 —— 使用者沒辦法把「教壞的」提示詞重設");
+        else
+            Console.WriteLine("  ✔ /rest 已註冊（重設這個伺服器學到的規矩）");
 
         // ── /say 是這次新加的：一定要在，而且只能有一個必填的字串參數 ──
         var say = commands.FirstOrDefault(c => CommandPath(c) == "say");
@@ -1716,11 +1723,14 @@ public static class DryRun
             Console.WriteLine($"  ✔ 儲存後端：{store.Describe()}（訂閱組與 LLM 用量共用同一個實例）");
 
         // ── Discord 的模組一定要註冊成 transient ────────────
+        var moduleTypes = new[]
+        {
+            typeof(BusModule), typeof(BusComponentModule), typeof(SayModule),
+            typeof(ChatModule), typeof(ResetModule)
+        };
+
         var badLifetime = collection
-            .Where(d => d.ServiceType == typeof(BusModule)
-                        || d.ServiceType == typeof(BusComponentModule)
-                        || d.ServiceType == typeof(SayModule)
-                        || d.ServiceType == typeof(ChatModule))
+            .Where(d => moduleTypes.Contains(d.ServiceType))
             .Where(d => d.Lifetime != ServiceLifetime.Transient)
             .Select(d => $"{d.ServiceType.Name}（{d.Lifetime}）")
             .ToList();
@@ -1729,7 +1739,7 @@ public static class DryRun
             Problem($"指令模組必須是 transient（共用實例會讓並行的互動互相蓋掉 Context）：" +
                     string.Join("、", badLifetime));
         else
-            Console.WriteLine("  ✔ 4 個指令模組都註冊成 transient（每次互動都是新實例）");
+            Console.WriteLine($"  ✔ {moduleTypes.Length} 個指令模組都註冊成 transient（每次互動都是新實例）");
 
         return provider;
     }

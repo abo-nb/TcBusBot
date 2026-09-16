@@ -15,6 +15,24 @@ internal sealed class TripStops
     public required string[] StopUids { get; init; }
     public required string[] StopNames { get; init; }
     public required Dictionary<string, int> FirstSeqByStopUid { get; init; }
+
+    /// <summary>
+    /// 站名（正規化後）→ 第一次出現的站序。
+    ///
+    /// 為什麼要有「按站名」的索引：台中同一條路上常有**同名但不同 StopUID** 的月台
+    /// （去回程各登記一次、專用道與慢車道各一組），所以「轉乘」用 UID 比對會找不到
+    /// （A 路線停在 TXG19265、B 路線停在 TXG1865，其實是同一個路口）。
+    /// 用人類的方式比對（站名）才找得到合理的轉乘點。
+    /// </summary>
+    public required Dictionary<string, int> FirstSeqByNameKey { get; init; }
+
+    public required string[] NameKeys { get; init; }
+
+    /// <summary>StopSequence → StopNames／NameKeys 的索引（TDX 的站序不保證從 0 或 1 開始）。</summary>
+    public required Dictionary<int, int> IndexBySeq { get; init; }
+
+    /// <summary>依站序排好的 StopSequence（與 StopNames／NameKeys 同一個順序）。</summary>
+    public required int[] StopSequences { get; init; }
 }
 
 /// <summary>
@@ -82,6 +100,17 @@ public sealed class TaichungBusDataService
             foreach (var s in ordered)
                 firstSeq.TryAdd(s.StopUID, s.StopSequence);   // 環狀路線同站重複出現時取第一次
 
+            // 站名索引（給「轉乘」用：同名不同月台也要算同一個轉乘點）
+            var nameKeys = ordered.Select(s => StopNameNormalizer.ForSearch(s.ZhTwName)).ToArray();
+            var firstSeqByName = new Dictionary<string, int>(StringComparer.Ordinal);
+            var indexBySeq = new Dictionary<int, int>();
+
+            for (var i = 0; i < nameKeys.Length; i++)
+            {
+                firstSeqByName.TryAdd(nameKeys[i], ordered[i].StopSequence);
+                indexBySeq.TryAdd(ordered[i].StopSequence, i);
+            }
+
             var key = (sor.RouteUID, sor.Direction);
             var trip = new TripStops
             {
@@ -91,7 +120,11 @@ public sealed class TaichungBusDataService
                 Headsign = ResolveHeadsign(sor),
                 StopUids = ordered.Select(s => s.StopUID).ToArray(),
                 StopNames = ordered.Select(s => s.ZhTwName).ToArray(),
-                FirstSeqByStopUid = firstSeq
+                FirstSeqByStopUid = firstSeq,
+                FirstSeqByNameKey = firstSeqByName,
+                NameKeys = nameKeys,
+                IndexBySeq = indexBySeq,
+                StopSequences = ordered.Select(s => s.StopSequence).ToArray()
             };
             _trips[key] = trip;
 
@@ -132,6 +165,26 @@ public sealed class TaichungBusDataService
         var allStops = merged.Values.ToList();
         foreach (var s in allStops)
             _displayNameByStopUid[s.StopUID] = s.ZhTwName;
+
+        // ── 2b) 站序裡的站名補齊 ──────────────────────────
+        // ⚠️ 不是每份資料的 StopOfRoute 都帶站名（我們的離線 fixture 就只有 StopUID），
+        //    而「路線查詢」「轉乘建議」都是拿站序裡的站名在講話 ——
+        //    少了這一步，那些功能會吐出 TXG13567 這種代號，模型也看不懂。
+        //    站名統一到 _displayNameByStopUid（Stop 為主、StopOfRoute 為輔）。
+        foreach (var trip in _trips.Values)
+        {
+            trip.FirstSeqByNameKey.Clear();
+
+            for (var i = 0; i < trip.StopNames.Length; i++)
+            {
+                if (string.IsNullOrWhiteSpace(trip.StopNames[i])
+                    && _displayNameByStopUid.TryGetValue(trip.StopUids[i], out var name))
+                    trip.StopNames[i] = name;
+
+                trip.NameKeys[i] = StopNameNormalizer.ForSearch(trip.StopNames[i]);
+                trip.FirstSeqByNameKey.TryAdd(trip.NameKeys[i], trip.StopSequences[i]);
+            }
+        }
 
         // ── 3) 建議群組 ───────────────────────────────────
         var (groups, groupKeyByStopUid) = StopAreaGrouping.Build(allStops, clusterMeters);
@@ -359,6 +412,195 @@ public sealed class TaichungBusDataService
 
     public string GetHeadsign(string routeUid, int direction)
         => _trips.TryGetValue((routeUid, direction), out var trip) ? trip.Headsign : "";
+
+    // ─────────────────────────────────────────────────────
+    //  依「路線號碼」查（使用者常常只知道號碼）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>一條 (路線, 方向) 的摘要（給「查路線號碼」用）。</summary>
+    public sealed record RouteSummary(
+        string RouteUid,
+        string RouteName,
+        int Direction,
+        string Headsign,
+        int StopCount,
+        string FirstStopName,
+        string LastStopName)
+    {
+        public string Describe()
+            => $"{RouteName}（{(Direction == 0 ? "去程" : "返程")}）{Headsign}｜共 {StopCount} 站｜" +
+               $"{FirstStopName} → {LastStopName}";
+
+        /// <summary>關鍵站（給模型看的：頭尾＋中間抽樣）。</summary>
+        public IReadOnlyList<string> SampleStops { get; init; } = [];
+    }
+
+    /// <summary>
+    /// 用路線號碼找路線（「300」「304」「藍1」「5」…）。
+    ///
+    /// 為什麼需要：使用者最常說的是「300 多久來一班」，而不是站名。
+    /// 站牌搜尋（<see cref="Search"/>）只找得到站，找不到路線。
+    /// </summary>
+    public IReadOnlyList<RouteSummary> FindRoutesByNumber(string number, int max = 12)
+    {
+        var q = StopNameNormalizer.ForSearch(number ?? "");
+        if (q.Length == 0) return Array.Empty<RouteSummary>();
+
+        var results = new List<RouteSummary>();
+
+        foreach (var trip in _trips.Values)
+        {
+            var nameKey = StopNameNormalizer.ForSearch(trip.RouteName);
+
+            // 完全相符優先，其次前綴（打「3」不要把 300/304/35 全部倒出來時就靠這個排序）
+            if (!nameKey.Contains(q, StringComparison.Ordinal)) continue;
+
+            var sample = trip.StopNames.Length <= 6
+                ? trip.StopNames
+                : new[]
+                {
+                    trip.StopNames[0],
+                    trip.StopNames[trip.StopNames.Length / 2],
+                    trip.StopNames[^1]
+                };
+
+            results.Add(new RouteSummary(
+                RouteUid: trip.RouteUid,
+                RouteName: trip.RouteName,
+                Direction: trip.Direction,
+                Headsign: trip.Headsign,
+                StopCount: trip.StopNames.Length,
+                FirstStopName: trip.StopNames[0],
+                LastStopName: trip.StopNames[^1])
+            {
+                SampleStops = sample
+            });
+        }
+
+        return results
+            .OrderBy(r => StopNameNormalizer.ForSearch(r.RouteName) == q ? 0 : 1)
+            .ThenBy(r => r.RouteName, StringComparer.Ordinal)
+            .ThenBy(r => r.Direction)
+            .Take(Math.Max(1, max))
+            .ToList();
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  轉乘（沒有直達時）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>一次轉乘的建議。</summary>
+    public sealed record TransferOption(
+        string RouteNameA, int DirectionA, string BoardStopName,
+        string TransferStopName,
+        string RouteNameB, int DirectionB, string AlightStopName,
+        int StopsToTransfer, int StopsAfterTransfer, string RouteUidA, string RouteUidB)
+    {
+        public int TotalStops => StopsToTransfer + StopsAfterTransfer;
+
+        public string Describe()
+            => $"搭 {RouteNameA}（{(DirectionA == 0 ? "去程" : "返程")}）在 {BoardStopName} 上車 → " +
+               $"在 {TransferStopName} 下車（{StopsToTransfer} 站），" +
+               $"轉 {RouteNameB}（{(DirectionB == 0 ? "去程" : "返程")}）→ 在 {AlightStopName} 下車" +
+               $"（{StopsAfterTransfer} 站）";
+    }
+
+    /// <summary>
+    /// 找「轉一次」的走法（沒有直達路線時用）。
+    ///
+    /// ⚠️ **轉乘點用站名比對，不是 StopUID** —— 台中同一條路上常有同名不同 UID 的月台
+    /// （去回程各一組、專用道與慢車道各一組），用 UID 比對幾乎找不到轉乘點，
+    /// 但用站名比對就完全符合「同一個路口換車」的直覺。
+    ///
+    /// 成本刻意壓在很小的範圍：起點可搭的路線取前 <paramref name="maxLegA"/> 條、
+    /// 每條最多看 <see cref="MaxStopsPerLeg"/> 站、目的地候選站全部（通常 ≤ 25）。
+    /// 這是「幫忙找一個可行方案」，不是完整的最短路徑演算法 ——
+    /// 回傳的選項依「總站數」排序，越短的越可能合理。
+    /// </summary>
+    public IReadOnlyList<TransferOption> FindTransferRoutes(
+        LocationTarget origin, LocationTarget destination, int max = 3, int maxLegA = 10)
+    {
+        if (origin.CandidateStopUids.Count == 0 || destination.CandidateStopUids.Count == 0)
+            return Array.Empty<TransferOption>();
+
+        // 目的地候選站 → 可以搭哪些 (路線, 方向) 抵達（= 第二段候選）
+        var legB = new List<(TripStops Trip, int AlightIndex)>();
+        foreach (var destUid in destination.CandidateStopUids)
+        {
+            foreach (var occ in GetOccurrences(destUid))
+            {
+                if (!_trips.TryGetValue((occ.RouteUid, occ.Direction), out var trip)) continue;
+                if (!trip.IndexBySeq.TryGetValue(occ.Sequence, out var alightIndex)) continue;
+
+                legB.Add((trip, alightIndex));
+            }
+        }
+
+        if (legB.Count == 0) return Array.Empty<TransferOption>();
+
+        // 起點候選站 → 可以搭哪些 (路線, 方向)（= 第一段候選）
+        var legA = new List<(TripStops Trip, int BoardIndex)>();
+        foreach (var fromUid in origin.CandidateStopUids)
+        {
+            foreach (var occ in GetOccurrences(fromUid))
+            {
+                if (!_trips.TryGetValue((occ.RouteUid, occ.Direction), out var trip)) continue;
+                if (!trip.IndexBySeq.TryGetValue(occ.Sequence, out var boardIndex)) continue;
+
+                legA.Add((trip, boardIndex));
+            }
+        }
+
+        var results = new List<TransferOption>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var (tripA, boardIndex) in legA.Take(Math.Max(1, maxLegA)))
+        {
+            var last = Math.Min(tripA.StopNames.Length, boardIndex + MaxStopsPerLeg);
+
+            // ⚠️ 從 boardIndex + 1 開始：轉乘點必須是「搭了一段之後才到的地方」。
+            //    從 boardIndex 開始會產生「在干城站上車、在干城站下車（0 站）、轉 XXX」
+            //    這種廢話（真實資料上真的出現過）——那不是轉乘，只是換月台。
+            for (var i = boardIndex + 1; i < last; i++)
+            {
+                var nameKey = tripA.NameKeys[i];
+
+                foreach (var (tripB, alightIndex) in legB)
+                {
+                    if (tripB.RouteUid == tripA.RouteUid && tripB.Direction == tripA.Direction) continue;
+                    if (!tripB.FirstSeqByNameKey.TryGetValue(nameKey, out var transferSeqB)) continue;
+                    if (!tripB.IndexBySeq.TryGetValue(transferSeqB, out var transferIndexB)) continue;
+                    if (transferIndexB >= alightIndex) continue;   // 第二段必須往目的地方向走
+                    if (alightIndex - transferIndexB < 1) continue; // 第二段至少也要搭 1 站
+
+                    var key = $"{tripA.RouteUid}|{tripA.Direction}|{nameKey}|{tripB.RouteUid}|{tripB.Direction}";
+                    if (!seen.Add(key)) continue;
+
+                    results.Add(new TransferOption(
+                        RouteNameA: tripA.RouteName,
+                        DirectionA: tripA.Direction,
+                        BoardStopName: tripA.StopNames[boardIndex],
+                        TransferStopName: tripA.StopNames[i],
+                        RouteNameB: tripB.RouteName,
+                        DirectionB: tripB.Direction,
+                        AlightStopName: tripB.StopNames[alightIndex],
+                        StopsToTransfer: i - boardIndex,
+                        StopsAfterTransfer: alightIndex - transferIndexB,
+                        RouteUidA: tripA.RouteUid,
+                        RouteUidB: tripB.RouteUid));
+                }
+            }
+        }
+
+        return results
+            .OrderBy(r => r.TotalStops)
+            .ThenBy(r => r.RouteNameA, StringComparer.Ordinal)
+            .Take(Math.Max(1, max))
+            .ToList();
+    }
+
+    /// <summary>第一段最多往後看幾站（越大越找得到，但成本越高）。</summary>
+    private const int MaxStopsPerLeg = 70;
 
     // ─────────────────────────────────────────────────────
     //  核心：候選集合 × 候選集合 的路線匹配

@@ -52,14 +52,20 @@ public sealed class ChatOrchestrator
         你有工具可以實際幫使用者操作，呼叫工具之後**一定要**把結果老實講出來：
         • 使用者說「幫我訂 X 到 Y 的公車」→ 呼叫 subscribe_bus（站名先問清楚或用 search_stops 查）
         • 要確認已經訂了什麼 → list_subscriptions
-        • 使用者說「不想搭了／全部取消」→ cancel_all_subscriptions
-        • 只是想知道有什麼車 → find_routes（不會建立訂閱）
         • 問「還要多久」→ next_arrivals（需要 TDX 金鑰；查不到就明講）
+        • 只想知道有什麼車 → find_routes（不會建立訂閱）
+        • 只說得出路線號碼（例如「300 到哪」）→ search_routes
+        • 使用者說「不想搭了／全部取消」→ cancel_all_subscriptions
+        • **使用者教你這個伺服器的規矩或知識** → remember_rule
+          （語氣偏好、稱呼方式、以及**自訂表情代表什麼**都算；
+            表情的格式就是「表情名稱 是 意思」，例如使用者說某個表情是委屈，
+            你就把那一句記下來 —— 表情名稱每個伺服器都不一樣，只有這裡學到的才有意義）
         規則：
         1. 站名不確定時**先問**，不要自己猜一個看起來像的（猜錯會訂到錯的路線）。
         2. 工具回報失敗（找不到站牌、沒有直達路線）時，把原因講清楚，不要假裝成功。
         3. 呼叫完工具後用一兩句話總結「你做了什麼」，不要貼出工具的原始輸出。
         4. 沒有工具能做的事（例如即時動態、票價）就說你查不到，不要編。
+        5. 使用者要你「記住」某件事時就呼叫 remember_rule；只是閒聊的內容不用記。
         """;
 
     private readonly ILlmClient _llm;
@@ -68,19 +74,22 @@ public sealed class ChatOrchestrator
     private readonly WeeklyTokenBudget _budget;
     private readonly TopicSwitchDetector _detector;
     private readonly IChatToolProvider _tools;
+    private readonly GuildPersonaStore _personas;
 
     public ChatOrchestrator(
         ILlmClient llm,
         LlmOptions options,
         ConversationStore conversations,
         WeeklyTokenBudget budget,
-        IChatToolProvider? tools = null)
+        IChatToolProvider? tools = null,
+        GuildPersonaStore? personas = null)
     {
         _llm = llm;
         _options = options;
         _conversations = conversations;
         _budget = budget;
         _tools = tools ?? NoChatTools.Instance;
+        _personas = personas ?? new GuildPersonaStore();
         _detector = new TopicSwitchDetector(llm, options);
     }
 
@@ -90,11 +99,24 @@ public sealed class ChatOrchestrator
 
     public IChatToolProvider Tools => _tools;
 
-    /// <summary>這次要送出的系統提示（使用者設定的 ＋ 工具說明）。</summary>
-    public string EffectiveSystemPrompt
-        => _options.ToolsEnabled && _tools is not NoChatTools
-            ? _options.SystemPrompt + ToolInstructions
-            : _options.SystemPrompt;
+    public GuildPersonaStore Personas => _personas;
+
+    /// <summary>
+    /// 這次要送出的系統提示：
+    /// 主機設定的人格 → 工具規則 → **這個伺服器後天學到的規則**。
+    ///
+    /// ⚠️ 順序有意義：學到的規則放最後，模型對「最後的指示」通常最聽話，
+    /// 也才壓得過前面那些通用規則（使用者教它「講話簡短一點」就該真的簡短）。
+    /// </summary>
+    public string EffectiveSystemPrompt(ulong guildId)
+    {
+        var prompt = _options.SystemPrompt;
+
+        if (_options.ToolsEnabled && _tools is not NoChatTools)
+            prompt += ToolInstructions;
+
+        return prompt + _personas.Overlay(guildId);
+    }
 
     /// <summary>
     /// 回答一則訊息。
@@ -172,7 +194,7 @@ public sealed class ChatOrchestrator
         var plugins = _options.ToolsEnabled ? _tools.CreateFor(toolContext, toolLog) : [];
 
         var request = new LlmRequest(
-            SystemPrompt: EffectiveSystemPrompt,
+            SystemPrompt: EffectiveSystemPrompt(guildId),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,

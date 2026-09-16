@@ -81,12 +81,14 @@ internal static class BotServices
         services.AddSingleton<ILlmClient>(_ => CreateLlmClient(cfg.Llm, log));
 
         services.AddSingleton<BusActionService>();
+        services.AddSingleton(sp => new GuildPersonaStore(sp.GetRequiredService<ILlmStateStore>()));
 
         services.AddSingleton<IChatToolProvider>(sp =>
             cfg.Llm.IsConfigured && cfg.Llm.ToolsEnabled
-                ? new BusToolProvider(
+                ? new BotToolProvider(
                     sp.GetRequiredService<BusActionService>(),
                     sp.GetRequiredService<SubscriptionService>(),
+                    sp.GetRequiredService<GuildPersonaStore>(),
                     ArrivalsAsync(sp))
                 : NoChatTools.Instance);
 
@@ -95,7 +97,8 @@ internal static class BotServices
             cfg.Llm,
             sp.GetRequiredService<ConversationStore>(),
             sp.GetRequiredService<WeeklyTokenBudget>(),
-            sp.GetRequiredService<IChatToolProvider>()));
+            sp.GetRequiredService<IChatToolProvider>(),
+            sp.GetRequiredService<GuildPersonaStore>()));
 
         services.AddSingleton<LlmChatService>();
 
@@ -111,6 +114,7 @@ internal static class BotServices
         services.AddTransient<BusComponentModule>();
         services.AddTransient<SayModule>();
         services.AddTransient<ChatModule>();
+        services.AddTransient<ResetModule>();
 
         return services;
     }
@@ -150,30 +154,45 @@ internal static class BotServices
                 return "使用者目前沒有任何訂閱，所以沒有到站時間可以查。" +
                        "（可以問他要不要用 subscribe_bus 訂閱）";
 
-            var group = groups[^1];
-            var result = await runtime.BuildEtaTableAsync(group, DateTimeOffset.UtcNow);
+            // 以前只看「最後一組」訂閱 —— 使用者常常有好幾組（上班／回家），
+            // 只回最後一組會讓他以為其他訂閱消失了。這裡把每一組都查一遍。
+            var blocks = new List<string>();
 
-            var rows = result.Rows.AsEnumerable();
-
-            if (!string.IsNullOrWhiteSpace(route))
+            foreach (var group in groups.Take(3))
             {
-                var filtered = rows
-                    .Where(r => r.Subscription.RouteName.Contains(route!, StringComparison.OrdinalIgnoreCase))
-                    .ToList();
+                var result = await runtime.BuildEtaTableAsync(group, DateTimeOffset.UtcNow);
+                var rows = result.Rows.AsEnumerable();
 
-                if (filtered.Count > 0) rows = filtered;
+                if (!string.IsNullOrWhiteSpace(route))
+                {
+                    var filtered = rows
+                        .Where(r => r.Subscription.RouteName.Contains(route!, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+
+                    if (filtered.Count > 0) rows = filtered;
+                }
+
+                var lines = rows.Take(12).Select(r =>
+                {
+                    var when = r.LiveSeconds is { } sec ? $"約 {Math.Round(sec / 60.0)} 分鐘" : r.StatusText;
+                    return $"　• {r.Subscription.RouteName}（{(r.Subscription.Direction == 0 ? "去程" : "返程")}）" +
+                           $"{r.Subscription.BoardStopName}：{when}";
+                }).ToList();
+
+                if (lines.Count == 0 && !string.IsNullOrWhiteSpace(route))
+                    continue;   // 這一組沒有使用者問的路線就整組略過
+
+                var header = result.Simulation ? "（⚠️ 模擬資料，主機沒有 TDX 金鑰）" : "";
+                var error = result.Error is null ? "" : $"（查詢部分失敗：{result.Error}）";
+
+                blocks.Add($"{group.DescribeRoute()} {header}{error}\n" + string.Join("\n", lines));
             }
 
-            var lines = rows.Take(15).Select(r =>
-            {
-                var when = r.LiveSeconds is { } sec ? $"約 {Math.Round(sec / 60.0)} 分鐘" : r.StatusText;
-                return $"• {r.Subscription.RouteName}（{(r.Subscription.Direction == 0 ? "去程" : "返程")}）" +
-                       $"{r.Subscription.BoardStopName}：{when}";
-            });
+            if (blocks.Count == 0)
+                return string.IsNullOrWhiteSpace(route)
+                    ? "目前查不到任何到站時間。"
+                    : $"使用者訂閱的路線裡沒有「{route}」這一條（可以用 list_subscriptions 確認他訂了什麼）。";
 
-            var header = result.Simulation ? "（⚠️ 這是模擬資料，主機沒有 TDX 金鑰）\n" : "";
-            var error = result.Error is null ? "" : $"\n⚠️ 查詢部分失敗：{result.Error}";
-
-            return header + $"{group.DescribeRoute()} 的到站狀況：\n" + string.Join("\n", lines) + error;
+            return "目前訂閱的到站狀況：\n" + string.Join("\n\n", blocks);
         };
 }

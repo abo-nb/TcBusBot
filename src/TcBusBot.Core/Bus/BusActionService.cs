@@ -44,12 +44,50 @@ public sealed class BusActionService
 
         var lines = shown.Take(Math.Max(1, limit)).Select(g =>
         {
-            var names = g.Hits.Select(h => h.Entry.DisplayName).Distinct(StringComparer.Ordinal).Take(4);
-            return $"• {g.DisplayName}（{g.Hits.Count} 個站牌：{string.Join("、", names)}）";
+            // 除了站名，也把「有哪幾條路線經過」講出來 —— 模型很常需要這個才能判斷
+            // 「使用者講的是哪一個站」（同名站牌在不同路口時，經過的路線不一樣）
+            var routes = g.Hits
+                .SelectMany(h => _data.GetOccurrences(h.Entry.StopUid))
+                .Select(o => _data.GetRouteName(o.RouteUid))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(n => n, StringComparer.Ordinal)
+                .Take(5)
+                .ToList();
+
+            var names = g.Hits.Select(h => h.Entry.DisplayName)
+                              .Distinct(StringComparer.Ordinal)
+                              .Take(4);
+
+            return $"• {g.DisplayName}（{g.Hits.Count} 個站牌：{string.Join("、", names)}）" +
+                   (routes.Count > 0 ? $"\n　　經過的路線：{string.Join("、", routes)}" : "");
         });
 
         return $"「{keyword}」找到 {shown.Count} 組站牌" +
                (hidden > 0 ? $"（另外濾掉 {hidden} 組模糊相符）" : "") + "：\n" + string.Join("\n", lines);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  依路線號碼查（使用者常常只知道號碼）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>用路線號碼查路線（「300」「304」「藍1」…）。</summary>
+    public string SearchRoutes(string number, int limit = 8)
+    {
+        number = (number ?? "").Trim();
+        if (number.Length == 0) return "請給我路線號碼，例如 300、304、藍1。";
+
+        var routes = _data.FindRoutesByNumber(number, limit);
+
+        if (routes.Count == 0)
+            return $"找不到號碼符合「{number}」的路線。（可以先用 search_stops 查站牌，" +
+                   "再用 find_routes 看有哪些路線可以搭）";
+
+        var lines = routes.Select(r =>
+            $"• {r.Describe()}" +
+            (r.SampleStops.Count > 0 ? $"\n　　經過：{string.Join(" → ", r.SampleStops)}" : ""));
+
+        return $"號碼符合「{number}」的路線共 {routes.Count} 筆（同一條路線的去回程分開列）：\n" +
+               string.Join("\n", lines);
     }
 
     // ─────────────────────────────────────────────────────
@@ -67,15 +105,36 @@ public sealed class BusActionService
         var routes = _data.FindRoutes(from.Target, to.Target);
 
         if (routes.Count == 0)
-            return $"{from.Target.DisplayName} → {to.Target.DisplayName} 目前沒有直接抵達的路線" +
-                   "（可能方向不對、或需要轉乘）。";
+        {
+            // 沒有直達 → 幫忙找「轉一次」的走法（以前這裡就只回「沒有直達」，等於幫不上忙）
+            var transfers = _data.FindTransferRoutes(from.Target, to.Target);
+            var head = $"{from.Target.DisplayName} → {to.Target.DisplayName} **沒有直達路線**。";
 
-        var lines = routes.Take(15).Select(r =>
+            if (transfers.Count == 0)
+                return head + "也找不到只轉一次就到的走法（可能要轉兩次以上，或其中一段方向不對）。";
+
+            var lines = transfers.Select((t, i) => $"{i + 1}. {t.Describe()}（約 {t.TotalStops} 站）");
+
+            return head + "\n以下是**轉一次**的走法（依總站數排序，僅供參考）：\n" + string.Join("\n", lines);
+        }
+
+        var direct = routes.Take(15).Select(r =>
             $"• {r.RouteName}（{(r.Direction == 0 ? "去程" : "返程")}）" +
             $"上車：{string.Join("、", r.BoardChoices.Select(b => $"{b.BoardStopName}（第 {b.BoardSequence} 站）"))}");
 
-        return $"{from.Target.DisplayName} → {to.Target.DisplayName} 共 {routes.Count} 條路線：\n" +
-               string.Join("\n", lines);
+        var text = $"{from.Target.DisplayName} → {to.Target.DisplayName} 共 {routes.Count} 條直達路線：\n" +
+                   string.Join("\n", direct);
+
+        if (routes.Count == 1)
+        {
+            // 只有一條時，順便提一下轉乘的可能（使用者常常想比較哪個快）
+            var transfers = _data.FindTransferRoutes(from.Target, to.Target, max: 1);
+
+            if (transfers.Count > 0 && transfers[0].TotalStops < 40)
+                text += $"\n（另外也可以轉車：{transfers[0].Describe()}）";
+        }
+
+        return text;
     }
 
     // ─────────────────────────────────────────────────────

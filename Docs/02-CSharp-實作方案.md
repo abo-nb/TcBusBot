@@ -1280,6 +1280,10 @@ Step 7  按「10 分鐘」→ 更新該批訂閱並回覆：
 | `/bus status` | 顯示資料來源、輪詢間隔、訂閱數、儲存後端（管理用） |
 | `/bus end` | **結束追蹤**：一次取消自己的全部訂閱，回覆附「↩️ 復原」按鈕（§7.3.1） |
 | `/say <message>` | 讓 Bot 幫使用者說一句話（無用小功能；`SAY_ALLOWED_USERS` 可限制使用者） |
+| `/ai status` | AI 聊天狀態：模型、每週 token 用量、這個頻道的記憶、這個伺服器學到幾條規矩 |
+| `/ai learned` | 看這個伺服器學到的規矩（含自訂表情的意思，§20.11） |
+| `/ai forget` | 忘掉這個頻道的 AI 對話記憶 |
+| `/rest` | **重設這個伺服器學到的規矩**（提示詞恢復預設；可選順便清該頻道對話記憶，§20.11） |
 
 > `/say` 是唯一不是 `/bus` 群組的指令（獨立模組 `SayModule`）。
 > 它的四個設計：**不留使用指令的痕跡**（見下）、`AllowedMentions.None`
@@ -2378,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 367 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具…）
+    └─ SelfTest.cs                      ★ 406 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2388,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 367 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 406 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3027,12 +3031,14 @@ Discord/BusToolProvider       每次提問現做一份 plugin（帶著「誰在�
 
 | 工具 | 會改資料 | 說明 |
 | --- | --- | --- |
-| `search_stops` | ✗ | 模糊查站名（台/臺、縮寫） |
-| `find_routes` | ✗ | 純查詢路線 |
+| `search_stops` | ✗ | 模糊查站名（台/臺、縮寫）＋**回報有哪幾條路線經過** |
+| `search_routes` | ✗ | 用**路線號碼**查（§20.12） |
+| `find_routes` | ✗ | 純查詢路線；**沒有直達時給「轉一次」的走法**（§20.12） |
 | `list_subscriptions` | ✗ | 列出自己的訂閱 |
-| `next_arrivals` | ✗ | 到站時間（需要 TDX，用 delegate 從 Discord 那一層接進來） |
+| `next_arrivals` | ✗ | 到站時間（需要 TDX，用 delegate 從 Discord 那一層接進來；所有訂閱組都會查） |
 | `subscribe_bus` | ✅ | 真的建立訂閱 |
 | `cancel_all_subscriptions` | ✅ | 真的取消（並回傳內容讓 Bot 掛「↩️ 復原」） |
+| `remember_rule` / `list_rules` / `forget_rule` | ✅ | 修改**這個伺服器**的提示詞（§20.11） |
 
 **安全性設計**：
 
@@ -3108,6 +3114,74 @@ Discord/BusToolProvider       每次提問現做一份 plugin（帶著「誰在�
 
 驗收：`tcbus selftest` 第 23 節（**17 項**，用假的 HttpMessageHandler 攔下送出的 body 來驗，
 完全不需要網路）＋ 真實 API 實測（思考關掉後**工具呼叫與話題判斷都仍然正常**）。
+
+### 20.11 可以被「馴服」的提示詞（每個伺服器一份，`/rest` 重設）
+
+需求是「讓機器人修改自己的提示詞以被馴服，但只限那個伺服器，而且可以用 `/rest` 重設」。
+**不能**直接改 `LLM_SYSTEM_PROMPT` —— 那是主機端的設定，一改就是所有伺服器一起變。
+
+所以改成三層疊起來的系統提示（`ChatOrchestrator.EffectiveSystemPrompt(guildId)`）：
+
+```
+[主機的 LLM_SYSTEM_PROMPT]     ← 人格、語言、範圍（只有主機端能改）
+[工具的規則]                   ← 由程式附加（能力說明；LLM_TOOLS=false 時不加）
+[這個伺服器學到的規則]         ← ★ 這裡（AI 自己或使用者都可以加）
+```
+
+⚠️ **順序有意義**：學到的規則放最後。模型對「最後的指示」通常最聽話，
+這樣「講話再簡短一點」才壓得過前面那些通用規則。
+
+實作：`Core/Chat/GuildPersonaStore.cs`
+
+| 特性 | 做法 | 為什麼 |
+| --- | --- | --- |
+| 只影響一個伺服器 | key 是 GuildId，`Overlay(guildId)` 只讀自己那份 | 實測：在 B 伺服器問「我教過你什麼」→ 它說「這個伺服器沒有記下任何規矩」 |
+| 可以由對話教 | 工具 `remember_rule` / `list_rules` / `forget_rule`（`persona` plugin） | 使用者只要 @ 它講「記住…」就會生效 |
+| 自訂表情 | 就記成一句「表情名稱 是 意思」 | Discord 的自訂表情**每個伺服器各自一組**，這種知識只對該伺服器有意義 |
+| 不會被當記事本 | 每伺服器 ≤ 40 條、每條 ≤ 300 字、overlay ≤ 2000 字；完全相同的不重複加 | 提示詞是有成本的（token），也怕被塞爆 |
+| 可以重設 | `/rest`（`ResetModule`）：清掉該伺服器的規則（可選順便清該頻道對話記憶），並**原文列出清掉的內容** | 教壞了想重來只要三個字；列出來是為了讓想留的人可以複製回去 |
+| 看得到學了什麼 | `/ai learned`；`/ai status` 也會顯示條數 | 「看不到的東西」不該存在 |
+| 跨重啟保留 | 借 `ILlmStateStore` 的 blob（MongoDB／SQLite／文字檔／記憶體） | 學到的東西重開就不見會很氣人 |
+
+實測（真實 API）：
+
+```
+「記住：以後回話都要在最後加一個「喵」」 → remember_rule → 下一句真的加喵 ✅
+「記住：<:cat_cry:123456789> 這個表情是委屈」 → 記成「cat_cry 是委屈的意思…」✅
+另一台伺服器問同一件事 → 「這個伺服器沒有記下任何規矩」（提示詞長度 845 → 711）✅
+/rest → 清掉 2 條、提示詞回到 711 字、B 不受影響 ✅
+```
+
+### 20.12 公車查詢加強（原本「找公車的能力有點弱」）
+
+| 加了什麼 | 說明 |
+| --- | --- |
+| `search_routes`（新工具） | 用**路線號碼**查（「300 到哪裡」「304 幾站」）。以前只能靠站名，使用者只講號碼時就幫不上忙 |
+| **轉乘建議** | 沒有直達時，`FindTransferRoutes` 會給「轉一次」的走法（依總站數排序），`find_routes` 直接附在回覆裡 |
+| `search_stops` 更完整 | 除了站名，還回報**有哪幾條路線經過** —— 模型才判斷得出「同名站牌在不同路口」時是哪一個 |
+| `next_arrivals` 修好 | 以前只看「最後一組」訂閱，現在**所有訂閱組都會查** |
+
+**轉乘用「站名」比對，不是 StopUID**：台中同一條路上常有同名不同 UID 的月台
+（去回程各一組、專用道與慢車道各一組），用 UID 比對幾乎找不到轉乘點，
+但用站名比對就完全符合「同一個路口換車」的直覺。
+做法是在 `TripStops` 多建一份「正規化站名 → 第一次出現的站序」索引
+（`StopNameNormalizer.ForSearch`，所以「臺中車站」與「台中車站」也算同一個）。
+
+**兩個真實資料上抓到的問題（都已修）**：
+
+1. **「搭 0 站就轉乘」的廢話**：第一版允許「在干城站上車 → 在干城站下車（0 站），轉 303」
+   ——那不是轉乘，只是換月台。現在兩段都至少要搭 1 站，
+   並加了**用真實快取資料**跑的迴歸測試（`selftest` 第 25 節，檢查 3 組起訖都不會出現 0 站）
+2. **站名變成代號**：不是每份資料的 `StopOfRoute` 都帶站名（我們的離線 fixture 就只有 StopUID），
+   於是路線查詢會吐出 `TXG13567`。現在 `Load` 會從站牌清單**補齊站名**再建站名索引
+
+實測（真實資料集 14,036 站牌／755 筆站序，全部 < 5 ms）：
+
+```
+靜宜大學 → 逢甲大學：直達 0 條 → 搭 300 到秋紅谷（11 站），轉 63 → 逢甲大學（5 站）✅
+新民高中 → 霧峰    ：搭 105 到寶覺寺（1 站），轉 200 → 霧峰農工（34 站）✅
+干城站  → 東海別墅：直達 2 條；另外也找得到轉乘走法 ✅
+```
 
 ---
 
