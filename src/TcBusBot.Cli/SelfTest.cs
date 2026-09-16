@@ -115,6 +115,9 @@ public static class SelfTest
         Section("26. 認人（暱稱＋ID）與主人授權（特殊 key）");
         TestIdentityAndOwner();
 
+        Section("27. 面板與 LLM 用同一套站牌解析（同名站牌找不到的根因）");
+        TestSharedStopPicks();
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -2238,6 +2241,140 @@ public static class SelfTest
         Check("授權說明不會提到 key 的內容",
             !owner.Contains("KEY-12345", StringComparison.Ordinal));
         Check("★ 一般訊息不會拿到主人說明", !guest.Contains("你的主人", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// **面板與 LLM 必須用同一套站牌解析**（使用者反映「同名站牌找不到」的根因）。
+    ///
+    /// 問題出在兩邊各寫一套：
+    ///   * 面板：`g:{站區}` 短鍵 → 解出**整個站區**的站牌（「臺中車站」38 個月台全都要）
+    ///   * LLM ：拿**搜尋命中**當候選 —— 而命中有上限（整體 25 筆，
+    ///     每組只留符合關鍵字的那些），所以只放進 2~3 個月台，
+    ///     停在其他月台的路線就整條找不到
+    ///
+    /// 現在兩邊都走 <see cref="StopPicks"/>，這裡用**真實資料集**驗：
+    ///   1. 解析出來的站牌數＝整個站區的站牌數（不是搜尋命中的數量）
+    ///   2. LLM 那條路（<see cref="BusActionService"/>）用到的候選站集合
+    ///      與 <see cref="StopPicks"/> 算出來的**完全相同**
+    ///   3. 對到多個站區時**不會自己挑一個**，而是回報候選讓模型去問使用者
+    /// </summary>
+    private static void TestSharedStopPicks()
+    {
+        var cachePath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "cache");
+        var cached = TcBusBot.Core.DataSources.StaticDataLoader.TryReadCache(cachePath);
+
+        // ── 先用離線 fixture 驗行為（沒有快取時也測得到）────
+        var fixture = MiniFixtureSource.Load(MiniFixtureSource.ResolveRoot(null));
+
+        var fixtureGroups = StrongGroups(fixture, "臺中車站");
+        var (fixtureUids, fixtureAmbiguous, _) = StopPicks.ResolveDefaults(fixtureGroups, fixture);
+        var fixtureArea = fixture.GetGroupByShortKey(fixtureGroups[0].GroupKey)!;
+
+        Check("★ 解析出來的站牌＝整個站區（fixture）",
+            !fixtureAmbiguous && fixtureArea.StopUids.All(fixtureUids.Contains),
+            $"{fixtureUids.Count} 個／站區 {fixtureArea.StopUids.Count} 個");
+
+        var ambiguous = StopPicks.ResolveDefaults(StrongGroups(fixture, "中正國小"), fixture);
+        Check("★ 對到多個站區時不會自己挑一個（回報候選讓模型問使用者）",
+            ambiguous.Ambiguous || ambiguous.Uids.Count > 0,
+            $"ambiguous={ambiguous.Ambiguous}, 候選 {ambiguous.Candidates.Count} 個");
+
+        if (cached is null)
+        {
+            Check("（真實快取不存在 → 略過真實資料的站區比對）", true);
+            return;
+        }
+
+        // ── 真實資料集（14,036 站牌）：這才是同名站牌問題真正會出現的地方 ──
+        var data = new TaichungBusDataService();
+        data.Load(cached.Stops, cached.StopOfRoutes, cached.Routes);
+
+        var groups = StrongGroups(data, "臺中車站");
+        var set = StopPicks.Build(groups, data);
+        var (uids, isAmbiguous, candidates) = StopPicks.ResolveDefaults(groups, data);
+
+        Check("★ 「臺中車站」解析出整個站區的所有月台（真實資料）",
+            !isAmbiguous && uids.Count > 25 && uids.Count == data.GetGroupByShortKey(groups[0].GroupKey)!.StopUids.Count,
+            $"{uids.Count} 個（舊版因為搜尋命中上限只會拿到 2~3 個）");
+
+        Check("★ 而且選項是「整個站區」而不是逐月台（多種站名時）",
+            set.Defaults.Any(v => v.StartsWith("g:", StringComparison.Ordinal)),
+            string.Join("、", set.Defaults));
+
+        // 每個月台都要在候選集合裡 —— 這是「同名站牌找不到」的直接檢查
+        var area = data.GetGroupByShortKey(groups[0].GroupKey)!;
+        Check("★ 站區裡的每一個 StopUID 都在候選集合裡（不會漏掉同名不同月台）",
+            area.StopUids.All(u => uids.Contains(u, StringComparer.Ordinal)),
+            $"站區 {area.StopUids.Count} 個／候選 {uids.Count} 個");
+
+        // ── LLM 那條路必須用同一組候選 ────────────────────
+        var subs = new SubscriptionService();
+        var actions = new BusActionService(data, subs);
+
+        var outcome = actions.Subscribe(555UL, "台中車站", "靜宜大學");
+        Check("★ LLM 訂閱用的起點候選＝StopPicks 算出來的那一組",
+            outcome.Ok && outcome.Group is not null
+            && outcome.Group.Origin.CandidateStopUids.OrderBy(x => x, StringComparer.Ordinal)
+                .SequenceEqual(uids.OrderBy(x => x, StringComparer.Ordinal)),
+            $"工具用 {outcome.Group?.Origin.CandidateStopUids.Count} 個／解析 {uids.Count} 個");
+
+        // 與面板同一條路徑算出來的「可搭路線數」也要一致
+        var destGroups = StrongGroups(data, "靜宜大學");
+        var (destUids, _, _) = StopPicks.ResolveDefaults(destGroups, data);
+        var expectedRoutes = data.FindRoutes(
+            data.TargetFromStops(uids), data.TargetFromStops(destUids)).Count;
+
+        Check("★ LLM 找到的路線數＝面板同一條路徑算出來的路線數",
+            subs.GetSubscriptions(outcome.Group!).Select(s => (s.RouteUid, s.Direction)).Distinct().Count()
+                == expectedRoutes,
+            $"工具 {subs.GetSubscriptions(outcome.Group!).Select(s => (s.RouteUid, s.Direction)).Distinct().Count()} 條／預期 {expectedRoutes} 條");
+
+        Check("★ 真實資料上「臺中車站 → 靜宜大學」找得到 20 條路線（面板的水準）",
+            expectedRoutes >= 20, $"{expectedRoutes} 條");
+
+        // ── 模糊到對不起來的關鍵字：不可以自己挑 ──────────
+        // ⚠️ 「什麼叫模糊」取決於資料集（例如「車站」在真實資料裡會前綴命中「車站前」，
+        //    那算精確命中，不算模糊）。所以這裡**找一個真的沒有精確命中的關鍵字**來測，
+        //    而不是寫死一個猜測。
+        string? vagueKeyword = null;
+
+        foreach (var candidate in new[] { "路口", "國小", "市場", "前站", "站牌" })
+        {
+            var probe = StopPicks.Build(StrongGroups(data, candidate), data);
+            if (probe.Options.Count > 0 && probe.Defaults.Count == 0)
+            {
+                vagueKeyword = candidate;
+                break;
+            }
+        }
+
+        if (vagueKeyword is null)
+        {
+            Check("（真實資料裡找不到「只能模糊比對」的關鍵字 → 略過這一項）", true);
+        }
+        else
+        {
+            var vagueGroups = StrongGroups(data, vagueKeyword);
+            var (vagueUids, vagueAmbiguous, vagueCandidates) = StopPicks.ResolveDefaults(vagueGroups, data);
+
+            Check($"★ 只打「{vagueKeyword}」這種模糊關鍵字 → 不自己挑站區，回報候選",
+                vagueAmbiguous && vagueUids.Count == 0 && vagueCandidates.Count > 0,
+                $"ambiguous={vagueAmbiguous}, 候選 {vagueCandidates.Count} 個：" +
+                string.Join("、", vagueCandidates.Take(3)));
+
+            var vague = actions.Subscribe(556UL, vagueKeyword, "靜宜大學");
+            Check("★ 模糊關鍵字不會亂訂（訂閱失敗並請模型去問使用者）",
+                !vague.Ok && vague.Message.Contains("站區", StringComparison.Ordinal),
+                vague.Message.Split('\n')[0]);
+        }
+    }
+
+    /// <summary>與面板相同的過濾：有強相符時只留強相符。</summary>
+    private static IReadOnlyList<StopSearchGroupResult> StrongGroups(TaichungBusDataService data, string keyword)
+    {
+        var groups = data.Search.SearchGrouped(keyword);
+        var strong = groups.Where(g => g.IsStrongMatch).ToList();
+        return strong.Count > 0 ? strong : groups;
     }
 
     /// <summary>

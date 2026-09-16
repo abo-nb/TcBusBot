@@ -224,22 +224,37 @@ public static class Program
 
     private static LocationTarget? ResolveTarget(TaichungBusDataService data, string keyword, string label)
     {
-        var groups = data.Search.SearchGrouped(keyword);
-        if (groups.Count == 0)
+        // ★ 與面板／LLM 工具走同一份站牌解析（StopPicks），不要自己再寫一套 ——
+        //   以前這裡取 groups[0]，LLM 那條路取搜尋命中，三套不一致，
+    //   就出現「同名站牌找不到」的災難。
+        var (shown, hidden) = PreferStrong(data.Search.SearchGrouped(keyword));
+        var (uids, ambiguous, candidates) = StopPicks.ResolveDefaults(shown, data);
+
+        if (ambiguous)
+        {
+            Console.Error.WriteLine($"{label}：「{keyword}」對到多個站區，" +
+                                    $"請說清楚是哪一個（候選：{string.Join("、", candidates)}）");
+            return null;
+        }
+
+        if (uids.Count == 0)
         {
             Console.Error.WriteLine($"{label}：找不到「{keyword}」");
             return null;
         }
 
-        // 取最相符的那一組當候選集合（真實 UI 會讓使用者勾選、可再增減）
-        var g = groups[0];
-        var area = data.GetGroupByShortKey(g.GroupKey);
-        var uids = area?.StopUids ?? g.Hits.Select(h => h.Entry.StopUid).ToArray();
-
-        Console.WriteLine($"[{label}] 「{keyword}」→ 建議群組「{g.DisplayName}」{uids.Count} 個站牌" +
-                          (groups.Count > 1 ? $"（另有 {groups.Count - 1} 組相符）" : ""));
+        Console.WriteLine($"[{label}] 「{keyword}」→ {uids.Count} 個候選站牌" +
+                          (hidden > 0 ? $"（濾掉 {hidden} 組模糊相符）" : ""));
 
         return data.TargetFromStops(uids);
+    }
+
+    /// <summary>與面板相同的過濾：有強相符時只留強相符。</summary>
+    private static (List<StopSearchGroupResult> Shown, int HiddenFuzzy) PreferStrong(
+        IReadOnlyList<StopSearchGroupResult> groups)
+    {
+        var strong = groups.Where(g => g.IsStrongMatch).ToList();
+        return strong.Count > 0 ? (strong, groups.Count - strong.Count) : (groups.ToList(), 0);
     }
 
     private static string DirLabel(int direction)

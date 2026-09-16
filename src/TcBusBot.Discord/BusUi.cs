@@ -236,152 +236,64 @@ public static class BusUi
     /// <summary>
     /// 把選項的值解析成 StopUID 清單 —— 與 <see cref="BuildStopOptions"/> 對稱。
     ///
-    ///   `g:{群組ShortKey}`        → 該建議群組的全部站牌
-    ///   `n:{群組ShortKey}:{索引}`  → 該群組裡第 N 種站名的全部站牌
-    ///   `s:UID1,UID2,...`         → 直接指定（保留相容用）
+    /// ⚠️ 實作在 <see cref="StopPicks.Resolve"/>：**LLM 工具走的是同一份**。
+    /// 之前兩邊各寫一次，結果 LLM 那版拿「搜尋命中」當候選（有 25 筆上限），
+    /// 同名站牌就找不到 —— 面板與 AI 對同一句話必須給出同一組站牌。
     /// </summary>
     public static List<string> ResolveStopValues(
         IEnumerable<string> values, TaichungBusDataService data)
-    {
-        var uids = new List<string>();
-
-        foreach (var v in values)
-        {
-            if (v.StartsWith("g:", StringComparison.Ordinal))
-            {
-                var group = data.GetGroupByShortKey(v[2..]);
-                if (group is not null) uids.AddRange(group.StopUids);
-            }
-            else if (v.StartsWith("n:", StringComparison.Ordinal))
-            {
-                var parts = v[2..].Split(':');
-                if (parts.Length == 2 && int.TryParse(parts[1], out var idx))
-                    uids.AddRange(data.GetGroupNameStopUids(parts[0], idx));
-            }
-            else if (v.StartsWith("s:", StringComparison.Ordinal))
-            {
-                foreach (var uid in v[2..].Split(',', StringSplitOptions.RemoveEmptyEntries))
-                    uids.Add(uid.Trim());
-            }
-        }
-
-        return uids.Distinct(StringComparer.Ordinal).ToList();
-    }
+        => StopPicks.Resolve(values, data);
 
     /// <summary>使用者沒有手動勾選時，預設要勾的項目（強相符的群組／站牌）。</summary>
     public static List<string> DefaultStopPicks(
         IReadOnlyList<StopSearchGroupResult> groups, TaichungBusDataService data)
-        => BuildStopOptions(groups, data, Array.Empty<string>()).StrongDefaults;
+        => StopPicks.Build(groups, data).Defaults.ToList();
 
     /// <summary>「全選」要帶入的值 —— 必須與實際存在的選項完全一致。</summary>
     public static List<string> AllStopValues(
         IReadOnlyList<StopSearchGroupResult> groups, TaichungBusDataService data)
-        => BuildStopOptions(groups, data, Array.Empty<string>()).AllValues;
-
-    /// <summary>一次「挑站牌」所需的選項、預設勾選、全部值。</summary>
-    private sealed record StopOptions(
-        List<SelectMenuOptionBuilder> Options,
-        List<string> StrongDefaults,
-        List<string> AllValues);
+        => StopPicks.Build(groups, data).AllValues.ToList();
 
     /// <summary>
     /// 把搜尋結果變成選項。
     ///
-    /// 規則（重點是**同名站牌要合併**，以及**值不能超長**）：
-    ///   * 每個「站名」一個選項，同名但有多個 StopUID（去回程／不同月台／
-    ///     每個路線方向各自登記）會合併成同一個選項。
-    ///   * 選項的值用**短鍵**：`g:{群組ShortKey}`（整個站區）或
-    ///     `n:{群組ShortKey}:{站名索引}`（該站區裡的某個站名）。
-    ///     ⚠️ **不能把 StopUID 串進 value** —— 「國立臺中科技大學」有 44 個同名站牌，
-    ///     串起來約 400 字元會超過 Discord 的 100 字元上限而被截斷，
-    ///     候選集合少掉大半就會「明明有 11 條路線卻只找到 1 條」（實際踩過）。
-    ///   * 一個站區內有多種站名時，最前面額外給一個「整個站區」的選項。
-    ///   * 「全選」與「預設勾選」都由此函式推導，確保帶入的值一定存在於選項中
-    ///     （Discord 會驗證送出的值必須是選項之一）。
-    ///   * Discord 的 String Select 上限是 25 個選項，超過就截斷。
+    /// ⚠️ 規則全部在 <see cref="StopPicks.Build"/>（與 LLM 工具共用同一份），
+    /// 這裡只負責把純資料轉成 Discord 的 Select Menu，並套用 Discord 的長度限制。
     /// </summary>
     private static StopOptions BuildStopOptions(
         IReadOnlyList<StopSearchGroupResult> groups,
         TaichungBusDataService data,
         IReadOnlyCollection<string> selected)
     {
-        const int maxOptions = 25;
+        var set = StopPicks.Build(groups, data, selected);
         var list = new List<SelectMenuOptionBuilder>();
-        var defaults = new List<string>();
-        var all = new List<string>();
-        var picked = new HashSet<string>(selected, StringComparer.Ordinal);
 
-        void Add(string value, string label, string description, bool isDefault)
+        foreach (var option in set.Options)
         {
             // 值超長一定是設計錯誤（Discord 上限 100），大聲說出來而不是默默截斷
-            if (value.Length > 100)
-                Console.WriteLine($"[ui] ⚠️ 選項 value 超過 100 字元（{value.Length}）：{value[..40]}… " +
-                                  "請改用短鍵，不要塞 StopUID。");
+            if (option.Value.Length > 100)
+                Console.WriteLine($"[ui] ⚠️ 選項 value 超過 100 字元（{option.Value.Length}）：" +
+                                  $"{option.Value[..40]}… 請改用短鍵，不要塞 StopUID。");
 
-            var opt = new SelectMenuOptionBuilder()
-                .WithLabel(Truncate(label, 100))
-                .WithValue(Truncate(value, 100))
-                .WithDescription(Truncate(description, 100));
+            var builder = new SelectMenuOptionBuilder()
+                .WithLabel(Truncate(option.Label, 100))
+                .WithValue(Truncate(option.Value, 100))
+                .WithDescription(Truncate(option.Description, 100));
 
-            if (isDefault) opt.WithDefault(true);
+            if (option.IsDefault) builder.WithDefault(true);
 
-            list.Add(opt);
-            all.Add(value);
-            if (isDefault) defaults.Add(value);
+            list.Add(builder);
         }
 
-        foreach (var g in groups)
-        {
-            if (list.Count >= maxOptions) break;
-
-            // 由資料服務推導（不是用搜尋命中），確保與之後解析短鍵時看到的是同一份
-            var byName = data.GetGroupNameBreakdown(g.GroupKey);
-            if (byName.Count == 0) continue;
-
-            // 只有 1 種站名時不需要「整個站區」選項（會與那唯一的選項重複）
-            if (byName.Count > 1 && list.Count < maxOptions)
-            {
-                var groupValue = $"g:{g.GroupKey}";
-                var totalStops = byName.Sum(n => n.StopUids.Count);
-
-                Add(groupValue,
-                    $"{g.DisplayName}（全部 {totalStops} 個）",
-                    "整個站區",
-                    picked.Contains(groupValue) || (picked.Count == 0 && g.IsDefaultPick));
-            }
-
-            for (var i = 0; i < byName.Count; i++)
-            {
-                if (list.Count >= maxOptions) break;
-
-                var (name, uids, routeCount) = byName[i];
-                var value = $"n:{g.GroupKey}:{i}";
-
-                // 預設勾選：使用者勾過就沿用；否則在「精確命中且只有一種站名」時預設勾選
-                //（多種站名時上面那個「整個站區」已經代表精確命中了）
-                // ⚠️ 用 IsDefaultPick 而不是 IsStrongMatch：搜「车站」會顯示 22 組，
-                //    但那些只是子字串相符，不該全部預設勾起來。
-                var isDefault = picked.Contains(value)
-                                || (picked.Count == 0 && g.IsDefaultPick && byName.Count == 1);
-
-                var desc = uids.Count > 1
-                    ? $"{g.DisplayName}｜同站 {uids.Count} 個站牌｜經過 {routeCount} 條路線"
-                    : $"{g.DisplayName}｜經過 {routeCount} 條路線";
-
-                Add(value, name, desc, isDefault);
-            }
-        }
-
-        // 只有一個選項時就直接預設勾選 —— 使用者的意圖再明顯不過，
-        // 不該讓他按了「確認」還被說「沒有選到任何站牌」。
-        if (all.Count == 1 && defaults.Count == 0)
-        {
-            list[0].WithDefault(true);
-            defaults.Add(all[0]);
-        }
-
-        return new StopOptions(list, defaults, all);
+        return new StopOptions(list, set.Defaults.ToList(), set.AllValues.ToList());
     }
+
+
+    /// <summary>一次「挑站牌」所需的選項、預設勾選、全部值。</summary>
+    private sealed record StopOptions(
+        List<SelectMenuOptionBuilder> Options,
+        List<string> StrongDefaults,
+        List<string> AllValues);
 
     public static Embed PickedSummary(bool isOrigin, IReadOnlyList<string> stopUids,
         IReadOnlyList<string> groupNames, TaichungBusDataService data)

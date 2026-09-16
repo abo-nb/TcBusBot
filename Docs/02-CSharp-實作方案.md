@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 445 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞…）
+    └─ SelfTest.cs                      ★ 455 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 445 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 455 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3241,6 +3241,52 @@ LLM_ADMIN_KEY=OWNER-xxxxx  # 特殊 key（沒設定 → 整個機制關閉，fai
 一般訊息看不到主人說明、但看得到全域規則；模型還會自己區分
 「伺服器規則兩條 ＋ 全域規則一條」。
 
+
+### 20.14 面板與 LLM 共用站牌解析（「同名站牌找不到」的根因）
+
+使用者反映「AI 找公車也會有同名站牌找不到的問題」——根因是**兩邊各寫一套**：
+
+| | 舊行為 |
+| --- | --- |
+| 面板（`BusUi`） | 選項值用短鍵 `g:{站區}`，解析時取 `GetGroupByShortKey(key).StopUids`＝**整個站區**的站牌 |
+| LLM（`BusActionService`） | 拿 `StopSearchGroupResult.Hits` 當候選 —— 而命中數**有上限**（整體 25 筆，每組只留符合關鍵字的那些） |
+
+所以「臺中車站」38 個月台只會被放進 2~3 個，停在**其他月台**的路線就整條找不到 ——
+而面板按同一顆按鈕是找得到的。這正是兩個入口對同一句話給出不同答案的原因。
+
+修法：把「搜尋結果 → 可選站牌 → StopUID 集合」抽成 Core 的 **`StopPicks`**（唯一一份實作），
+三個入口全部改成用它：
+
+```
+StopPicks.Build(groups, data)           → 選項（短鍵 g:/n:）、預設勾選、全部值
+StopPicks.Resolve(values, data)         → StopUID 清單
+StopPicks.ResolveDefaults(groups, data) → (站牌, 是否模糊到不能自己挑, 候選清單)
+
+BusUi（面板）      → Build 的結果轉成 Select Menu；Resolve／Defaults／AllValues 直接轉呼叫
+BusActionService   → ResolveDefaults；模糊到對不起來時**拒絕動手**，回報候選讓模型去問
+tcbus route（CLI） → 同一條路徑（以前是第三套實作：取 groups[0]）
+```
+
+**關鍵規則**（都寫在 `StopPicks` 的註解裡，改壞會直接影響使用者）：
+
+* 站區內只有一種站名時不給「整個站區」選項（避免與那唯一的選項重複）
+* 值用短鍵，**不能塞 StopUID** —— 「國立臺中科技大學」有 44 個同名站牌，
+  串起來約 400 字元會超過 Discord 的 100 字元上限而被截斷（曾造成「11 條路線只找到 1 條」）
+* 預設勾選用 `IsDefaultPick`（精確命中）而不是 `IsStrongMatch` ——
+  搜「车站」會顯示 22 組，但那些只是子字串相符，不該全部預設勾起來
+* 沒有任何精確命中時**不自己挑一個**（那正是訂錯路線的來源），回報候選讓呼叫端去問
+
+驗收：
+
+| 檢查 | 在哪 |
+| --- | --- |
+| 真實資料上「臺中車站」解析出**整個站區 38 個**站牌、與面板同路徑得到 **20 條路線**；LLM 訂閱用的候選站集合＝`StopPicks` 算出來的那一組；模糊關鍵字不會亂訂 | `tcbus selftest` 第 27 節（**10 項**，用真實快取資料） |
+| 面板與 Core 算出同一組站牌、面板每個選單選項值都解析得出站牌、解析涵蓋整個站區 | `--dryrun` 的「站牌解析檢查」（與 Bot 同一份 `BusUi`） |
+| 用嘴巴訂閱的實際結果 | 真實 API ＋ 真實資料集：`subscribe_bus` → 20 筆訂閱、38 個候選站牌（與面板相同） |
+
+> 順便修掉：「車站前(和平路)」這種**前綴命中**在規則上算「精確」（所以會直接採用），
+> 而「路口」這種只符合子字串的會被判定成模糊 → 測試因此改成
+> **動態找出一個真的沒有精確命中的關鍵字**來驗，而不是寫死一個猜測。
 
 ---
 

@@ -443,6 +443,9 @@ public static class DryRun
         // ── 元件與處理函式的雙向接線檢查 ────────────────────
         AuditWiring();
 
+        // ── 面板與 LLM 共用同一份站牌解析 ────────────────────
+        AuditStopPicks(data);
+
         // ── DI 容器（與真正的 Bot 用同一份註冊程式碼）──────────
         using var client = new DiscordSocketClient(new DiscordSocketConfig
         {
@@ -1637,6 +1640,91 @@ public static class DryRun
         cells.Add(current.ToString());
         return cells;
     }
+
+    /// <summary>
+    /// **面板（<see cref="BusUi"/>）與 Core 的 <see cref="StopPicks"/> 必須是同一份邏輯**。
+    ///
+    /// 為什麼要專門驗這個：使用者反映「AI 找公車會有同名站牌找不到的問題」，
+    /// 根因就是兩邊各寫一套 —— 面板按 `g:{站區}` 短鍵時解出的是**整個站區**的站牌，
+    /// 而 LLM 那條路當時拿的是**搜尋命中**（有 25 筆上限、每組只留符合關鍵字的那些），
+    /// 於是「臺中車站」38 個月台只被放進 2~3 個，停在其他月台的路線整條找不到。
+    ///
+    /// 這裡驗三件事（都在離線、真實資料集上跑）：
+    ///   1. 面板算出來的預設勾選 ＝ Core 算出來的預設勾選
+    ///   2. 面板的 Select Menu 裡每一個選項值，都能被 Core 解析回非空的站牌
+    ///      （順便確認值沒有被 Discord 的 100 字元上限截斷 —— 那會安靜地少掉候選站）
+    ///   3. 解析出來的站牌數＝整個站區的站牌數（不是搜尋命中的數量）
+    /// </summary>
+    private static void AuditStopPicks(TaichungBusDataService data)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 站牌解析檢查  面板（BusUi）↔ LLM 工具（StopPicks）");
+
+        var keywords = new[] { "臺中車站", "台中車站", "靜宜大學", "干城站", "臺中科大" };
+        var checkedCount = 0;
+
+        foreach (var keyword in keywords)
+        {
+            var groups = data.Search.SearchGrouped(keyword);
+            var strong = groups.Where(g => g.IsStrongMatch).ToList();
+            if (strong.Count == 0) continue;
+
+            checkedCount++;
+
+            // 1) 預設勾選要完全一致
+            var uiDefaults = BusUi.DefaultStopPicks(strong, data);
+            var coreDefaults = StopPicks.Build(strong, data).Defaults.ToList();
+
+            if (!uiDefaults.SequenceEqual(coreDefaults, StringComparer.Ordinal))
+                Problem($"「{keyword}」面板與工具的預設勾選不一致：" +
+                        $"面板 [{string.Join(",", uiDefaults)}]／工具 [{string.Join(",", coreDefaults)}]");
+
+            // 2) 面板的每個選項值都要能被解析回站牌
+            var components = BusUi.SearchComponents(true, strong, data, Array.Empty<string>());
+            var optionValues = SelectOptionValues(components);
+
+            if (optionValues.Count == 0)
+            {
+                Problem($"「{keyword}」面板沒有產生任何站牌選項");
+                continue;
+            }
+
+            foreach (var value in optionValues)
+            {
+                var uids = BusUi.ResolveStopValues([value], data);
+
+                if (uids.Count == 0)
+                    Problem($"「{keyword}」選項 {value} 解析不出任何站牌（值被截斷或短鍵壞了？）");
+            }
+
+            // 3) 解析出來的站牌＝整個站區
+            var uidsFromUi = BusUi.ResolveStopValues(uiDefaults, data);
+            var area = data.GetGroupByShortKey(strong[0].GroupKey);
+
+            if (area is not null && uiDefaults.Any(v => v.StartsWith("g:", StringComparison.Ordinal)))
+            {
+                if (!area.StopUids.All(uidsFromUi.Contains))
+                    Problem($"「{keyword}」解出來的站牌沒有涵蓋整個站區" +
+                            $"（{uidsFromUi.Count}／{area.StopUids.Count}）");
+            }
+        }
+
+        if (checkedCount == 0)
+            Console.WriteLine("  ℹ 這個資料集沒有任何強相符的站名可以比對（略過）");
+        else
+            Console.WriteLine($"  ✔ {checkedCount} 組關鍵字：面板與 LLM 工具算出同一組站牌" +
+                              "（含同名不同月台，不會漏）");
+    }
+
+    /// <summary>把元件裡所有 Select Menu 的選項值抓出來。</summary>
+    private static List<string> SelectOptionValues(MessageComponent components)
+        => components.Components
+            .OfType<ActionRowComponent>()
+            .SelectMany(row => row.Components)
+            .OfType<SelectMenuComponent>()
+            .SelectMany(menu => menu.Options)
+            .Select(o => o.Value)
+            .ToList();
 
     /// <summary>
     /// **DI 容器檢查**：用與真正的 Bot 完全相同的註冊程式碼（<see cref="BotServices.Create"/>）

@@ -23,9 +23,6 @@ public sealed class BusActionService
         _subs = subs;
     }
 
-    /// <summary>預設最多帶幾個候選站進匹配（太多會讓「同站區不同站名」全部命中而失去精準度）。</summary>
-    public const int MaxGroupsPerKeyword = 3;
-
     // ─────────────────────────────────────────────────────
     //  站牌搜尋（給模型看的文字）
     // ─────────────────────────────────────────────────────
@@ -99,8 +96,11 @@ public sealed class BusActionService
         var from = Resolve(origin);
         var to = Resolve(destination);
 
-        if (from.Uids.Count == 0) return $"找不到起點「{origin}」的站牌。";
-        if (to.Uids.Count == 0) return $"找不到終點「{destination}」的站牌。";
+        if (from.Uids.Count == 0)
+            return $"起點：{DescribeUnresolved(origin, from)}";
+
+        if (to.Uids.Count == 0)
+            return $"終點：{DescribeUnresolved(destination, to)}";
 
         var routes = _data.FindRoutes(from.Target, to.Target);
 
@@ -168,14 +168,11 @@ public sealed class BusActionService
         var to = Resolve(destination);
 
         if (from.Uids.Count == 0)
-            return new SubscribeOutcome(false,
-                $"找不到起點「{origin}」。請先問使用者正確的站名，或用 search_stops 查。" +
-                $"這份資料集裡有的站名例如：{string.Join("、", _data.ExampleStopNames(4))}。",
+            return new SubscribeOutcome(false, $"起點：{DescribeUnresolved(origin, from)}",
                 null, null, null, []);
 
         if (to.Uids.Count == 0)
-            return new SubscribeOutcome(false,
-                $"找不到終點「{destination}」。請先問使用者正確的站名，或用 search_stops 查。",
+            return new SubscribeOutcome(false, $"終點：{DescribeUnresolved(destination, to)}",
                 null, null, null, []);
 
         var routes = _data.FindRoutes(from.Target, to.Target);
@@ -199,10 +196,6 @@ public sealed class BusActionService
             channelId: channelId);
 
         var warnings = new List<string>();
-        if (from.Uids.Count > 0 && from.WeakMatch)
-            warnings.Add($"起點「{origin}」是模糊相符（{from.Target.DisplayName}）");
-        if (to.WeakMatch)
-            warnings.Add($"終點「{destination}」是模糊相符（{to.Target.DisplayName}）");
 
         var lines = _subs.GetSubscriptions(group).Take(10).Select(s =>
             $"• {s.RouteName}（{(s.Direction == 0 ? "去程" : "返程")}）" +
@@ -275,43 +268,61 @@ public sealed class BusActionService
     //  內部：站名關鍵字 → 候選站牌集合
     // ─────────────────────────────────────────────────────
 
-    private sealed record Resolved(LocationTarget Target, List<string> Uids, bool WeakMatch);
+    private sealed record Resolved(
+        LocationTarget Target,
+        List<string> Uids,
+        bool WeakMatch,
+        bool Ambiguous,
+        IReadOnlyList<string> Candidates);
 
     /// <summary>
     /// 把口語站名展開成候選 StopUID 集合。
     ///
-    /// 規則與面板的「預設勾選」一致（見 BusUi.BuildStopOptions）：
-    ///   1. 只留強相符（完全／前綴／子字串／縮寫）的群組
-    ///   2. 從中挑「夠精確」的（不含單純子字串）當候選；一個都沒有才退回最相符的那一組
-    ///   3. 最多取 <see cref="MaxGroupsPerKeyword"/> 組，避免把整個城市都當成候選
+    /// ★ **與面板（<c>/bus panel</c>）走完全同一份實作**（<see cref="StopPicks"/>）：
+    ///   模糊搜尋 → 只留強相符的站區 → 取「精確命中」的預設勾選 → 用短鍵解出站牌。
     ///
-    /// 「同一個站區裡的不同站名」全部都會進候選（例如「臺中車站」8 個月台），
-    /// 這樣「300 在 A 月台、304 在臺灣大道」這種情況才找得出來。
+    /// 為什麼一定要共用：以前這裡自己寫了一套（拿**搜尋命中**當候選），
+    /// 而命中有上限（整體 25 筆、每組只留符合關鍵字的那些），
+    /// 於是「臺中車站」38 個月台只會被放進 2~3 個 ——
+    /// 停在其他月台的路線就整條找不到（面板按 `g:` 時是取整個站區，所以面板找得到）。
+    /// 這就是「同名站牌找不到」的根因。
     /// </summary>
     private Resolved Resolve(string keyword)
     {
         keyword = (keyword ?? "").Trim();
-        if (keyword.Length == 0) return new Resolved(EmptyTarget(), [], true);
 
+        if (keyword.Length == 0)
+            return new Resolved(EmptyTarget(), [], true, false, []);
+
+        // 與面板相同：有強相符時只留強相符，不要被模糊相符的雜訊塞滿
         var (shown, _) = PreferStrong(_data.Search.SearchGrouped(keyword));
-        if (shown.Count == 0) return new Resolved(EmptyTarget(), [], true);
 
-        var precise = shown.Where(g => g.IsDefaultPick).ToList();
-        var weak = precise.Count == 0;
+        if (shown.Count == 0)
+            return new Resolved(EmptyTarget(), [], true, false, []);
 
-        var picked = (weak ? shown.Take(1) : precise.Take(MaxGroupsPerKeyword)).ToList();
+        var (uids, ambiguous, candidates) = StopPicks.ResolveDefaults(shown, _data);
 
-        var uids = picked
-            .SelectMany(g => g.Hits)
-            .Where(h => h.Strong)
-            .Select(h => h.Entry.StopUid)
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
+        if (ambiguous)
+            return new Resolved(EmptyTarget(), [], true, true, candidates);
 
-        if (uids.Count == 0)
-            return new Resolved(EmptyTarget(), [], true);
+        return new Resolved(_data.TargetFromStops(uids), uids, false, false, []);
+    }
 
-        return new Resolved(_data.TargetFromStops(uids), uids, weak);
+    /// <summary>找不到站牌／對到多個站區時要講的話（讓模型去問使用者，而不是自己猜）。</summary>
+    private string DescribeUnresolved(string keyword, Resolved resolved)
+    {
+        if (resolved.Ambiguous)
+        {
+            var list = resolved.Candidates.Count > 0
+                ? "候選有：" + string.Join("、", resolved.Candidates)
+                : "";
+
+            return $"「{keyword}」對到好幾個不同的站區，我不確定是哪一個，所以先不動手。" +
+                   $"請使用者說清楚（例如加上路口名或行政區），{list}";
+        }
+
+        return $"找不到符合「{keyword}」的站牌。請先問使用者正確的站名，或用 search_stops 查。" +
+               $"這份資料集裡有的站名例如：{string.Join("、", _data.ExampleStopNames(6))}。";
     }
 
     private static LocationTarget EmptyTarget() => new() { DisplayName = "", CandidateStopUids = [] };
