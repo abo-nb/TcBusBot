@@ -1166,6 +1166,8 @@ public static class DryRun
                 Problem($"/say 的說明長度不合法：{say.Description.Length} 字（必須 1~100）");
         }
 
+        AuditSayHiddenFlow();
+
         // ── 名稱一律小寫、說明不超過 100 字（Discord 的硬限制）──
         foreach (var command in commands)
         {
@@ -1191,6 +1193,122 @@ public static class DryRun
         }
 
         AuditSayAllowList();
+    }
+
+    /// <summary>
+    /// `/say` 必須「不留使用指令的痕跡」。
+    ///
+    /// 為什麼要用這麼硬的方式驗：直接用 <c>RespondAsync</c> 回應的話，Discord 會在訊息上方掛一行
+    /// 「@某某 使用了 /say」—— 那就等於把「這是有人叫 Bot 說的」寫在頻道上。
+    /// 正確做法是 `DeferAsync(ephemeral)` → `Channel.SendMessageAsync`（普通訊息）→
+    /// `DeleteOriginalResponseAsync`（把暫存回應刪掉）。
+    ///
+    /// 這件事**在畫面上驗不到**（DryRun 沒有真的互動可以按，要模擬得先架一整套 socket），
+    /// 所以直接讀編譯出來的 IL，把 <c>SendSilentlyAsync</c> 實際呼叫到的其他方法列出來：
+    /// 該有的要在、不該有的（<c>RespondAsync</c>／<c>FollowupAsync</c>）不能出現。
+    /// 這樣連「未來的自己順手改回 RespondAsync」都會被擋下來。
+    ///
+    /// ⚠️ 一定要掃**非同步狀態機**的 <c>MoveNext</c>：async 方法自己的 IL 只有
+    /// 「建狀態機 + Start」三行，內容全在編譯器產生的 <c>&lt;SendSilentlyAsync&gt;d__N</c> 裡。
+    /// （第一次寫這個檢查時就是掃錯方法，什麼都沒掃到而誤判成「少了必要的呼叫」。）
+    /// </summary>
+    private static void AuditSayHiddenFlow()
+    {
+        var send = typeof(SayModule).GetMethod("SendSilentlyAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        if (send is null)
+        {
+            Problem("找不到 SayModule.SendSilentlyAsync —— 無法驗證 /say 不留痕跡");
+            return;
+        }
+
+        // 呼叫端也一起驗：內容只能走 SendSilentlyAsync，不能有人繞過去
+        var say = typeof(SayModule).GetMethod(nameof(SayModule.SayAsync));
+        var sayCalls = say is null ? [] : CollectCalls(say);
+
+        if (!sayCalls.Contains("SayModule.SendSilentlyAsync"))
+            Problem("/say 沒有走 SendSilentlyAsync —— 內容可能被直接用 RespondAsync 送出去");
+
+        var calls = CollectCalls(send);
+        Console.WriteLine($"  ℹ /say 的送出流程會呼叫：{string.Join("、", calls)}");
+
+        var forbidden = calls
+            .Where(c => c is "InteractionModuleBase`1.RespondAsync"
+                        or "InteractionModuleBase`1.FollowupAsync"
+                        or "InteractionModuleBase`1.RespondWithFileAsync")
+            .ToList();
+
+        if (forbidden.Count > 0)
+            Problem($"/say 用 {string.Join("、", forbidden)} 送內容 —— " +
+                    "這會在頻道上留下「@某某 使用了 /say」的回應標頭");
+
+        var required = new[]
+        {
+            "InteractionModuleBase`1.DeferAsync",
+            "ISocketMessageChannel.SendMessageAsync",
+            "InteractionModuleBase`1.DeleteOriginalResponseAsync"
+        };
+        var missing = required.Where(r => !calls.Contains(r)).ToList();
+
+        if (missing.Count > 0)
+            Problem($"/say 少了不留痕跡必要的呼叫：{string.Join("、", missing)}");
+        else if (forbidden.Count == 0 && sayCalls.Contains("SayModule.SendSilentlyAsync"))
+            Console.WriteLine("  ✔ /say 不留痕跡：只有自己看得到的 defer → 頻道普通訊息 → 刪掉暫存回應" +
+                              "，全程沒有「使用了 /say」的回應標頭");
+    }
+
+    /// <summary>
+    /// 把一個方法（若是 async 就自動找它的狀態機）實際呼叫到的其他方法列出來。
+    ///
+    /// 這是「線性掃描位元組」而不是完整反組譯，所以會用
+    /// 「解析出來的方法真的屬於預期的型別」來過濾雜訊 ——
+    /// 剛好掃到別人運算元裡的位元組時，解析結果不會是
+    /// <c>InteractionModuleBase</c>／<c>ISocketMessageChannel</c>／本模組的方法，會直接被丟掉。
+    /// </summary>
+    private static List<string> CollectCalls(MethodInfo method)
+    {
+        var target = method;
+
+        var stateMachine = method
+            .GetCustomAttributes(inherit: false)
+            .OfType<System.Runtime.CompilerServices.AsyncStateMachineAttribute>()
+            .FirstOrDefault();
+
+        if (stateMachine is not null)
+        {
+            var moveNext = stateMachine.StateMachineType.GetMethod("MoveNext",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            if (moveNext is not null) target = moveNext;
+        }
+
+        var il = target.GetMethodBody()?.GetILAsByteArray();
+        if (il is null) return [];
+
+        var calls = new List<string>();
+
+        // 只認 call(0x28)／callvirt(0x6F)
+        for (var i = 0; i + 4 < il.Length; i++)
+        {
+            if (il[i] is not (0x28 or 0x6F)) continue;
+
+            var token = BitConverter.ToInt32(il, i + 1);
+            MethodBase? called;
+            try { called = target.Module.ResolveMethod(token); }
+            catch (Exception) { continue; }
+
+            var owner = called?.DeclaringType?.Name ?? "";
+            var interesting = owner == nameof(SayModule)
+                              || owner.StartsWith("InteractionModuleBase", StringComparison.Ordinal)
+                              || owner is "ISocketMessageChannel" or "IMessageChannel";
+
+            if (called is not null && interesting) calls.Add($"{owner}.{called.Name}");
+
+            i += 4;
+        }
+
+        return calls.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
     }
 
     /// <summary>

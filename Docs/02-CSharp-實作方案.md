@@ -1282,9 +1282,22 @@ Step 7  按「10 分鐘」→ 更新該批訂閱並回覆：
 | `/say <message>` | 讓 Bot 幫使用者說一句話（無用小功能；`SAY_ALLOWED_USERS` 可限制使用者） |
 
 > `/say` 是唯一不是 `/bus` 群組的指令（獨立模組 `SayModule`）。
-> 它的三個設計：`AllowedMentions.None`（不能被拿來 `@everyone`）、
-> 內容裡的 `\n` 換成真換行、`SAY_ALLOWED_USERS` 未設定時所有人都能用。
-> `--dryrun` 會檢查它真的進了指令樹、參數是必填字串（≤2000 字），並驗允許名單的解析。
+> 它的四個設計：**不留使用指令的痕跡**（見下）、`AllowedMentions.None`
+> （不能被拿來 `@everyone`）、內容裡的 `\n` 換成真換行、`SAY_ALLOWED_USERS`
+> 未設定時所有人都能用。
+> `--dryrun` 會檢查它真的進了指令樹、參數是必填字串（≤2000 字），
+> 並驗允許名單的解析與「不留痕跡的送法」。
+>
+> **不留痕跡的送法**：直接用 `RespondAsync` 回應的話，Discord 會在訊息上方掛一行
+> 「@某某 使用了 /say」—— 那就等於把「這是有人叫 Bot 說的」寫在頻道上。
+> 所以 `SayModule.SendSilentlyAsync` 改成
+> `DeferAsync(ephemeral: true)`（暫存的「正在思考…」只有指令使用者看得到）
+> → `Context.Channel.SendMessageAsync`（普通的 Bot 訊息，不掛任何回應標頭）
+> → `DeleteOriginalResponseAsync`（把暫存回應刪掉）。
+> 這件事在畫面上驗不到，所以 `--dryrun` 直接讀那個方法**非同步狀態機的 IL**，
+> 確認 `RespondAsync`／`FollowupAsync` 真的不在送內容的路徑上。
+> ⚠️ 注意要掃 `MoveNext` —— async 方法自己的 IL 只有「建狀態機 + Start」，
+> 掃錯方法會什麼都掃不到（第一版就是這樣誤判的）。
 
 #### 7.3.1 `/bus end` 與「放回原物件」的復原
 

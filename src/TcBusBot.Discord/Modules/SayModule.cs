@@ -12,7 +12,8 @@ namespace TcBusBot.Discord.Modules;
 /// 想知道 Bot 到底能不能在這個頻道發訊息、Embed 會不會被權限擋掉，
 /// 本來得等到公車真的快到；現在打一句話就知道。
 ///
-/// 三個刻意的設計：
+/// 四個刻意的設計：
+///   * **不留「用過指令」的痕跡**（見 <see cref="SayAsync"/> 的說明）
 ///   * <c>AllowedMentions.None</c> —— 不然任何人都能叫 Bot 去 @everyone 洗頻
 ///   * 內容打 <c>\n</c> 會變成真正的換行（斜線指令的輸入框打不出多行）
 ///   * 環境變數 <c>SAY_ALLOWED_USERS</c> 可以限制誰能用（沒設定 = 所有人都能用）
@@ -68,8 +69,64 @@ public sealed class SayModule : InteractionModuleBase<SocketInteractionContext>
         Console.WriteLine($"[say] {Context.User.Username}（{Context.User.Id}）在 {where} 讓 Bot 說：" +
                           text.Replace("\n", " ⏎ "));
 
-        // ⚠️ 一定要限制 mention：否則任何人都可以叫 Bot 去 @everyone
-        await RespondAsync(text: text, allowedMentions: AllowedMentions.None);
+        await SendSilentlyAsync(text);
+    }
+
+    /// <summary>
+    /// 真正把話說出去 —— **不留「用過指令」痕跡**的送法。
+    ///
+    /// 直接用 <c>RespondAsync</c> 回應的話，Discord 會在訊息上方掛一行
+    /// 「@某某 使用了 /say」，那就等於把「這是有人叫 Bot 說的」寫在頻道上了。
+    /// 所以改成：
+    ///   1) <c>DeferAsync(ephemeral: true)</c>：3 秒內給 Discord 一個交代，
+    ///      而且這個「正在思考…」只有指令使用者自己看得到
+    ///   2) 內容用 <c>Context.Channel.SendMessageAsync</c> 送出 ——
+    ///      這是一則**普通的 Bot 訊息**，不會掛任何指令／回應標頭
+    ///   3) <c>DeleteOriginalResponseAsync</c>：把剛剛那個「正在思考…」刪掉
+    ///
+    /// 結果：頻道上只剩那句話本身，看不出是誰、用什麼指令叫它說的。
+    ///
+    /// ⚠️ 上面兩個「只有你看得到」的檢查（空白內容、不在允許名單）走的是
+    /// <c>RespondAsync(ephemeral: true)</c>，那是刻意的 —— 它們的內容不會出現在頻道上。
+    /// 但**內容本身**絕對不可以走那條路。這件事交給
+    /// <c>--dryrun</c> 讀這個方法的 IL 來把關（見 DryRun.AuditSayHiddenFlow）。
+    ///
+    /// 刻意獨立成一個方法：這樣離線驗證只要讀這個方法的 IL，
+    /// 就能確認「送內容的路徑上沒有任何 RespondAsync」。
+    /// </summary>
+    private async Task SendSilentlyAsync(string text)
+    {
+        await DeferAsync(ephemeral: true);
+
+        try
+        {
+            // ⚠️ 一定要限制 mention：否則任何人都可以叫 Bot 去 @everyone
+            var sent = await Context.Channel.SendMessageAsync(
+                text: text, allowedMentions: AllowedMentions.None);
+
+            Console.WriteLine($"[say] → 已送出一般訊息 {sent.Id}（沒有回應標頭）");
+        }
+        catch (Exception ex)
+        {
+            // 送不出去（多半是這個頻道的「傳送訊息」權限）——
+            // 用剛剛那個只有你看得到的回應說明，不要在頻道上留下錯誤訊息。
+            Console.WriteLine($"[say] 送出失敗：{ex.GetType().Name}: {ex.Message}");
+
+            await ModifyOriginalResponseAsync(m =>
+                m.Content = $"❌ 送不出去：`{ex.GetType().Name}: {ex.Message}`\n" +
+                            "（通常是 Bot 在這個頻道沒有「傳送訊息」權限）");
+            return;
+        }
+
+        // 收尾：把 defer 產生的「正在思考…」刪掉。失敗不影響已送出的訊息。
+        try
+        {
+            await DeleteOriginalResponseAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[say] 無法刪除暫存回應（訊息已送出，不影響）：{ex.GetType().Name}");
+        }
     }
 
     /// <summary>
