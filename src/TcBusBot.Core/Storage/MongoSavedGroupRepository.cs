@@ -79,6 +79,8 @@ public sealed class MongoSavedGroupRepository : ISavedGroupRepository
 
     public bool IsPersistent => true;
 
+    public string DatabasePath => _describe;
+
     public string Describe() => _describe;
 
     private void EnsureIndexes()

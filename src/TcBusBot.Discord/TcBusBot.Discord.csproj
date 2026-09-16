@@ -14,8 +14,10 @@
 
   <ItemGroup>
     <!-- Discord.Net 3.18.0：本機 NuGet 快取已有，離線也能建置。
-         刻意不使用 Microsoft.Extensions.Hosting（快取裡沒有），
-         改在 Program.cs 手工組裝 —— 這個專案本來就不需要 DI 容器。 -->
+         服務的組裝在 BotServices.cs（用 Microsoft.Extensions.DependencyInjection，
+         由 TcBusBot.Core 帶進來；以前是自己手寫的 SimpleServiceProvider）。
+         刻意不用 Microsoft.Extensions.Hosting —— 這個專案只有一個進入點，
+         不需要它的生命週期與設定系統。 -->
     <PackageReference Include="Discord.Net" Version="3.18.0" />
   </ItemGroup>
 

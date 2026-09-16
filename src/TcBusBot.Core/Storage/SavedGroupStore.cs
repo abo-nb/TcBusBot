@@ -230,13 +230,10 @@ public sealed class SavedGroupStore : IDisposable, TcBusBot.Core.Chat.ILlmStateS
 
     private readonly ISavedGroupRepository _repo;
 
-    /// <summary>MongoDB 連不上時的背景重試（只提醒，不自動切換）。</summary>
-    private static MongoRecheckLoop? _mongoRecheck;
-
     /// <summary>是否真的寫進檔案（false = 記憶體模式，重啟就消失）。</summary>
     public bool IsPersistent => _repo.IsPersistent;
 
-    /// <summary>登錄的資料庫路徑（文字檔模式時，文字檔放在同一個目錄）。</summary>
+    /// <summary>資料實際放在哪（文字檔路徑／MongoDB 說明／記憶體）。</summary>
     public string DatabasePath { get; }
 
     /// <summary>文字檔後備的檔名。</summary>
@@ -250,105 +247,20 @@ public sealed class SavedGroupStore : IDisposable, TcBusBot.Core.Chat.ILlmStateS
     public SavedGroupStore(
         string path, string? mongoConnectionString, string? mongoDatabase,
         StorageMode mode = StorageMode.Auto)
+        : this(new StorageSettings(path, mongoConnectionString, mongoDatabase, mode)) { }
+
+    /// <summary>由 <see cref="StorageSettings"/> 決定後端（給 DI 與測試用）。</summary>
+    public SavedGroupStore(StorageSettings settings, Action<string>? log = null)
+        : this(StorageBackendFactory.Open(settings, log)) { }
+
+    /// <summary>
+    /// 直接注入已經選好的後端（DI 容器用；後端的選擇在
+    /// <see cref="StorageBackendFactory"/>，不在這裡）。
+    /// </summary>
+    internal SavedGroupStore(ISavedGroupRepository repo)
     {
-        DatabasePath = path;
-
-        _repo = Open(path, mongoConnectionString, mongoDatabase, mode);
-    }
-
-    private static ISavedGroupRepository Open(
-        string path, string? mongoConnectionString, string? mongoDatabase, StorageMode mode)
-    {
-        var textPath = TextPathFor(path);
-        var wantsMongo = !string.IsNullOrWhiteSpace(mongoConnectionString);
-        var mongoDb = string.IsNullOrWhiteSpace(mongoDatabase) ? MongoSavedGroupRepository.DefaultDatabase : mongoDatabase!;
-
-        if (mode == StorageMode.Mongo && !wantsMongo)
-            throw new InvalidOperationException("指定了 StorageMode.Mongo 但沒有給連線字串");
-
-        if (wantsMongo)
-        {
-            // 先講清楚「現在要連 MongoDB，最多等 15 秒」——
-            // 否則雲端上看到啟動卡住十幾秒會以為當掉了。
-            BotLog.Warn($"[儲存] 正在連線 MongoDB（{MongoDiagnostics.Mask(mongoConnectionString!)}，" +
-                        "最多等 15 秒）…");
-
-            try
-            {
-                var repo = new MongoSavedGroupRepository(mongoConnectionString!, mongoDb);
-                BotLog.Warn($"[儲存] 使用 MongoDB：{repo.Describe()}");
-                return repo;
-            }
-            catch (Exception ex)
-            {
-                if (mode == StorageMode.Mongo) throw;
-
-                // 不硬撐：連不上就退回本機儲存，但一定要讓使用者看到**為什麼**。
-                // MongoDB 的例外訊息本身看不出原因，所以附上可執行的檢查清單。
-                BotLog.Warn($"[儲存] ❌ MongoDB 連不上（{Short(ex)}）→ 改用本機儲存" +
-                            "（這次的訂閱組不會同步到其他機器）");
-                BotLog.Warn(MongoDiagnostics.Checklist(mongoConnectionString!));
-
-                _mongoRecheck = new MongoRecheckLoop(mongoConnectionString!, mongoDb);
-            }
-        }
-
-        // 明確要求記憶體（乾跑與測試用）：SQLite 的記憶體資料庫最理想，
-        // 沒有 SQLite 就退回「不寫檔的文字儲存」—— 行為一致，只是重啟就沒有。
-        if (path == ":memory:" && mode == StorageMode.Auto)
-        {
-            if (SqliteBackends.IsAvailable)
-            {
-                try { return new SqliteSavedGroupRepository(SqliteBackends.Open(":memory:"), path); }
-                catch (Exception) { /* 往下退回記憶體儲存 */ }
-            }
-
-            return new TextSavedGroupRepository(null);
-        }
-
-        if (mode == StorageMode.Text)
-            return new TextSavedGroupRepository(textPath);
-
-        if (SqliteBackends.IsAvailable)
-        {
-            try
-            {
-                return new SqliteSavedGroupRepository(SqliteBackends.Open(path), path);
-            }
-            catch (Exception ex)
-            {
-                // 開不起來（權限、檔案損毀、平台不支援…）→ 退回文字檔，
-                // 而不是默默變成記憶體模式（那樣使用者會以為資料存好了）
-                BotLog.Warn($"[儲存] SQLite 開不起來（{Short(ex)}），改用文字檔：{textPath}");
-            }
-        }
-
-        try
-        {
-            return new TextSavedGroupRepository(textPath);
-        }
-        catch (Exception ex)
-        {
-            BotLog.Warn($"[儲存] 文字檔也寫不進去（{Short(ex)}），" +
-                        "訂閱組只好放記憶體（重啟後會消失）");
-            return new TextSavedGroupRepository(null);
-        }
-    }
-
-    /// <summary>例外訊息只取一行並截短（MongoDB 的例外很長，整段印出來只會洗版）。</summary>
-    private static string Short(Exception ex)
-    {
-        var reason = (ex.Message ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
-        return $"{ex.GetType().Name}: {(reason.Length > 120 ? reason[..120] + "…" : reason)}";
-    }
-
-    /// <summary>`tcbus.db` → 同目錄的 `saved_groups.txt`。</summary>
-    private static string TextPathFor(string path)
-    {
-        if (path == ":memory:") return Path.Combine(Path.GetTempPath(), TextFileName);
-
-        var dir = Path.GetDirectoryName(path);
-        return string.IsNullOrEmpty(dir) ? TextFileName : Path.Combine(dir, TextFileName);
+        _repo = repo;
+        DatabasePath = repo.DatabasePath;
     }
 
     public string Describe() => _repo.Describe();
@@ -420,7 +332,9 @@ public sealed class SavedGroupStore : IDisposable, TcBusBot.Core.Chat.ILlmStateS
     public void Dispose()
     {
         _repo.Dispose();
-        _mongoRecheck?.Dispose();
-        _mongoRecheck = null;
+
+        // 背景的 MongoDB 重試迴圈是整個行程共用的（只有一個 Mongo 連線），
+        // 所以在這裡一起收掉。
+        StorageBackendFactory.DisposeShared();
     }
 }

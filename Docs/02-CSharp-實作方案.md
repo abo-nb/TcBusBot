@@ -2365,27 +2365,34 @@ TcBusBot.sln
 │   ├─ Subscriptions/                   ★ Subscription / SubscriptionGroup（多段行程）/ Service / Matcher / UndoStack
 │   ├─ Storage/SqliteDatabase.cs        ★ 零套件 SQLite（P/Invoke winsqlite3.dll）
 │   ├─ Storage/SavedGroupStore.cs       ★ 訂閱組持久化（多段行程 payload + 舊格式相容，§8.1）
+│   ├─ Storage/StorageBackendFactory.cs ★ 後端選擇（MongoDB → SQLite → 文字檔 → 記憶體）
+│   ├─ Storage/StorageServiceCollectionExtensions.cs  ★ 儲存方案的 DI 註冊
+│   ├─ Chat/                            ★ AI 聊天（SK 客戶端、切段、額度、工具轉接，§20）
 ├─ src/TcBusBot.Discord/          ← Discord.Net 3.18.0（唯一外部套件）
 │   ├─ Program.cs / BotConfig.cs / BotRuntime.cs / BusUi.cs / BusSession.cs
-│   ├─ Modules/BusModule.cs / BusComponentModule.cs
-│   ├─ EtaPoller.cs / SimpleServiceProvider.cs
+│   ├─ Modules/BusModule.cs / BusComponentModule.cs / ChatModule.cs / SayModule.cs
+│   ├─ BotServices.cs                   ★ 服務註冊（composition root，DI 容器）
+│   ├─ BusTools.cs                      ★ LLM 工具的 SK plugin（§20.8）
+│   ├─ LlmChatService.cs                ★ AI 聊天的 Discord 接線
+│   ├─ EtaPoller.cs                     唯一的輪詢迴圈
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
-    ├─ Program.cs                       selftest / search / route / diag
-    └─ SelfTest.cs                      ★ 219 項離線驗收測試（含簡繁折疊、縮寫搜尋、輪詢成本、儲存後端、.env 與環境變數、合併與復原）
+    ├─ Program.cs                       selftest / search / route / diag / mongo
+    └─ SelfTest.cs                      ★ 350 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
-**按鈕 ↔ 處理函式的雙向接線檢查**（§7.6）—— 這是實機測試抓到的錯所留下的防護。
+**按鈕 ↔ 處理函式的雙向接線檢查**（§7.6）、**DI 容器檢查**（§21）與
+**環境變數清單比對**（§20.9）—— 這些都是實際上踩過的錯所留下的防護。
 
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 244 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 350 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
-dotnet run --project src\TcBusBot.Discord -- --dryrun          # Discord 元件限制檢查
+dotnet run --project src\TcBusBot.Discord -- --dryrun          # 元件限制 + 接線 + DI + 設定檢查
 ```
 
 **為什麼 M0~M2 先做成「零相依」**：
@@ -3066,6 +3073,80 @@ Discord/BusToolProvider       每次提問現做一份 plugin（帶著「誰在�
 * 程式透過 `SettingResolver` 問過的每個鍵（含別名，見 `SettingResolver.SeenKeys`）
   → 一定要出現在 CSV 裡，否則視為問題
 * CSV 裡寫了但程式沒用到的 → 印出來提醒（可能是別的平台用的，或說明過期）
+
+---
+
+## 21. 服務組裝改成 DI 容器（含儲存方案）
+
+### 21.1 原本的樣子與問題
+
+原本**沒有** DI 容器：
+
+| 位置 | 原本的作法 | 問題 |
+| --- | --- | --- |
+| `src/TcBusBot.Discord/SimpleServiceProvider.cs` | 自己手寫的 73 行容器（實作 `IServiceProvider` + `IServiceScopeFactory`，靠反射挑「參數最多的建構子」） | 行為與真正的 DI 不同（不會自動建立未註冊的型別、沒有生命週期驗證）；`--dryrun` 還要**另外手動組一遍**，所以「離線驗證的圖」與「真正的圖」可能不一致 |
+| `SavedGroupStore.Open()` | 後端選擇（MongoDB → SQLite → 文字檔 → 記憶體）寫死在 private static 裡 | 「儲存方案」與「儲存的使用者」綁在一起；只能靠 `new SavedGroupStore(...)` 取得，沒有一個地方能一眼看出現在的儲存設定 |
+| `Program.cs` | 依序 `new` 出每個服務再傳進容器 | 物件關係散在 200 行的啟動流程裡 |
+
+直接用後果說話：那個「沒設定 `LLM_API_KEY` → `ILlmClient` 不存在 → **整個 Bot 起不來**」
+的 bug（§20.6），根因就是「模組的依賴是反射決定的，而且沒有地方會先驗證」。
+
+### 21.2 現在的樣子
+
+```csharp
+// TcBusBot.Discord/BotServices.cs —— 唯一的組裝處（composition root）
+var services = BotServices.Create(cfg, data, api, client, sourceDesc, Console.WriteLine);
+using var provider = services.BuildServiceProvider(new ServiceProviderOptions
+{
+    ValidateOnBuild = true,     // 建構子參數解析不到 → 建容器時就炸
+    ValidateScopes = true
+});
+```
+
+| 角色 | 生命週期 | 為什麼 |
+| --- | --- | --- |
+| `TaichungBusDataService`、`SubscriptionService`、`BusSessionStore`、`RealtimeBusCache`、`ConversationStore`、`WeeklyTokenBudget`、`ILlmClient`、`IChatToolProvider`、`ChatOrchestrator`、`SavedGroupStore`、`DiscordSocketClient`、`InteractionService` | singleton | 整台 Bot 共用一份狀態 |
+| `BusModule`、`BusComponentModule`、`SayModule`、`ChatModule` | **transient** | Discord.Net 每次互動都會把 `Context` 設到模組實例上；共用實例會讓**並行的互動互相蓋掉 Context**（這條規則以前只寫在 `SimpleServiceProvider` 的註解裡，現在變成容器的一級設定，而且 `--dryrun` 會驗） |
+
+`Program.cs` 現在只負責**啟動流程**（登入、註冊指令、輪詢、防休眠、關閉），
+所有服務都從容器拿；關閉時也不必一個一個 `Dispose` —— 容器會釋放它建立的 singleton。
+
+### 21.3 儲存方案：`AddBusBotStorage`
+
+```csharp
+services.AddBusBotStorage(new StorageSettings(cfg.DatabasePath, cfg.MongoUri, cfg.MongoDatabase), log);
+```
+
+* 後端選擇抽到 `StorageBackendFactory`（純靜態、可單獨測），設定用 `StorageSettings` 表達
+* 註冊三個東西，而且**共用同一個實例**：
+  * `SavedGroupStore`（訂閱組）
+  * `ILlmStateStore`（AI 的每週 token 用量）
+  * `ISavedGroupRepository`（internal，Core 內部用）
+* 為什麼「同一個實例」很重要：兩者都走同一條後端鏈，各開一份連線的話，
+  用量與訂閱組會落在不同的檔案／連線上，重啟後對不起來
+* **釋放責任分得清清楚楚**：
+  * `SavedGroupStore` 用**工廠**註冊 → 容器會負責 `Dispose`（連線在裡面關）
+  * 底層後端用**實例**註冊 → 容器不碰它，由 store 釋放（避免同一條連線被釋放兩次）
+  * `--dryrun` 會直接檢查這兩個 descriptor 的形狀，把這個約定固定下來
+* `StorageMode.Mongo` 但沒有連線字串 → **直接丟例外**（不偷偷退回本機）；
+  `Auto` 模式連不上 Mongo → 退回本機並留下警告（§18 的行為完全不變）
+
+### 21.4 離線驗證
+
+| 檢查 | 在哪 |
+| --- | --- |
+| 註冊表 ↔ 建構子需求（`ValidateOnBuild`、逐一解析、儲存共用實例、模組必須 transient） | `--dryrun` 的「DI 容器檢查」（與 Bot **同一份**註冊程式碼） |
+| 後端選擇、共用實例、生命週期、遮罩、強制模式 | `tcbus selftest` 第 22 節（**16 項**） |
+
+⚠️ 離線驗證用的是 `StorageSettings.Memory` —— `--dryrun` **不該**去開（也不該改到）
+真正的 `tcbus.db` 或 MongoDB。這是實作時真的犯過的錯：第一版乾跑就把 repo 目錄下的
+`tcbus.db` 開起來了（連 `-wal`/`-shm` 都冒出來），才加上這個參數。
+
+### 21.5 順手修掉的小問題
+
+`AuditEnvCsv()` 讀 `env-vars.csv` 時，如果**Excel 開著那個檔案**（Windows 會獨佔鎖住），
+`File.ReadAllLines` 會丟 `IOException` 讓整個 `--dryrun` 中斷。
+讀一份「文件」不該讓驗證掛掉，所以現在會印一行提醒並略過比對。
 
 ---
 

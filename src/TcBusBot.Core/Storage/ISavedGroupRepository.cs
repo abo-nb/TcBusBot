@@ -25,6 +25,9 @@ internal interface ISavedGroupRepository : IDisposable
 
     bool IsPersistent { get; }
 
+    /// <summary>資料實際放在哪（SQLite 是檔案路徑、MongoDB 是連線說明、記憶體模式是說明文字）。</summary>
+    string DatabasePath { get; }
+
     IReadOnlyList<SavedGroup> ListByUser(ulong userId);
     int CountByUser(ulong userId);
     SavedGroup? Get(long id, ulong userId);
@@ -91,6 +94,8 @@ internal sealed class TextSavedGroupRepository : ISavedGroupRepository
     }
 
     public bool IsPersistent => _path is not null;
+
+    public string DatabasePath => _path ?? "（記憶體，沒有寫入檔案）";
 
     public string Describe()
         => _path is null

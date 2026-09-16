@@ -17,7 +17,7 @@
 | --- | --- |
 | M0 專案骨架 | ✅ |
 | M1 TDX 資料模型與解析 | ✅ |
-| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 334 項離線驗收測試全過 || **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
+| M2 靜態索引 + 模糊搜尋 + 候選集合匹配 | ✅ 350 項離線驗收測試全過 || **M3 Discord UI** | ✅ 已實作（含訂閱組；實機驗收中） |
 | M4 即時輪詢 | ✅ 程式完成（輪詢迴圈 + 到站時間總表），實際運作需 TDX 金鑰 |
 | **M7 Android APK**（掛在舊手機上） | ⏸ **擱置**（已實機驗證過，程式碼留著；改用 Render） |
 | **M10 Render 部署** | ✅ 健康檢查端點 + 防休眠 + Dockerfile + `render.yaml`（端點有離線測試） |
@@ -609,6 +609,38 @@ dotnet run --project src\TcBusBot.Discord -- --mongo "mongodb+srv://..." --mongo
     "payload": "{\"legs\":[…],\"notify\":10}", "used": 7 }
   ```
 
+### 這四種後端是怎麼被挑的（DI 容器）
+
+「挑後端」與「怎麼把它交給需要的服務」現在都在 **DI 容器**裡，程式不用自己判斷：
+
+```csharp
+// BotServices.cs（唯一的組裝處）
+services.AddBusBotStorage(new StorageSettings(cfg.DatabasePath, cfg.MongoUri, cfg.MongoDatabase), log);
+```
+
+* 後端的選擇與退回邏輯集中在 `StorageBackendFactory`（MongoDB → SQLite → 文字檔 → 記憶體）
+* `SavedGroupStore`（訂閱組）與 `ILlmStateStore`（AI 的每週 token 用量）**共用同一個實例** ——
+  同一條後端鏈不該開兩份連線；容器的 `Dispose` 負責關閉
+* 指令模組註冊成 **transient**（Discord.Net 每次互動都要新的實例，共用會讓並行的互動互相蓋掉 Context）
+* `Program.cs` 只負責啟動流程（登入、註冊指令、輪詢、防休眠），不再自己 `new` 這些服務
+
+```powershell
+# 離線看整張服務圖（與 Bot 用同一份註冊程式碼）
+dotnet run --project src\TcBusBot.Discord -- --dryrun
+#   ▶ DI 容器檢查  服務註冊 ↔ 建構子需求
+#     註冊 23 個服務（19 singleton／4 transient）
+#     ✔ 每個註冊的服務都解析得到
+#     ✔ 儲存後端：…（訂閱組與 LLM 用量共用同一個實例）
+#     ✔ 4 個指令模組都註冊成 transient
+```
+
+容器開了 `ValidateOnBuild`：**任何服務的建構子參數找不到，建容器時就會炸**。
+（這也是為什麼之前那個「沒設定 `LLM_API_KEY` → `ILlmClient` 不存在 → 整個 Bot 起不來」的
+bug 現在不可能再發生：`--dryrun` 的這一關會先擋下來。）
+
+> 離線驗證用的是**記憶體模式**（`StorageSettings.Memory`），不會去開、也不會改到真正的
+> `tcbus.db` 或 MongoDB。
+
 ---
 
 ## 在手機上用 Termux 跑（不用 APK，有控制台）
@@ -837,7 +869,7 @@ TDX 公車 v2 的公式是 **`呼叫次數 / 1,500` ＋ `回傳資料量(MB) / 1
 沒有 Discord Token 的情況下完整測試。
 
 ```powershell
-# 334 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端、.env 路徑、合併與復原、結束追蹤、AI 聊天切段與每週額度、LLM 工具訂閱、SQLite 持久化
+# 350 項驗收測試：搜尋、群組、匹配、通知判定、簡繁折疊、縮寫、輪詢成本、儲存後端與 DI 註冊、.env 路徑、合併與復原、結束追蹤、AI 聊天切段與每週額度、LLM 工具訂閱、SQLite 持久化
 dotnet run --project src\TcBusBot.Cli -- selftest
 
 # 模糊站牌搜尋
@@ -894,7 +926,8 @@ src/TcBusBot.Core/            零外部套件相依
 └─ Subscriptions/                   ★ 訂閱群組 / 服務 / Matcher（挑最快 + 去重）
 
 src/TcBusBot.Discord/         Discord.Net 3.18.0
-├─ Program.cs                       入口（手工組裝，不用 DI 容器）
+├─ Program.cs                       入口（啟動流程；服務由 DI 容器提供）
+├─ BotServices.cs                   ★ 服務註冊（composition root；含儲存後端）
 ├─ BusUi.cs                         ★ 所有 Embed / 元件組裝（純函式）
 ├─ BusSession.cs                    面板狀態（記憶體）
 ├─ BotRuntime.cs                    通知預覽（模擬 / 真實）

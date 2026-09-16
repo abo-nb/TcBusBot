@@ -65,6 +65,26 @@ public sealed class LlmChatService : IDisposable
     public int Refused => _refused;
     public int ChannelCount => _chat.Conversations.ChannelCount;
 
+    private int _started;
+
+    /// <summary>
+    /// 接上 <c>MessageReceived</c>。
+    ///
+    /// 為什麼由服務自己訂閱（而不是 Program 幫它接）：這樣「AI 聊天怎麼被觸發」
+    /// 只寫在一個地方，Program 只要在真的啟用時呼叫一次 <see cref="Start"/>。
+    /// </summary>
+    public void Start()
+    {
+        if (Interlocked.Exchange(ref _started, 1) != 0) return;
+
+        _client.MessageReceived += message =>
+        {
+            // 事件處理絕對不能被例外中斷（Discord.Net 會把例外往上丟，可能影響連線）
+            _ = Task.Run(() => HandleAsync(message));
+            return Task.CompletedTask;
+        };
+    }
+
     public string Describe()
         => $"{_options.Describe()}｜已回 {_handled} 則／失敗 {_failed}／額度擋下 {_refused}｜" +
            $"{_chat.Budget.Describe()}";

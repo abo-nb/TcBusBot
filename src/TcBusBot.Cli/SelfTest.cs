@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Net;
+using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Chat;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Tdx;
@@ -97,6 +98,9 @@ public static class SelfTest
 
         Section("21. LLM 工具：用一句話訂閱公車（口語站名 → 真的建立訂閱）");
         TestBusActions(data, origin, dest);
+
+        Section("22. 儲存方案的 DI 註冊（後端選擇、共用實例、生命週期）");
+        TestStorageDi();
 
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
@@ -1526,6 +1530,108 @@ public static class SelfTest
         Check("另一個使用者的訂閱是分開的", otherSub.Ok && subs.GetGroupsByUser(other).Count() == 1);
         Check("自己的訂閱不會因為別人訂閱而增加",
             subs.GetGroupsByUser(me).Count() == 2, $"{subs.GetGroupsByUser(me).Count()} 組");
+    }
+
+    /// <summary>
+    /// 儲存方案的 **DI 註冊**（`services.AddBusBotStorage(...)`）。
+    ///
+    /// 以前「挑後端」寫死在 SavedGroupStore 的 private static 裡、服務用自己手寫的容器組；
+    /// 現在是標準的 ServiceCollection，所以這裡驗三件事：
+    ///   1. 註冊之後真的解析得到，而且**訂閱組與 LLM 用量是同一个實例**
+    ///      （不是同一個的話，每週用量會寫到另一條連線上，重啟後就對不起來）
+    ///   2. 後端由 StorageSettings 決定（記憶體／文字檔／MongoDB 強制）
+    ///   3. 生命週期語意正確：SavedGroupStore 由**工廠**建立 → 容器會負責釋放；
+    ///      底層連線則是實例註冊 → 由 store 釋放（避免同一條連線被釋放兩次）
+    /// </summary>
+    private static void TestStorageDi()
+    {
+        // ── 1) 記憶體模式：兩個入口指向同一個實例 ────────────
+        var services = new ServiceCollection();
+        services.AddBusBotStorage(StorageSettings.Memory, _ => { });
+
+        using var provider = services.BuildServiceProvider(new ServiceProviderOptions
+        {
+            ValidateOnBuild = true,
+            ValidateScopes = true
+        });
+
+        var store = provider.GetRequiredService<SavedGroupStore>();
+        var state = provider.GetRequiredService<TcBusBot.Core.Chat.ILlmStateStore>();
+
+        Check("★ 註冊後解析得到 SavedGroupStore", store is not null);
+        Check("★ 訂閱組與 LLM 用量共用同一個實例（同一條後端鏈）",
+            ReferenceEquals(store, state));
+
+        // 兩邊都真的能用
+        var payload = SavedGroupPayloadFactory.FromSubscriptions(
+            new SavedTarget("臺中車站", new[] { "TXG12251" }),
+            new SavedTarget("靜宜大學", new[] { "TXG13567" }),
+            new[] { ("TXG300", 1, "300") }, notifyMinutes: 10);
+
+        var (saved, _) = store.Save(7UL, "DI 測試", payload);
+        Check("透過容器拿到的 store 可以存訂閱組", saved == SaveGroupResult.Created, saved.ToString());
+
+        state.SetBlob("llm_weekly_usage", "{\"total\":123}");
+        Check("★ 同一條後端也能存 LLM 用量（ILlmStateStore）",
+            state.GetBlob("llm_weekly_usage")?.Contains("123", StringComparison.Ordinal) == true);
+        Check("從 store 這一頭讀得到剛剛寫的用量",
+            store.GetBlob("llm_weekly_usage")?.Contains("123", StringComparison.Ordinal) == true);
+
+        // ── 2) 生命週期：誰負責釋放 ────────────────────────
+        var storeDescriptor = services.First(d => d.ServiceType == typeof(SavedGroupStore));
+        var repoDescriptor = services.First(d => d.ServiceType.Name == "ISavedGroupRepository");
+
+        Check("★ SavedGroupStore 用**工廠**註冊（容器會負責釋放連線）",
+            storeDescriptor.ImplementationFactory is not null);
+        Check("★ 底層後端用**實例**註冊（由 store 釋放，不會被釋放兩次）",
+            repoDescriptor.ImplementationInstance is not null);
+        Check("SavedGroupStore 是 singleton（整台 Bot 共用一條連線）",
+            storeDescriptor.Lifetime == ServiceLifetime.Singleton);
+
+        // ── 3) 文字檔模式：後端真的照設定走 ────────────────
+        var dir = Path.Combine(Path.GetTempPath(), $"tcbus-di-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var textServices = new ServiceCollection();
+        textServices.AddBusBotStorage(
+            new StorageSettings(Path.Combine(dir, "tcbus.db"), Mode: SavedGroupStore.StorageMode.Text));
+
+        using var textProvider = textServices.BuildServiceProvider();
+        var textStore = textProvider.GetRequiredService<SavedGroupStore>();
+
+        Check("★ 指定文字檔模式 → 真的用文字檔",
+            textStore.Describe().Contains("文字檔", StringComparison.Ordinal), textStore.Describe());
+        Check("文字檔模式仍然算是持久化", textStore.IsPersistent);
+
+        var (textSaved, _) = textStore.Save(8UL, "文字檔測試", payload);
+        Check("文字檔模式可以存", textSaved == SaveGroupResult.Created, textSaved.ToString());
+
+        var textFile = Path.Combine(dir, SavedGroupStore.TextFileName);
+        Check("★ 檔案真的產生在設定的目錄底下", File.Exists(textFile), textFile);
+
+        try { Directory.Delete(dir, recursive: true); } catch (Exception) { /* 測試的暫存檔 */ }
+
+        // ── 4) 強制 MongoDB 卻沒有連線字串 → 明確失敗（不偷偷退回）──
+        var threw = false;
+
+        try
+        {
+            new ServiceCollection().AddBusBotStorage(
+                new StorageSettings("tcbus.db", Mode: SavedGroupStore.StorageMode.Mongo));
+        }
+        catch (InvalidOperationException)
+        {
+            threw = true;
+        }
+
+        Check("★ 指定 MongoDB 模式卻沒給連線字串 → 直接丟例外（不偷偷用本機）", threw);
+
+        // ── 5) 連線字串不會被印出來 ────────────────────────
+        var settings = new StorageSettings("tcbus.db", "mongodb+srv://user:secret@cluster.example.net/db");
+        Check("★ 連線字串預覽有遮罩（不能把帳密印出來）",
+            !settings.MongoPreview.Contains("secret", StringComparison.Ordinal), settings.MongoPreview);
+        Check("StorageSettings 說得出自己的模式", settings.Describe().Contains("MongoDB", StringComparison.Ordinal));
+        Check("沒有連線字串時預覽寫「存在本機」",
+            new StorageSettings("tcbus.db").MongoPreview.Contains("本機", StringComparison.Ordinal));
     }
 
     /// <summary>

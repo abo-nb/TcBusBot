@@ -30,6 +30,9 @@
          （DeepSeek / OpenRouter / 自架 Ollama…）。 -->
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.66.0" />
     <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.66.0" />
+    <!-- 真正的 DI 容器：服務註冊（含儲存後端的選擇）改成 ServiceCollection。
+         以前是自己手寫的 SimpleServiceProvider（因為當時 NuGet 快取沒有這個套件）。 -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
   </ItemGroup>
 
   <ItemGroup>

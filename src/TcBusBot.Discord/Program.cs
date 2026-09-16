@@ -2,6 +2,7 @@ using System.Text;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
+using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
 using TcBusBot.Core.DataSources;
@@ -110,84 +111,7 @@ public static class Program
         // ── 離線 UI 驗證（不需要 Token）────────────────────
         if (dryRun) return DryRun.Run(data, cfg);
 
-        // ── 2) 服務組裝（手工，不用 DI 容器）───────────────
-        var subs = new SubscriptionService();
-        var sessions = new BusSessionStore();
-        var cache = new RealtimeBusCache();
-
-        SavedGroupStore savedGroups;
-        try
-        {
-            savedGroups = new SavedGroupStore(cfg.DatabasePath, cfg.MongoUri, cfg.MongoDatabase);
-            Console.WriteLine($"✅ 訂閱組儲存：{savedGroups.Describe()}");
-            BotStatus.StorageMode = savedGroups.Describe();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  無法開啟訂閱組資料庫（{ex.Message}），改用記憶體模式。");
-            savedGroups = new SavedGroupStore(":memory:");
-        }
-        Console.WriteLine();
-
-
-        // 健康檢查端點會讀這裡的數字（訂閱數、快取筆數）
-        BotStatus.SubscriptionCounts = () => (subs.GroupCount, subs.SubscriptionCount);
-        BotStatus.CachedEtas = () => cache.Count;
-
-        var runtime = new BotRuntime(subs, api) { DataSourceDescription = sourceDesc };
-
-        // ── 2b) AI 聊天（選配：有 LLM_API_KEY 才啟用）──────
-        //   刻意讓「LLM 壞掉」不影響公車功能：設定錯、連不上、金鑰過期
-        //   都只印警告，Bot 照常上線。
-        var llmOptions = cfg.Llm;
-        ILlmClient? llm = null;
-        SemanticKernelLlmClient? llmClient = null;
-
-        // 對話記憶與用量預算**一律建立**（沒有 LLM 時就是空的）：
-        // `/ai status` 才不用處理「服務不存在」這種情況。
-        var conversations = new ConversationStore(llmOptions);
-        var budget = new WeeklyTokenBudget(llmOptions, savedGroups);
-
-        if (llmOptions.IsConfigured)
-        {
-            var (created, message) = SemanticKernelLlmClient.Create(llmOptions);
-            if (created is null)
-            {
-                Console.WriteLine($"⚠️  {message}");
-            }
-            else
-            {
-                llmClient = created;
-                llm = created;
-
-                Console.WriteLine(message);
-                Console.WriteLine($"    每週額度：{budget.Describe()}");
-                Console.WriteLine("    對話記憶：只在記憶體（每個頻道各自一份，不同伺服器不相通）");
-            }
-        }
-        else
-        {
-            Console.WriteLine("⏸️  AI 聊天未啟用（沒有設定 LLM_API_KEY）");
-        }
-
-        Console.WriteLine();
-
-        var services = new SimpleServiceProvider()
-            .Add(data)
-            .Add(subs)
-            .Add(sessions)
-            .Add(runtime)
-            .Add(cache)
-            .Add(savedGroups)
-            .Add(llmOptions)
-            .Add(conversations)
-            .Add(budget);
-
-        // ★ ILlmClient 一定要註冊（沒設定時給空物件）：
-        //   Discord.Net 要求模組的每個建構子參數都解析得到，否則**連 Bot 都啟動不了**。
-        services.Add<ILlmClient>(llm ?? DisabledLlmClient.Instance);
-
-        // ── 3) Discord ────────────────────────────────────
+        // ── 2) Discord 客戶端（意圖要在建立時決定）──────────
         // 意圖（intents）：
         //   * Guilds        —— 斜線指令與元件互動
         //   * GuildMessages + MessageContent —— AI 聊天要讀訊息內容
@@ -200,7 +124,7 @@ public static class Program
         if (cfg.EnableMessageContentIntent)
         {
             intents |= GatewayIntents.GuildMessages | GatewayIntents.MessageContent;
-            if (llmOptions.AllowDm) intents |= GatewayIntents.DirectMessages;
+            if (cfg.Llm.AllowDm) intents |= GatewayIntents.DirectMessages;
         }
 
         var client = new DiscordSocketClient(new DiscordSocketConfig
@@ -210,20 +134,52 @@ public static class Program
             LogLevel = cfg.Verbose ? LogSeverity.Verbose : LogSeverity.Info
         });
 
-        var interactions = new InteractionService(client.Rest, new InteractionServiceConfig
+        // ── 2b) 服務組裝（**DI 容器**，註冊集中在 BotServices）──
+        //   `--dryrun` 用的是同一份註冊程式碼，所以離線驗證通過 = 這裡也組得起來。
+        var services = BotServices.Create(cfg, data, api, client, sourceDesc, Console.WriteLine);
+
+        using var provider = services.BuildServiceProvider(new ServiceProviderOptions
         {
-            DefaultRunMode = RunMode.Async,
-            LogLevel = cfg.Verbose ? LogSeverity.Verbose : LogSeverity.Info
+            ValidateOnBuild = true,     // 有任何參數解析不到就在這裡炸（不是跑到一半才炸）
+            ValidateScopes = true
         });
 
+        // ★ 儲存方案：後端（MongoDB／SQLite／文字檔／記憶體）是在註冊時就挑好的，
+        //   Program 不需要知道現在是哪一種 —— 只把它印出來並給健康檢查端點用。
+        using var scopeForLog = provider.CreateScope();
+        var savedGroups = provider.GetRequiredService<SavedGroupStore>();
+        Console.WriteLine($"✅ 訂閱組儲存：{savedGroups.Describe()}");
+        BotStatus.StorageMode = savedGroups.Describe();
+
+        var subs = provider.GetRequiredService<SubscriptionService>();
+        var cache = provider.GetRequiredService<RealtimeBusCache>();
+        var budget = provider.GetRequiredService<WeeklyTokenBudget>();
+        var llmOptions = provider.GetRequiredService<LlmOptions>();
+        var llm = provider.GetRequiredService<ILlmClient>();
+
+        if (llmOptions.IsConfigured && llm.IsConfigured)
+        {
+            Console.WriteLine($"    每週額度：{budget.Describe()}");
+            Console.WriteLine("    對話記憶：只在記憶體（每個頻道各自一份，不同伺服器不相通）");
+        }
+
+        Console.WriteLine();
+
+        // 健康檢查端點會讀這裡的數字（訂閱數、快取筆數）
+        BotStatus.SubscriptionCounts = () => (subs.GroupCount, subs.SubscriptionCount);
+        BotStatus.CachedEtas = () => cache.Count;
+
+        var interactions = provider.GetRequiredService<InteractionService>();
+
         // 一個模組註冊失敗**不可以**讓整個 Bot 起不來：
-        // 公車功能是主要功能，AI 聊天是額外的（曾經因為 ILlmClient 沒註冊，
-        // 這裡直接丟例外 → Bot 完全啟動不了）。
+        // 公車功能是主要功能，AI 聊天是額外的。
+        // （容器已經開了 ValidateOnBuild，所以「參數解析不到」這種錯在 BuildServiceProvider
+        //   就會先炸出來 —— 之前那個 ILlmClient 沒註冊導致整個 Bot 起不來的 bug 就屬於這類。）
         async Task RegisterModuleAsync<TModule>(string label) where TModule : class
         {
             try
             {
-                await interactions.AddModuleAsync<TModule>(services);
+                await interactions.AddModuleAsync<TModule>(provider);
             }
             catch (Exception ex)
             {
@@ -240,65 +196,13 @@ public static class Program
         // ── AI 聊天：接上訊息事件 ───────────────────────────
         LlmChatService? chat = null;
 
-        if (llm is not null)
+        if (llm.IsConfigured)
         {
-            // 真正的規則（切段／額度／呼叫）在 Core 的 ChatOrchestrator，
-            // 這裡只負責「Discord 的部分」。
-            var actions = new BusActionService(data, subs);
+            chat = provider.GetRequiredService<LlmChatService>();
+            chat.Start();   // 訂閱 MessageReceived（只有真的啟用時才接）
 
-            // 到站時間需要 BotRuntime（TDX 查詢在 Discord 這一層），
-            // 所以用一個 delegate 把它接進工具裡；純文字格式化放在這裡。
-            async Task<string> ArrivalsAsync(ChatToolContext ctx, string? route, CancellationToken ct)
-            {
-                var groups = subs.GetGroupsByUser(ctx.UserId).ToList();
-
-                if (groups.Count == 0)
-                    return "使用者目前沒有任何訂閱，所以沒有到站時間可以查。" +
-                           "（可以問他要不要用 subscribe_bus 訂閱）";
-
-                var group = groups[^1];
-                var result = await runtime.BuildEtaTableAsync(group, DateTimeOffset.UtcNow);
-
-                var rows = result.Rows.AsEnumerable();
-                if (!string.IsNullOrWhiteSpace(route))
-                {
-                    var filtered = rows.Where(r =>
-                        r.Subscription.RouteName.Contains(route!, StringComparison.OrdinalIgnoreCase)).ToList();
-
-                    if (filtered.Count > 0) rows = filtered;
-                }
-
-                var lines = rows.Take(15).Select(r =>
-                {
-                    var when = r.LiveSeconds is { } sec
-                        ? $"約 {Math.Round(sec / 60.0)} 分鐘"
-                        : r.StatusText;
-                    return $"• {r.Subscription.RouteName}（{(r.Subscription.Direction == 0 ? "去程" : "返程")}）" +
-                           $"{r.Subscription.BoardStopName}：{when}";
-                });
-
-                var header = result.Simulation ? "（⚠️ 這是模擬資料，主機沒有 TDX 金鑰）\n" : "";
-                var error = result.Error is null ? "" : $"\n⚠️ 查詢部分失敗：{result.Error}";
-
-                return header + $"{group.DescribeRoute()} 的到站狀況：\n" +
-                       string.Join("\n", lines) + error;
-            }
-
-            IChatToolProvider toolProvider = llmOptions.ToolsEnabled
-                ? new BusToolProvider(actions, subs, ArrivalsAsync)
-                : NoChatTools.Instance;
-
-            var orchestrator = new ChatOrchestrator(llm, llmOptions, conversations, budget, toolProvider);
-            chat = new LlmChatService(client, orchestrator, llmOptions, sessions);
-
-            Console.WriteLine($"    工具　　：{(llmOptions.ToolsEnabled ? toolProvider.Describe() : "未啟用（LLM_TOOLS=false）")}");
-
-            client.MessageReceived += message =>
-            {
-                // 事件處理不能被例外中斷（Discord.Net 會把例外往上丟，可能影響連線）
-                _ = Task.Run(() => chat.HandleAsync(message));
-                return Task.CompletedTask;
-            };
+            var tools = provider.GetRequiredService<IChatToolProvider>();
+            Console.WriteLine($"    工具　　：{(llmOptions.ToolsEnabled ? tools.Describe() : "未啟用（LLM_TOOLS=false）")}");
 
             BotStatus.Llm = () => chat.Describe();
 
@@ -366,7 +270,7 @@ public static class Program
                 // ⚠️ InteractionService 會「吃掉」命令處理中的例外並包成 ExecuteResult，
                 //    不會往外丟。所以一定要檢查回傳值，否則使用者只會看到
                 //    Discord 的「無法提交」，console 也只有一行沒有細節的錯誤。
-                var result = await interactions.ExecuteCommandAsync(ctx, services);
+                var result = await interactions.ExecuteCommandAsync(ctx, provider);
 
                 if (result is ExecuteResult { IsSuccess: false } failed && failed.Exception is not null)
                 {
@@ -455,6 +359,8 @@ public static class Program
             // 有些平台（Android）沒有主控台中斷事件
         }
 
+        var runtime = provider.GetRequiredService<BotRuntime>();
+
         if (api is not null && cfg.EnablePoller)
         {
             runtime.PollerDescription = $"啟用中，每 {cfg.PollIntervalSeconds} 秒一次";
@@ -533,9 +439,9 @@ public static class Program
         // 把還沒寫下去的每週用量補寫（不然重啟前的那幾次呼叫就不算錢了）
         budget.Flush(DateTimeOffset.UtcNow);
         chat?.Dispose();
-        llmClient?.Dispose();
 
-        savedGroups.Dispose();
+        // 容器負責釋放所有 singleton（儲存後端、MongoDB 連線、SQLite 檔案、
+        // HttpClient…），所以這裡不需要一個一個 Dispose。
         cts.Dispose();
         _stop = null;
         return 0;

@@ -29,9 +29,10 @@ internal sealed class SqliteSavedGroupRepository : ISavedGroupRepository
     public string DatabasePath { get; }
 
     public bool IsPersistent { get; }
-
     public string Describe()
-        => $"{Path.GetFullPath(DatabasePath)}（SQLite {_db.Version ?? "?"}）";
+        => DatabasePath == ":memory:"
+            ? "記憶體資料庫（SQLite :memory:，重啟後訂閱組會消失）"
+            : $"{Path.GetFullPath(DatabasePath)}（SQLite {_db.Version ?? "?"}）";
 
     private void CreateSchema()
     {

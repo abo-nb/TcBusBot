@@ -3,6 +3,7 @@ using System.Text;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
+using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.Configuration;
 using TcBusBot.Core.DataSources;
@@ -442,8 +443,17 @@ public static class DryRun
         // ── 元件與處理函式的雙向接線檢查 ────────────────────
         AuditWiring();
 
+        // ── DI 容器（與真正的 Bot 用同一份註冊程式碼）──────────
+        using var client = new DiscordSocketClient(new DiscordSocketConfig
+        {
+            GatewayIntents = GatewayIntents.Guilds,
+            LogLevel = LogSeverity.Critical
+        });
+
+        var provider = AuditDependencyInjection(cfg, data, client);
+
         // ── 指令樹（斜線指令真的註冊得起來嗎）───────────────
-        AuditCommandTree(data, subs, runtime);
+        if (provider is not null) AuditCommandTree(cfg, data, provider);
 
         // ── LLM 設定（不連線，只驗設定本身合不合理）─────────
         AuditLlmConfig(cfg);
@@ -1080,42 +1090,13 @@ public static class DryRun
     /// 而且炸在 <c>Ready</c> 事件裡 —— 使用者只會看到「指令不見了」，console 也不一定看得到。
     /// 這裡完全不連線，只建樹，離線就先抓到。
     /// </summary>
-    private static void AuditCommandTree(
-        TaichungBusDataService data, SubscriptionService subs, BotRuntime runtime)
+    private static void AuditCommandTree(BotConfig cfg, TaichungBusDataService data, IServiceProvider services)
     {
         Console.WriteLine();
         Console.WriteLine("▶ 指令樹檢查  斜線指令 ↔ 模組註冊");
 
-        using var client = new DiscordSocketClient(new DiscordSocketConfig
-        {
-            GatewayIntents = GatewayIntents.Guilds,
-            LogLevel = LogSeverity.Critical
-        });
-
-        using var savedGroups = new SavedGroupStore(":memory:");
-
-        var dryLlmOptions = new TcBusBot.Core.Chat.LlmOptions();
-
-        var services = new SimpleServiceProvider()
-            .Add(data)
-            .Add(subs)
-            .Add(new BusSessionStore())
-            .Add(runtime)
-            .Add(new RealtimeBusCache())
-            .Add(savedGroups)
-            .Add(dryLlmOptions)
-            .Add(new TcBusBot.Core.Chat.ConversationStore(dryLlmOptions))
-            .Add(new TcBusBot.Core.Chat.WeeklyTokenBudget(dryLlmOptions));
-
-        // ★ 與 Program.cs 一樣：ILlmClient 永遠要註冊得到（沒設定時是空物件），
-        //   否則模組建不起來 —— 這正是這個檢查抓到的第一個真 bug。
-        services.Add<TcBusBot.Core.Chat.ILlmClient>(TcBusBot.Core.Chat.DisabledLlmClient.Instance);
-
-        var interactions = new InteractionService(client.Rest, new InteractionServiceConfig
-        {
-            DefaultRunMode = RunMode.Async,
-            LogLevel = LogSeverity.Critical
-        });
+        var client = services.GetRequiredService<DiscordSocketClient>();
+        var interactions = services.GetRequiredService<InteractionService>();
 
         try
         {
@@ -1506,6 +1487,22 @@ public static class DryRun
             return;
         }
 
+        string[] lines;
+
+        try
+        {
+            lines = File.ReadAllLines(path, Encoding.UTF8);
+        }
+        catch (IOException)
+        {
+            // ⚠️ 這真的發生過：Excel 開著這個 CSV 時會**獨佔鎖住**檔案，
+            //    File.ReadAllLines 直接丟 IOException。
+            //    讀不到一份「文件」不該讓整個驗證中斷，所以只提醒並略過。
+            Console.WriteLine($"  ⚠️  {Path.GetFileName(path)} 現在被其他程式鎖住" +
+                              "（Excel 開著？）→ 這次略過清單比對");
+            return;
+        }
+
         // 程式這次啟動問過的鍵（SettingResolver 會記錄），加上幾個「不是透過 Resolver 讀」的
         var used = new HashSet<string>(SettingResolver.SeenKeys, StringComparer.Ordinal)
         {
@@ -1520,7 +1517,7 @@ public static class DryRun
         var documented = new HashSet<string>(StringComparer.Ordinal);
         var aliases = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var line in File.ReadAllLines(path, Encoding.UTF8))
+        foreach (var line in lines)
         {
             var text = line.Trim().TrimStart('\uFEFF');
             if (text.Length == 0) continue;
@@ -1600,6 +1597,109 @@ public static class DryRun
 
         cells.Add(current.ToString());
         return cells;
+    }
+
+    /// <summary>
+    /// **DI 容器檢查**：用與真正的 Bot 完全相同的註冊程式碼（<see cref="BotServices.Create"/>）
+    /// 組出容器，並一個一個解析。
+    ///
+    /// 為什麼這是目前最有價值的一段檢查：
+    ///   * <c>ValidateOnBuild = true</c> 會在建容器時就驗證「每個服務的建構子參數都解析得到」——
+    ///     **之前那個「沒設定 LLM_API_KEY → ILlmClient 不存在 → 整個 Bot 起不來」的 bug，
+    ///     就是在這一關會被擋下來的**（當時沒有 DI 容器，所以只能靠 DryRun 手動組一遍）
+    ///   * 再逐一把註冊表上的每個服務真的解析一次（有些錯只在「解析的當下」才會出現，
+    ///     例如工廠裡丟例外）
+    ///   * 順便驗兩個「同一條後端鏈」的保證：<c>SavedGroupStore</c> 與 <c>ILlmStateStore</c>
+    ///     必須是同一個實例，否則每週用量會寫到另一條連線上
+    ///
+    /// 回傳 null 代表容器建不起來（後面的檢查就跳過）。
+    /// </summary>
+    private static IServiceProvider? AuditDependencyInjection(
+        BotConfig cfg, TaichungBusDataService data, DiscordSocketClient client)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ DI 容器檢查  服務註冊 ↔ 建構子需求");
+
+        // ★ 與 Program.cs 同一份註冊程式碼。儲存強制用記憶體：
+        //    離線驗證不該去開（也不該改到）真正的 tcbus.db / MongoDB。
+        var collection = BotServices.Create(cfg, data, api: null, client, "（dry-run）",
+                                            msg => Console.WriteLine($"  ｜{msg}"),
+                                            storage: StorageSettings.Memory);
+
+        ServiceProvider provider;
+
+        try
+        {
+            provider = collection.BuildServiceProvider(new ServiceProviderOptions
+            {
+                ValidateOnBuild = true,
+                ValidateScopes = true
+            });
+        }
+        catch (Exception ex)
+        {
+            Problem($"DI 容器建不起來（有服務的建構子參數找不到）：{ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+
+        // 逐一解析：ValidateOnBuild 只驗「建得出來」，這裡確認真的拿得到東西
+        var failures = new List<string>();
+
+        foreach (var descriptor in collection)
+        {
+            try
+            {
+                if (provider.GetService(descriptor.ServiceType) is null)
+                    failures.Add($"{descriptor.ServiceType.Name}（解析結果是 null）");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{descriptor.ServiceType.Name}（{ex.GetType().Name}: {ex.Message}）");
+            }
+        }
+
+        var singletons = collection.Count(d => d.Lifetime == ServiceLifetime.Singleton);
+        var transients = collection.Count(d => d.Lifetime == ServiceLifetime.Transient);
+
+        Console.WriteLine($"  註冊 {collection.Count} 個服務（{singletons} singleton／{transients} transient）");
+
+        foreach (var group in collection.GroupBy(d => d.Lifetime).OrderBy(g => g.Key.ToString()))
+        {
+            var names = group.Select(d => d.ServiceType.Name).OrderBy(x => x, StringComparer.Ordinal);
+            Console.WriteLine($"  {group.Key}：{string.Join("、", names)}");
+        }
+
+        if (failures.Count > 0)
+            foreach (var f in failures) Problem($"服務解析失敗：{f}");
+        else
+            Console.WriteLine("  ✔ 每個註冊的服務都解析得到");
+
+        // ── 儲存方案：兩個入口要指向同一個實例 ───────────────
+        var store = provider.GetRequiredService<SavedGroupStore>();
+        var state = provider.GetRequiredService<TcBusBot.Core.Chat.ILlmStateStore>();
+
+        if (!ReferenceEquals(store, state))
+            Problem("SavedGroupStore 與 ILlmStateStore 不是同一個實例（每週用量會寫到別的地方）");
+        else
+            Console.WriteLine($"  ✔ 儲存後端：{store.Describe()}（訂閱組與 LLM 用量共用同一個實例）");
+
+        // ── Discord 的模組一定要註冊成 transient ────────────
+        var badLifetime = collection
+            .Where(d => d.ServiceType == typeof(BusModule)
+                        || d.ServiceType == typeof(BusComponentModule)
+                        || d.ServiceType == typeof(SayModule)
+                        || d.ServiceType == typeof(ChatModule))
+            .Where(d => d.Lifetime != ServiceLifetime.Transient)
+            .Select(d => $"{d.ServiceType.Name}（{d.Lifetime}）")
+            .ToList();
+
+        if (badLifetime.Count > 0)
+            Problem($"指令模組必須是 transient（共用實例會讓並行的互動互相蓋掉 Context）：" +
+                    string.Join("、", badLifetime));
+        else
+            Console.WriteLine("  ✔ 4 個指令模組都註冊成 transient（每次互動都是新實例）");
+
+        return provider;
     }
 
     /// <summary>與 BotRuntime.DescribeStatus 相同邏輯（DryRun 無法直接呼叫 private 方法）。</summary>
