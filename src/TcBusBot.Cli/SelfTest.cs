@@ -88,6 +88,9 @@ public static class SelfTest
         Section("18. 輪詢成本：$select 只要求會用到的欄位");
         TestEtaSelect(Path.Combine(fixturesRoot, "real", "EstimatedTimeOfArrival.sample.json"));
 
+        Section("19. 結束追蹤（/bus end）與復原");
+        TestEndTracking(data, origin, dest);
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -1056,8 +1059,112 @@ public static class SelfTest
     }
 
     /// <summary>
-    /// 儲存後端的選擇與後備鏈：MongoDB → SQLite → 文字檔 → 記憶體。
+    /// `/bus end`：一次取消全部訂閱，而且要能整個放回來。
     ///
+    /// 這個功能壞掉的代價特別高（使用者一次失去所有訂閱），
+    /// 所以除了「有沒有清乾淨」，更要驗「復原之後是不是真的跟沒按過一樣」：
+    ///   * 群組與訂閱的 **id 必須完全相同**（面板與去重狀態都掛在 id 上）
+    ///   * 通知去重狀態必須還在（否則復原後同一班車會被再通知一次）
+    ///   * 別人的訂閱不能被動到
+    /// </summary>
+    private static void TestEndTracking(TaichungBusDataService data, LocationTarget origin, LocationTarget dest)
+    {
+        const ulong me = 77UL;
+        const ulong other = 78UL;
+
+        var subs = Subs();
+
+        var forward = data.FindRoutes(origin, dest).Take(3).ToList();
+        if (forward.Count == 0)
+        {
+            Check("資料集裡有可用的路線（後續測試的前提）", false);
+            return;
+        }
+
+        var backward = data.FindRoutes(dest, origin).Take(2).ToList();
+        if (backward.Count == 0) backward = forward;
+
+        var mineA = subs.CreateGroup(me, origin, dest, forward, 10);
+        var mineB = subs.CreateMultiLegGroup(me,
+        [
+            new LegPlan(origin, dest, forward),
+            new LegPlan(dest, origin, backward),
+        ], notifyBeforeMinutes: 5);
+        var notMine = subs.CreateGroup(other, origin, dest, forward, 10);
+
+        // 假裝「這班車已經通知過」—— 結束追蹤再復原之後，這個狀態必須還在
+        var notifiedKey = "TXG300|1|123-FT";
+        mineA.State.MarkNotified(notifiedKey, DateTimeOffset.UtcNow);
+        Check("前置：去重狀態已記錄", mineA.State.WasNotified(notifiedKey, DateTimeOffset.UtcNow));
+
+        var myGroupIds = new[] { mineA.Id, mineB.Id }.OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var mySubIds = subs.GetGroupsByUser(me).SelectMany(subs.GetSubscriptions)
+                           .Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var myStops = subs.GetAllEnabledBoardStopUids();
+        var subCountBefore = subs.SubscriptionCount;
+
+        // ── 1) 結束追蹤 ──────────────────────────────────
+        var removed = subs.RemoveAllForUser(me);
+
+        Check("結束追蹤回傳 2 個訂閱群組", removed.Count == 2, $"{removed.Count} 組");
+        Check("★ 結束追蹤後我的群組都不見了", !subs.GetGroupsByUser(me).Any());
+        Check("結束追蹤後訂閱數只剩別人的",
+            subs.SubscriptionCount == subCountBefore - mySubIds.Count,
+            $"{subCountBefore} → {subs.SubscriptionCount}");
+        Check("★ 別人的訂閱完全沒被動到",
+            subs.GetGroup(notMine.Id) is not null
+            && subs.GetSubscriptions(notMine).Count == notMine.SubscriptionIds.Count);
+        var onlyOtherStops = subs.GetSubscriptions(notMine)
+                                 .Select(s => s.BoardStopUid)
+                                 .Distinct(StringComparer.Ordinal)
+                                 .OrderBy(x => x, StringComparer.Ordinal)
+                                 .ToList();
+        var stopsAfterEnd = subs.GetAllEnabledBoardStopUids()
+                                .OrderBy(x => x, StringComparer.Ordinal)
+                                .ToList();
+
+        Check("★ 結束追蹤後只剩別人的上車站要輪詢（我的都不查了）",
+            stopsAfterEnd.SequenceEqual(onlyOtherStops) && stopsAfterEnd.Count < myStops.Count,
+            $"{myStops.Count} → {stopsAfterEnd.Count} 個");
+        Check("回傳的內容包含每一個被移除的訂閱",
+            removed.Sum(r => r.Subscriptions.Count) == mySubIds.Count,
+            $"{removed.Sum(r => r.Subscriptions.Count)} 筆");
+
+        // ── 2) 復原：放回原本的物件，而不是重新建立 ─────────
+        var undo = new UndoStack();
+        undo.Push(new UndoEndedTracking($"結束追蹤（{removed.Count} 組訂閱）", removed, mineA.Id));
+        var message = undo.Undo(subs, store: null!, me);
+
+        Check("★ 復原後群組 id 完全相同（面板與去重狀態都掛在 id 上）",
+            subs.GetGroupsByUser(me).Select(g => g.Id).OrderBy(x => x, StringComparer.Ordinal)
+                .SequenceEqual(myGroupIds), message);
+        Check("★ 復原後訂閱 id 完全相同",
+            subs.GetGroupsByUser(me).SelectMany(subs.GetSubscriptions)
+                .Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal)
+                .SequenceEqual(mySubIds));
+        Check("★ 復原後「這班車已經通知過」的狀態還在（不會被重複通知）",
+            subs.GetGroup(mineA.Id)!.State.WasNotified(notifiedKey, DateTimeOffset.UtcNow));
+        Check("復原後要輪詢的上車站與結束前一致",
+            subs.GetAllEnabledBoardStopUids().SequenceEqual(myStops),
+            $"{subs.GetAllEnabledBoardStopUids().Count} 個");
+        Check("復原後訂閱總數回到原本的值", subs.SubscriptionCount == subCountBefore,
+            $"{subs.SubscriptionCount}");
+
+        // ── 3) 沒有訂閱的人按結束追蹤 ────────────────────
+        var emptyRemoved = subs.RemoveAllForUser(99UL);
+        Check("沒有訂閱的使用者：結束追蹤回傳空清單", emptyRemoved.Count == 0);
+        Check("空清單的復原訊息不會騙人",
+            new UndoEndedTracking("結束追蹤", emptyRemoved).Undo(subs, store: null!, 99UL)
+                .Contains("沒有東西可以復原", StringComparison.Ordinal));
+
+        // ── 4) 只影響自己 ────────────────────────────────
+        subs.RemoveAllForUser(other);
+        Check("結束追蹤別人的訂閱時，我的完全不受影響",
+            subs.GetGroup(mineA.Id) is not null && subs.GetGroup(notMine.Id) is null);
+    }
+
+    /// <summary>
+    /// 儲存後端的選擇與後備鏈：MongoDB → SQLite → 文字檔 → 記憶體。
     /// 這裡測「沒有伺服器也能測」的部分：
     ///   * document ↔ 物件的轉換（純函式）
     ///   * 連線字串遮罩（不能把帳密印出來）

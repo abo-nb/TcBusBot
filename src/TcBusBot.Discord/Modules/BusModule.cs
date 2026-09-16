@@ -142,6 +142,51 @@ public sealed class BusModule : BusModuleBase
             ephemeral: true);
     }
 
+    [SlashCommand("end", "結束追蹤：一次取消我的全部訂閱（按「復原」可以放回來）")]
+    public async Task EndAsync()
+    {
+        var session = _sessions.GetOrCreate(Context.User.Id, Context.Channel.Id);
+
+        // 先把內容抄下來再刪 —— 「結束追蹤」是一次影響很多東西的操作，必須可以復原
+        var removed = _subs.RemoveAllForUser(Context.User.Id);
+
+        var groupCount = removed.Count;
+        var subscriptions = removed.SelectMany(r => r.Subscriptions).ToList();
+        var subCount = subscriptions.Count;
+        var boardStops = subscriptions.Select(s => s.BoardStopUid).Distinct(StringComparer.Ordinal).Count();
+        var routes = subscriptions.Select(s => (s.RouteUid, s.Direction)).Distinct().Count();
+
+        // 面板還指著剛才被取消的群組 → 一定要清掉，
+        // 否則之後按「查看到站時間」會操作到一個已經不存在的群組。
+        var previousSessionGroupId = session.CreatedGroupId;
+        session.CreatedGroupId = null;
+        session.Origin = null;
+        session.Destination = null;
+        session.LastRoutes.Clear();
+        session.ResetPicks();
+
+        if (groupCount == 0)
+        {
+            await RespondAsync(
+                "你目前沒有任何訂閱，沒有東西需要停止。\n用 `/bus panel` 開始設定起點與目的地。",
+                ephemeral: true);
+            return;
+        }
+
+        session.Undo.Push(new UndoEndedTracking(
+            Description: $"結束追蹤（{groupCount} 組訂閱）",
+            Removed: removed,
+            PreviousSessionGroupId: previousSessionGroupId));
+
+        Console.WriteLine($"[end] 使用者 {Context.User.Id} 結束追蹤：" +
+                          $"{groupCount} 個訂閱群組、{subCount} 筆訂閱、{boardStops} 個上車站");
+
+        await RespondAsync(
+            embed: BusUi.TrackingEnded(groupCount, subCount, boardStops, routes),
+            components: BusUi.EndComponents(groupCount),
+            ephemeral: true);
+    }
+
     [SlashCommand("status", "顯示 Bot 目前的狀態（資料集、訂閱數、資料來源）")]
     public async Task StatusAsync()
     {

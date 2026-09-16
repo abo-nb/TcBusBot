@@ -130,6 +130,35 @@ public sealed class SubscriptionService
         return true;
     }
 
+    /// <summary>把某個使用者的訂閱群組**全部**移除（`/bus end` 用），回傳被移除的（含內容）。</summary>
+    public IReadOnlyList<(SubscriptionGroup Group, IReadOnlyList<Subscription> Subscriptions)> RemoveAllForUser(
+        ulong userId)
+    {
+        var removed = new List<(SubscriptionGroup, IReadOnlyList<Subscription>)>();
+
+        foreach (var group in _groups.Values.Where(g => g.UserId == userId).ToList())
+        {
+            // 先抄下來再刪，這樣「結束追蹤」可以復原
+            var subs = GetSubscriptions(group);
+            if (RemoveGroup(group.Id)) removed.Add((group, subs));
+        }
+
+        return removed;
+    }
+
+    /// <summary>
+    /// 把「移除前先抄下來」的群組與訂閱放回去（給「結束追蹤」的復原用）。
+    ///
+    /// 為什麼不重新建立一次：重新建立會拿到新的 id，
+    /// 而通知的去重狀態（<see cref="GroupNotifyState"/>）與面板指向的 group id 都會跟著跑掉。
+    /// 直接把原本的物件放回去，復原後的行為與「沒按過結束」完全一致。
+    /// </summary>
+    public void Restore(SubscriptionGroup group, IReadOnlyList<Subscription> subscriptions)
+    {
+        foreach (var sub in subscriptions) _subs[sub.Id] = sub;
+        _groups[group.Id] = group;
+    }
+
     public void SetNotifyBeforeMinutes(string groupId, int minutes)
     {
         if (_groups.TryGetValue(groupId, out var g)) g.NotifyBeforeMinutes = minutes;

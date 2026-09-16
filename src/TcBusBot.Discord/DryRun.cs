@@ -2,9 +2,11 @@ using System.Reflection;
 using System.Text;
 using Discord;
 using Discord.Interactions;
+using Discord.WebSocket;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Models;
+using TcBusBot.Core.Realtime;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Subscriptions;
 using TcBusBot.Core.Tdx;
@@ -170,6 +172,57 @@ public static class DryRun
         var listEmbed = BusUi.SubscriptionList(groups, g => subs.GetSubscriptions(subs.GetGroup(g)!));
         var listComp = BusUi.SubscriptionListComponents(groups);
         Print(listEmbed, listComp);
+
+        // ── Step 12b：/bus end 結束追蹤（可以復原）──────────
+        Console.WriteLine();
+        Console.WriteLine("▶ Step 12b  `/bus end` 結束追蹤 → 一次取消全部訂閱（可以 ↩️ 復原）");
+
+        var endedGroups = subs.GetGroupsByUser(session.UserId).ToList();
+        var endedSubs = endedGroups.SelectMany(subs.GetSubscriptions).ToList();
+
+        var endUndo = new UndoStack();
+        var removed = subs.RemoveAllForUser(session.UserId);
+        var removedSubs = removed.SelectMany(r => r.Subscriptions).ToList();
+
+        endUndo.Push(new UndoEndedTracking(
+            $"結束追蹤（{removed.Count} 組訂閱）", removed, session.CreatedGroupId));
+
+        Print(BusUi.TrackingEnded(
+                  removed.Count,
+                  removedSubs.Count,
+                  removedSubs.Select(s => s.BoardStopUid).Distinct(StringComparer.Ordinal).Count(),
+                  removedSubs.Select(s => (s.RouteUid, s.Direction)).Distinct().Count()),
+              BusUi.EndComponents(removed.Count));
+
+        if (subs.GetGroupsByUser(session.UserId).Any() || removed.Count != endedGroups.Count)
+            Problem($"/bus end 沒有把訂閱清乾淨：剩下 {subs.GetGroupsByUser(session.UserId).Count()} 組" +
+                    $"（原本 {endedGroups.Count} 組，移除 {removed.Count} 組）");
+        else
+            Console.WriteLine($"  ✔ 已停止 {removed.Count} 個訂閱群組、{removedSubs.Count} 筆訂閱");
+
+        Console.WriteLine();
+        Console.WriteLine("▶ Step 12b-2  按「↩️ 復原」→ 訂閱整個回來（id 與通知去重狀態都保留）");
+
+        var endUndoMessage = endUndo.Undo(subs, store: null!, session.UserId);
+        Console.WriteLine($"  ↩️ 復原：{endUndoMessage}");
+
+        var restoredGroups = subs.GetGroupsByUser(session.UserId).ToList();
+        var restoredIds = restoredGroups.Select(g => g.Id).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var expectedIds = endedGroups.Select(g => g.Id).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        if (restoredGroups.Count != endedGroups.Count)
+            Problem($"復原結束追蹤後群組數不符：{restoredGroups.Count} != {endedGroups.Count}");
+        else if (!restoredIds.SequenceEqual(expectedIds))
+            Problem("復原結束追蹤後群組 id 變了 —— 應該放回原本的物件，否則去重狀態會失效");
+        else if (!restoredGroups.SelectMany(subs.GetSubscriptions).Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal)
+                    .SequenceEqual(endedSubs.Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal)))
+            Problem("復原結束追蹤後訂閱內容不完整");
+        else
+            Console.WriteLine($"  ✔ 復原後 {restoredGroups.Count} 個群組、" +
+                              $"{restoredGroups.SelectMany(subs.GetSubscriptions).Count()} 筆訂閱都回來了");
+
+        Print(BusUi.SubscriptionList(restoredGroups, g => subs.GetSubscriptions(subs.GetGroup(g)!)),
+              BusUi.SubscriptionListComponents(restoredGroups));
 
         // ── Step 13：訂閱組（存到 SQLite）──────────────────
         Console.WriteLine();
@@ -387,6 +440,9 @@ public static class DryRun
 
         // ── 元件與處理函式的雙向接線檢查 ────────────────────
         AuditWiring();
+
+        // ── 指令樹（斜線指令真的註冊得起來嗎）───────────────
+        AuditCommandTree(data, subs, runtime);
 
         // ── 總結 ───────────────────────────────────────────
         Console.WriteLine();
@@ -1002,6 +1058,203 @@ public static class DryRun
                 return false;
 
         return true;
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  指令樹：斜線指令真的註冊得起來嗎
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 用 Discord.Net 自己的 <see cref="InteractionService"/> 把三個模組組起來，
+    /// 確認**指令樹建得起來**，並印出使用者會在 Discord 看到的樣子。
+    ///
+    /// 為什麼需要這個：<c>AddModuleAsync</c> 失敗（指令名稱不合規則、選項名稱有大寫、
+    /// 同一個名字註冊兩次、選項描述為空…）是**啟動後才會炸**的錯，
+    /// 而且炸在 <c>Ready</c> 事件裡 —— 使用者只會看到「指令不見了」，console 也不一定看得到。
+    /// 這裡完全不連線，只建樹，離線就先抓到。
+    /// </summary>
+    private static void AuditCommandTree(
+        TaichungBusDataService data, SubscriptionService subs, BotRuntime runtime)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 指令樹檢查  斜線指令 ↔ 模組註冊");
+
+        using var client = new DiscordSocketClient(new DiscordSocketConfig
+        {
+            GatewayIntents = GatewayIntents.Guilds,
+            LogLevel = LogSeverity.Critical
+        });
+
+        using var savedGroups = new SavedGroupStore(":memory:");
+
+        var services = new SimpleServiceProvider()
+            .Add(data)
+            .Add(subs)
+            .Add(new BusSessionStore())
+            .Add(runtime)
+            .Add(new RealtimeBusCache())
+            .Add(savedGroups);
+
+        var interactions = new InteractionService(client.Rest, new InteractionServiceConfig
+        {
+            DefaultRunMode = RunMode.Async,
+            LogLevel = LogSeverity.Critical
+        });
+
+        try
+        {
+            interactions.AddModuleAsync<BusModule>(services).GetAwaiter().GetResult();
+            interactions.AddModuleAsync<BusComponentModule>(services).GetAwaiter().GetResult();
+            interactions.AddModuleAsync<SayModule>(services).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Problem($"指令樹建立失敗（Discord 會直接拒絕這份指令）：{ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        var commands = interactions.SlashCommands
+            .OrderBy(CommandPath, StringComparer.Ordinal)
+            .ToList();
+
+        foreach (var command in commands)
+            PrintCommand(command);
+
+        // ── /bus 這個群組本身：一定要是「群組」，不然子指令會變成
+        //     /panel、/list 這種散落在最上層的指令（設定 [Group] 掉字就會這樣）──
+        var busGroup = interactions.Modules.FirstOrDefault(m => m.SlashGroupName == "bus");
+        if (busGroup is null || !busGroup.IsSlashGroup)
+            Problem("/bus 沒有被註冊成指令群組（[Group(\"bus\")] 掉了嗎？）");
+        else
+            Console.WriteLine($"  ✔ /bus 是一個指令群組，底下 {busGroup.SlashCommands.Count} 個子指令");
+
+        var subNames = commands
+            .Where(c => CommandPath(c).StartsWith("bus ", StringComparison.Ordinal))
+            .Select(c => c.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var expectedSubs = new[] { "panel", "list", "groups", "next", "status", "end" };
+        var missingSubs = expectedSubs.Where(e => !subNames.Contains(e)).ToList();
+
+        if (missingSubs.Count > 0)
+            Problem($"/bus 缺少子指令：{string.Join("、", missingSubs)}");
+        else
+            Console.WriteLine($"  ✔ /bus 的 {expectedSubs.Length} 個子指令都在" +
+                              $"（{string.Join("、", expectedSubs)}）");
+
+        // ── /say 是這次新加的：一定要在，而且只能有一個必填的字串參數 ──
+        var say = commands.FirstOrDefault(c => CommandPath(c) == "say");
+        if (say is null)
+        {
+            Problem("找不到 /say 指令 —— 使用者根本打不出來");
+        }
+        else
+        {
+            var options = say.Parameters.ToList();
+
+            if (options.Count != 1 || options[0].Name != "message")
+                Problem($"/say 的參數應該只有一個 message，實際 " +
+                        $"[{string.Join(", ", options.Select(o => o.Name))}]");
+            else if (!options[0].IsRequired || options[0].DiscordOptionType != ApplicationCommandOptionType.String)
+                Problem($"/say 的 message 應該要是必填字串，實際 {options[0].DiscordOptionType}／" +
+                        $"{(options[0].IsRequired ? "必填" : "選填")}");
+            else
+                Console.WriteLine($"  ✔ /say 有一個必填的字串參數（最多 " +
+                                  $"{options[0].MaxLength ?? 0} 字，剛好是 Discord 的訊息上限）");
+
+            if (say.Description.Length is 0 or > 100)
+                Problem($"/say 的說明長度不合法：{say.Description.Length} 字（必須 1~100）");
+        }
+
+        // ── 名稱一律小寫、說明不超過 100 字（Discord 的硬限制）──
+        foreach (var command in commands)
+        {
+            var path = CommandPath(command);
+
+            if (command.Name != command.Name.ToLowerInvariant())
+                Problem($"指令名稱必須是小寫：/{path}");
+
+            if (command.Description.Length is 0 or > 100)
+                Problem($"/{path} 的說明長度不合法（{command.Description.Length} 字，必須 1~100）");
+
+            foreach (var option in command.Parameters)
+            {
+                if (option.Name != option.Name.ToLowerInvariant())
+                    Problem($"/{path} 的參數名稱必須是小寫：{option.Name}");
+
+                if (option.Description is { Length: > 100 })
+                    Problem($"/{path} {option.Name} 的說明超過 100 字");
+            }
+
+            if (command.Parameters.Count > 25)
+                Problem($"/{path} 的參數超過 25 個：{command.Parameters.Count}");
+        }
+
+        AuditSayAllowList();
+    }
+
+    /// <summary>
+    /// <c>/say</c> 的允許名單。
+    ///
+    /// 為什麼要驗這個：名單寫錯就是**洗頻破口** ——
+    /// 少擋一個人等於任何人都能叫 Bot 去 @everyone（雖然 mention 已經被關掉了，
+    /// 但還是能洗頻）。解析規則是「逗號／分號／空白都算分隔、壞掉的項目直接忽略」，
+    /// 這剛好是最容易寫錯的地方。
+    /// </summary>
+    private static void AuditSayAllowList()
+    {
+        var previous = Environment.GetEnvironmentVariable(SayModule.AllowListVariable);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(SayModule.AllowListVariable, null);
+            if (!SayModule.IsAllowed(1UL))
+                Problem($"沒有設定 {SayModule.AllowListVariable} 時，所有人都應該可以用 /say");
+
+            Environment.SetEnvironmentVariable(SayModule.AllowListVariable, "123, 456;789\t壞掉的字");
+            var allowed = SayModule.AllowedUsers();
+
+            if (!allowed.SequenceEqual(new[] { 123UL, 456UL, 789UL }))
+                Problem($"允許名單解析錯誤（預期 123,456,789）：{string.Join(",", allowed)}");
+            else if (SayModule.IsAllowed(999UL))
+                Problem("允許名單沒有擋掉不在名單上的人");
+            else if (!SayModule.IsAllowed(456UL))
+                Problem("允許名單把名單上的人擋掉了");
+            else
+                Console.WriteLine("  ✔ /say 允許名單：未設定 = 所有人可用；設定後只放行名單上的人" +
+                                  "（逗號／分號／空白都算分隔）");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SayModule.AllowListVariable, previous);
+        }
+    }
+
+    /// <summary>
+    /// 指令的完整路徑。
+    ///
+    /// ⚠️ <c>SlashCommandInfo.Name</c> **不含群組名稱** —— 群組模組底下的子指令，
+    /// <c>Name</c> 只有 "panel"，是 <c>Module.SlashGroupName</c> 補上 "bus" 才成為 <c>/bus panel</c>。
+    /// 直接印 Name 會讓人以為註冊成 <c>/panel</c>（我就被騙過一次）。
+    /// </summary>
+    private static string CommandPath(SlashCommandInfo command)
+        => command.Module is { IsSlashGroup: true, SlashGroupName.Length: > 0 } module
+           && !command.IgnoreGroupNames
+            ? $"{module.SlashGroupName} {command.Name}"
+            : command.Name;
+
+    private static void PrintCommand(SlashCommandInfo command)
+    {
+        var path = CommandPath(command);
+        Console.WriteLine($"  /{path}　{command.Description}");
+
+        foreach (var option in command.Parameters)
+        {
+            var required = option.IsRequired ? "必填" : "選填";
+            var limit = option.MaxLength is { } max ? $"／最多 {max} 字" : "";
+            Console.WriteLine($"    └ {option.Name} [{option.DiscordOptionType}／{required}{limit}]" +
+                              $"　{option.Description}");
+        }
     }
 
     /// <summary>與 BotRuntime.DescribeStatus 相同邏輯（DryRun 無法直接呼叫 private 方法）。</summary>

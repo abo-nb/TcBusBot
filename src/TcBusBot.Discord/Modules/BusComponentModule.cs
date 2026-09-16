@@ -771,8 +771,28 @@ public sealed class BusComponentModule : BusModuleBase
                 ? pid
                 : null;
         }
+        else if (entry is UndoEndedTracking ended
+                 && ended.PreviousSessionGroupId is { } endedGroupId
+                 && _subs.GetGroup(endedGroupId) is not null)
+        {
+            // 「結束追蹤」的復原：面板本來指著的那一組回來了，就繼續指著它
+            session.CreatedGroupId = endedGroupId;
+        }
 
         Console.WriteLine($"[undo] 使用者 {Context.User.Id} 復原「{entry.Description}」→ {message}");
+
+        // 「結束追蹤」復原回來的是**訂閱**，不是「訂閱組」——
+        // 這時候顯示訂閱組清單會讓人以為什麼都沒回來，所以改顯示訂閱清單。
+        if (entry is UndoEndedTracking)
+        {
+            var restored = _subs.GetGroupsByUser(Context.User.Id).ToList();
+
+            await UpdateAsync(
+                text: $"↩️ 已復原「{entry.Description}」\n{message}\n（用 `/bus next` 看目前的到站時間）",
+                embed: BusUi.SubscriptionList(restored, g => _subs.GetSubscriptions(_subs.GetGroup(g)!)),
+                components: BusUi.SubscriptionListComponents(restored));
+            return;
+        }
 
         var groups = _savedGroups.ListByUser(Context.User.Id);
         session.SelectedSavedGroupIds = session.SelectedSavedGroupIds.Where(id => groups.Any(g => g.Id == id)).ToList();

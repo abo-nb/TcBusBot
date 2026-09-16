@@ -159,6 +159,7 @@ public static class Program
 
         await interactions.AddModuleAsync<BusModule>(services);
         await interactions.AddModuleAsync<BusComponentModule>(services);
+        await interactions.AddModuleAsync<SayModule>(services);
 
         client.Log += msg => OnLog(msg, cfg.Verbose);
         interactions.Log += msg => OnLog(msg, cfg.Verbose);
@@ -399,7 +400,12 @@ public static class Program
         Console.WriteLine("   在 Discord 輸入：");
         Console.WriteLine("     /bus panel    開啟訂閱面板（設定起點 → 目的地 → 選路線）");
         Console.WriteLine("     /bus list     查看我的訂閱");
+        Console.WriteLine("     /bus next     看所有訂閱目前的到站時間");
+        Console.WriteLine("     /bus groups   我的訂閱組（套用／合併／改名／刪除）");
+        Console.WriteLine("     /bus end      結束追蹤（一次取消全部訂閱，可以復原）");
         Console.WriteLine("     /bus status   查看 Bot 狀態");
+        Console.WriteLine("     /say <內容>   讓 Bot 幫你說一句話（無用小功能；" +
+                          $"可用 {SayModule.AllowListVariable} 限制使用者）");
         Console.WriteLine("──────────────────────────────────────────────────────────");
         Console.WriteLine();
     }

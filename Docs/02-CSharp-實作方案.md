@@ -1273,12 +1273,34 @@ Step 7  按「10 分鐘」→ 更新該批訂閱並回覆：
 
 | 指令 | 功能 |
 | --- | --- |
-| `/bus` | 開啟訂閱面板（主流程，起點／目的地面板式設定） |
-| `/bus list` | 列出自己的訂閱（含**預計到站時間排序**與啟用/暫停按鈕） |
+| `/bus panel` | 開啟訂閱面板（主流程，起點／目的地面板式設定） |
+| `/bus list` | 列出自己的訂閱，並用 Select Menu 選擇要取消的訂閱 |
 | `/bus groups` | **訂閱組清單**：套用／改名／刪除自己存的範本（§8.1） |
-| `/bus remove` | 以 Select Menu 選擇要取消的訂閱 |
 | `/bus next` | **立即查一次 ETA**，不建立訂閱（除錯 + 使用者體驗都好用） |
-| `/bus status` | 顯示快取狀態、輪詢間隔、上次更新時間、訂閱數（管理用） |
+| `/bus status` | 顯示資料來源、輪詢間隔、訂閱數、儲存後端（管理用） |
+| `/bus end` | **結束追蹤**：一次取消自己的全部訂閱，回覆附「↩️ 復原」按鈕（§7.3.1） |
+| `/say <message>` | 讓 Bot 幫使用者說一句話（無用小功能；`SAY_ALLOWED_USERS` 可限制使用者） |
+
+> `/say` 是唯一不是 `/bus` 群組的指令（獨立模組 `SayModule`）。
+> 它的三個設計：`AllowedMentions.None`（不能被拿來 `@everyone`）、
+> 內容裡的 `\n` 換成真換行、`SAY_ALLOWED_USERS` 未設定時所有人都能用。
+> `--dryrun` 會檢查它真的進了指令樹、參數是必填字串（≤2000 字），並驗允許名單的解析。
+
+#### 7.3.1 `/bus end` 與「放回原物件」的復原
+
+`/bus end` 是**一次影響很多東西**的操作（一次清掉該使用者所有訂閱），所以它跟合併／批次套用／
+批次刪除一樣走 `UndoStack`：`SubscriptionService.RemoveAllForUser` 先**抄下內容再刪**，
+`UndoEndedTracking` 復原時呼叫 `SubscriptionService.Restore`。
+
+⚠️ `Restore` 刻意放回**原本的 `SubscriptionGroup` / `Subscription` 實例**，而不是用
+`CreateGroup` 重建。原因是重建會拿到新的 id，而：
+
+* 通知去重狀態（`GroupNotifyState`，key 是 `(RouteUID|Direction|PlateNumb)`）掛在群組物件上 ——
+  重建等於「這班車沒通知過」，復原後會再通知一次；
+* 面板 session 的 `CreatedGroupId` 指向舊 id，復原後會指向一個不存在的群組。
+
+`selftest` 第 19 節因此驗的不是「有沒有清乾淨」而已，而是**復原後 id、訂閱集合與去重狀態
+是否與結束前完全相同**，外加「不會動到別人的訂閱」。
 
 ### 7.4 ⚠️ Discord 元件限制對照表（設計約束，已確認）
 

@@ -879,6 +879,42 @@ public static class BusUi
     }
 
     // ─────────────────────────────────────────────────────
+    //  結束追蹤（/bus end）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// `/bus end` 的結果卡。
+    ///
+    /// 為什麼要特別顯示「不再查詢的上車站」：輪詢成本只取決於
+    /// **不重複的上車站數量**（見 <c>SubscriptionService.GetAllEnabledBoardStopUids</c>），
+    /// 這才是「停止追蹤之後 TDX 呼叫真的少多少」的指標 ——
+    /// 顯示「取消了 87 筆訂閱」反而看不出省下什麼。
+    /// </summary>
+    public static Embed TrackingEnded(int groupCount, int subscriptionCount, int boardStopCount, int routeCount)
+    {
+        var b = new EmbedBuilder()
+            .WithColor(Muted)
+            .WithTitle("🛑 已停止追蹤")
+            .WithDescription(
+                "你的訂閱已經全部取消，我不會再查詢這些路線的到站時間，也不會再通知你。\n" +
+                "**按下面的「↩️ 復原」就可以全部放回來。**")
+            .AddField("取消的訂閱群組", $"{groupCount} 個", inline: true)
+            .AddField("取消的訂閱", $"{subscriptionCount} 筆", inline: true)
+            .AddField("不再查詢的上車站", $"{boardStopCount} 個", inline: true)
+            .AddField("不再查詢的路線", $"{routeCount} 條", inline: true)
+            .WithFooter("復原紀錄只存在記憶體，Bot 重啟後就沒辦法復原了。要重新設定請用 /bus panel。");
+
+        return b.Build();
+    }
+
+    /// <summary>`/bus end` 之後的按鈕：復原（唯一的救援方式）＋ 重新開始。</summary>
+    public static MessageComponent EndComponents(int groupCount)
+        => new ComponentBuilder()
+            .WithButton($"↩️ 復原（把 {groupCount} 組訂閱放回來）", Cid.Undo, ButtonStyle.Primary)
+            .WithButton("開始新訂閱", Cid.Panel, ButtonStyle.Secondary)
+            .Build();
+
+    // ─────────────────────────────────────────────────────
     //  通知訊息（真正會送出的長相）
     // ─────────────────────────────────────────────────────
 

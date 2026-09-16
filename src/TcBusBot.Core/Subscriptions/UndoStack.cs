@@ -107,6 +107,35 @@ public sealed record UndoRenamedSavedGroup(
 }
 
 /// <summary>
+/// 復原「結束追蹤」（`/bus end`）→ 把剛才停掉的訂閱整個放回去。
+///
+/// 這裡刻意放回**原本的物件**而不是重建：id 與通知去重狀態都會保留，
+/// 所以復原後不會因為「同一班車剛才已經通知過」而被重複通知。
+/// </summary>
+public sealed record UndoEndedTracking(
+    string Description,
+    IReadOnlyList<(SubscriptionGroup Group, IReadOnlyList<Subscription> Subscriptions)> Removed,
+    string? PreviousSessionGroupId = null) : UndoEntry(Description)
+{
+    public override string Undo(SubscriptionService subs, SavedGroupStore store, ulong userId)
+    {
+        var groups = 0;
+        var subscriptions = 0;
+
+        foreach (var (group, items) in Removed)
+        {
+            subs.Restore(group, items);
+            groups++;
+            subscriptions += items.Count;
+        }
+
+        return groups == 0
+            ? "沒有東西可以復原。"
+            : $"已恢復追蹤：{groups} 個訂閱群組、{subscriptions} 筆訂閱。";
+    }
+}
+
+/// <summary>
 /// 每個面板 session 一份的復原堆疊（後進先出）。
 ///
 /// 刻意保留不只一層：使用者常常是「套用 → 發現多套一個 → 再套用」，
