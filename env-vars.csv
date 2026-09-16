@@ -28,6 +28,7 @@
 "LLM_SEGMENT_GAP_MINUTES","LLM_GAP_MINUTES","選填","30","超過幾分鐘沒說話就當成新的一段（不帶舊上下文）","新增（AI 聊天）","AI 聊天"
 "LLM_TOPIC_DETECT","（無）","選填","true","時間門檻內是否讓 LLM 判斷「換話題了沒」","新增（AI 聊天）","AI 聊天"
 "LLM_TOOLS","（無）","選填","true","是否讓 LLM 用工具真的動手（訂閱／取消公車）","新增（AI 聊天）","AI 聊天"
+"LLM_REASONING","（無）","選填","off","模型要不要思考：off 最省（實測 out 660→20 tokens）；auto＝服務端預設；low／medium／high＝明確要思考","新增（AI 聊天）","AI 聊天"
 "LLM_MAX_CONTEXT_TURNS","（無）","選填","20","帶進提示詞的歷史上限（則）","新增（AI 聊天）","AI 聊天"
 "LLM_MAX_CONTEXT_TOKENS","（無）","選填","3000","帶進提示詞的歷史上限（估算 token）","新增（AI 聊天）","AI 聊天"
 "LLM_MAX_OUTPUT_TOKENS","（無）","選填","800","單次回覆的輸出上限","新增（AI 聊天）","AI 聊天"
