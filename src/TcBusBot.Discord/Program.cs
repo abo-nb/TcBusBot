@@ -235,6 +235,7 @@ public static class Program
         await RegisterModuleAsync<BusComponentModule>("bus（按鈕／選單）");
         await RegisterModuleAsync<SayModule>("say");
         await RegisterModuleAsync<ChatModule>("ai");
+        await RegisterModuleAsync<PersonaGrantModule>("ai（授權按鈕）");
         await RegisterModuleAsync<ResetModule>("rest");
 
         // ── AI 聊天：接上訊息事件 ───────────────────────────

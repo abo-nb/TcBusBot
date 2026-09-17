@@ -1114,6 +1114,7 @@ public static class DryRun
             interactions.AddModuleAsync<BusComponentModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<SayModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<ChatModule>(services).GetAwaiter().GetResult();
+            interactions.AddModuleAsync<PersonaGrantModule>(services).GetAwaiter().GetResult();
             interactions.AddModuleAsync<ResetModule>(services).GetAwaiter().GetResult();
         }
         catch (Exception ex)
@@ -1196,23 +1197,59 @@ public static class DryRun
             var psetAsync = typeof(ChatModule).GetMethod(nameof(ChatModule.PersonaSetAsync));
             var psetCalls = psetAsync is null ? [] : CollectCalls(psetAsync, resolveAll: true);
 
+            var canSet = typeof(ChatModule).GetMethod("CanSetPersona",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var canSetCalls = canSet is null ? [] : CollectCalls(canSet, resolveAll: true);
+
             var copyAsync = typeof(ChatModule).GetMethod("CopyFromAsync",
                 BindingFlags.Instance | BindingFlags.NonPublic);
             var copyCalls = copyAsync is null ? [] : CollectCalls(copyAsync, resolveAll: true);
 
             if (psetAsync is null)
                 Problem("找不到 ChatModule.PersonaSetAsync");
-            else if (!psetCalls.Contains("LlmOptions.get_AdminUserIds"))
-                Problem("/ai pset 沒有檢查 LLM_ADMIN_IDS —— 任何人都能改伺服器的提示詞");
+            else if (!psetCalls.Contains("ChatModule.CanSetPersona"))
+                Problem("/ai pset 沒有先問 CanSetPersona —— 任何人都能改伺服器的提示詞");
+            else if (!canSetCalls.Contains("LlmOptions.get_AdminUserIds"))
+                Problem("/ai pset 的授權沒有檢查 LLM_ADMIN_IDS（主機端名單那條路會失效）");
+            else if (!canSetCalls.Contains("PersonaGrantStore.PeekAuthority"))
+                Problem("/ai pset 的授權沒有檢查「來源伺服器按按鈕同意」的授權 —— 跨伺服器授權不會生效");
             else if (!psetCalls.Contains("GuildPersonaStore.SetRules"))
                 Problem("/ai pset 沒有走 GuildPersonaStore.SetRules（覆蓋模式的安全順序會失效）");
             else if (copyAsync is null || !copyCalls.Contains("GuildPersonaStore.CopyFrom"))
                 Problem("/ai pset from: 沒有走 GuildPersonaStore.CopyFrom");
-            else if (!copyCalls.Contains("SocketGuild.GetUser"))
-                Problem("/ai pset from: 沒有檢查「你也在來源伺服器裡」—— 可以把別人的設定搬走");
+            else if (!copyCalls.Contains("ChatModule.RequestGrantAsync"))
+                Problem("/ai pset from: 沒有「請求授權」那條路 —— 別的伺服器只能靠主機名單");
             else
-                Console.WriteLine("  ✔ /ai pset 真的會擋人（LLM_ADMIN_IDS）＋複製前確認來源（GetGuild／GetUser）" +
-                                  "，而且走的是可測試的 SetRules／CopyFrom");
+                Console.WriteLine("  ✔ /ai pset 真的會擋人（LLM_ADMIN_IDS 或來源同意）" +
+                                  "＋複製前確認來源，而且走的是可測試的 SetRules／CopyFrom");
+
+            // ── 授權按鈕：同意的人要真的被檢查資格 ────────────
+            var approver = typeof(PersonaGrantModule).GetMethod(nameof(PersonaGrantModule.IsApprover));
+            var approverCalls = approver is null ? [] : CollectCalls(approver, resolveAll: true);
+
+            var notice = typeof(PersonaGrantModule).GetMethod("HandleAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var noticeCalls = notice is null ? [] : CollectCalls(notice, resolveAll: true);
+
+            if (approver is null || notice is null)
+            {
+                Problem("找不到 PersonaGrantModule.IsApprover／HandleAsync —— 無法驗證授權按鈕");
+            }
+            else if (!approverCalls.Contains("LlmOptions.get_AdminUserIds"))
+                Problem("授權按鈕沒有檢查 LLM_ADMIN_IDS");
+            else if (!approverCalls.Contains("SocketGuild.get_OwnerId"))
+                Problem("授權按鈕沒有檢查「伺服器擁有者」—— 只有主機名單能按，等於沒解決問題");
+            else if (!approverCalls.Contains("SocketGuildUser.get_GuildPermissions"))
+                Problem("授權按鈕沒有檢查「管理伺服器」權限");
+            else if (!noticeCalls.Contains("PersonaGrantStore.Authorize"))
+                Problem("按下同意之後沒有真的發出授權（Authorize）");
+            else if (!noticeCalls.Contains("PersonaGrantStore.Take"))
+                Problem("按下同意之後沒有把請求消耗掉 —— 同一顆按鈕可以按兩次（會重複複製）");
+            else if (!noticeCalls.Contains("GuildPersonaStore.CopyFrom"))
+                Problem("按下同意之後沒有真的複製設定");
+            else
+                Console.WriteLine("  ✔ 授權按鈕：擁有者／Manage Server／主機名單才能按，" +
+                                  "同意後會發授權＋複製設定＋把請求消耗掉");
         }
 
         // ── /rest（重設這個伺服器學到的規矩）────────────────

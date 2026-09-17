@@ -23,6 +23,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly WeeklyTokenBudget _budget;
     private readonly ILlmClient _llm;
     private readonly GuildPersonaStore _personas;
+    private readonly PersonaGrantStore _grants;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -34,14 +35,28 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         ConversationStore conversations,
         WeeklyTokenBudget budget,
         ILlmClient llm,
-        GuildPersonaStore personas)
+        GuildPersonaStore personas,
+        PersonaGrantStore grants)
     {
         _options = options;
         _conversations = conversations;
         _budget = budget;
         _llm = llm;
         _personas = personas;
+        _grants = grants;
     }
+
+    /// <summary>
+    /// 這個人在這個伺服器可以設定提示詞嗎？
+    ///
+    /// 兩種來源：
+    ///   1. 主機端名單 `LLM_ADMIN_IDS`（自己人，任何伺服器都可以）
+    ///   2. **來源伺服器的人按按鈕同意**（見 <see cref="PersonaGrantStore"/>）——
+    ///      授權只限「那一個」伺服器，不會順便給全域權限
+    /// </summary>
+    private bool CanSetPersona(ulong guildId, ulong userId)
+        => _options.AdminUserIds.Contains(userId)
+           || _grants.PeekAuthority(guildId, userId, DateTimeOffset.UtcNow) is not null;
 
     [SlashCommand("status", "看 AI 聊天的狀態：模型、這一週用掉多少 token、這個頻道的記憶")]
     public async Task StatusAsync()
@@ -181,9 +196,18 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             return;
         }
 
-        if (guild.GetUser(Context.User.Id) is null)
+        // ── 授權：不只看名單，改成「來源伺服器的人按按鈕同意」──────
+        //
+        // 為什麼要這樣：那些內容是**來源伺服器的東西**（自訂表情名稱、稱呼、內規），
+        // 能不能給出去應該由**那邊的人**決定。以前是「你也要在來源伺服器裡」——
+        // 那對「幫忙代管兩個伺服器的人」很合理，但對「想把設定給朋友那個伺服器」就很怪：
+        // 你不在那邊、也不想為了這件事把對方加進 LLM_ADMIN_IDS（那會給他全域權限）。
+        var allowedDirectly = _options.AdminUserIds.Contains(Context.User.Id)
+                              && guild.GetUser(Context.User.Id) is not null;
+
+        if (!allowedDirectly)
         {
-            await RespondAsync($"❌ 你不在「{guild.Name}」裡面，不能把它的設定搬過來。", ephemeral: true);
+            await RequestGrantAsync(guild, targetGuildId, mode);
             return;
         }
 
@@ -243,6 +267,124 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                       "也可以直接給伺服器 ID。");
     }
 
+    /// <summary>
+    /// 在**來源伺服器**發一則「授權通知」，讓那邊的人按「同意」。
+    ///
+    /// 三個刻意的設計：
+    ///   * 通知發在**來源**（不是請求者那邊）—— 要給出去的是那邊的東西，
+    ///     同意的人當然要在那邊。這也是「在另一個伺服器傳授權通知」的意思。
+    ///   * 請求者必須在**目標**伺服器有「管理伺服器」權限：不然任何路人都能
+    ///     讓別人的伺服器跳通知（洗頻）。
+    ///   * 同意之後**同時**給他「設定那個伺服器」的權限（30 天）—— 不然他下次
+    ///     想改一個字又要再請一次，這個流程就變成麻煩而不是安全。
+    /// </summary>
+    private async Task RequestGrantAsync(SocketGuild sourceGuild, ulong targetGuildId, PersonaMode mode)
+    {
+        if (Context.Guild is not { } targetGuild)
+        {
+            await RespondAsync("❌ 這個指令要在伺服器裡使用。", ephemeral: true);
+            return;
+        }
+
+        if (!((Context.User as SocketGuildUser)?.GuildPermissions.ManageGuild ?? false))
+        {
+            await RespondAsync(
+                "❌ 這個功能要「**管理伺服器**」權限的人才能發起（它會讓另一個伺服器跳通知）。\n" +
+                "請找你們的管理員，或請對方直接在他的伺服器用 `/ai pset`。",
+                ephemeral: true);
+            return;
+        }
+
+        var channel = PickNoticeChannel(sourceGuild);
+
+        if (channel is null)
+        {
+            await RespondAsync(
+                $"❌ 我在「{sourceGuild.Name}」沒有可以發通知的頻道（缺少「傳送訊息」權限）。\n" +
+                "請在那邊給我一個可以發言的頻道，或請那邊的人自己用 `/ai pset` 匯出。",
+                ephemeral: true);
+            return;
+        }
+
+        var request = _grants.Request(
+            sourceGuildId: sourceGuild.Id,
+            targetGuildId: targetGuildId,
+            targetChannelId: Context.Channel.Id,
+            requesterId: Context.User.Id,
+            mode: mode == PersonaMode.Replace ? PersonaGrantModes.CopyReplace : PersonaGrantModes.CopyAppend,
+            now: DateTimeOffset.UtcNow);
+
+        var notice = new EmbedBuilder()
+            .WithColor(new Color(0xE6, 0x7E, 0x22))
+            .WithTitle("🤝 有人在別的伺服器請求授權")
+            .WithDescription(
+                $"**{targetGuild.Name}** 的 <@{Context.User.Id}> 想把**這個伺服器**的自訂提示詞複製過去" +
+                $"（{(mode == PersonaMode.Replace ? "覆蓋他那邊原本的" : "追加，跳過重複的")}）。\n\n" +
+                $"同意的話：他那邊會拿到這 **{_personas.Lines(sourceGuild.Id).Count}** 條設定，" +
+                $"而且接下來 {PersonaGrantStore.AuthorityTtl.TotalDays:0} 天可以直接用 `/ai pset` 維護**他那邊**的設定" +
+                "（不會拿到全域權限）。\n\n" +
+                $"-# 請求編號 `{request.Id}`｜{PersonaGrantStore.RequestTtl.TotalHours:0} 小時內有效｜" +
+                "只有這個伺服器的管理員（或有 `Manage Server` 權限的人）能按")
+            .Build();
+
+        var buttons = new ComponentBuilder()
+            .WithButton("✅ 同意並複製", PersonaGrantCid.AllowButton(request.Id), ButtonStyle.Success)
+            .WithButton("🚫 拒絕", PersonaGrantCid.DenyButton(request.Id), ButtonStyle.Danger)
+            .Build();
+
+        try
+        {
+            await ((IMessageChannel)channel).SendMessageAsync(embed: notice, components: buttons);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[授權] 通知發送失敗：{ex.Message}");
+            await RespondAsync($"❌ 通知發不出去（{ex.Message}）。請確認我在「{sourceGuild.Name}」有發言權限。",
+                ephemeral: true);
+            return;
+        }
+
+        Console.WriteLine($"[授權] {Context.User.Id} 請求把 {sourceGuild.Id} 的提示詞複製到 {targetGuildId}" +
+                          $"（{request.Id}）");
+
+        await RespondAsync(
+            $"📨 已把**授權請求**送到「{sourceGuild.Name}」的 <#{channel.Id}>（請求編號 `{request.Id}`）。\n" +
+            "那邊的管理員會看到一則通知，按「✅ 同意並複製」之後：\n" +
+            $"• 設定會直接複製到這裡（{(mode == PersonaMode.Replace ? "覆蓋現有的" : "追加")}）\n" +
+            "• 你之後可以直接用 `/ai pset` 維護這裡的設定（30 天）\n" +
+            "• 完成時我會在這個頻道回報",
+            ephemeral: true);
+
+        Console.WriteLine($"[授權] 通知已發到 {sourceGuild.Name} 的 #{channel.Name}（{channel.Id}）");
+    }
+
+    /// <summary>找一個「我在來源伺服器可以發言」的頻道（預設頻道優先，其次照順序找）。</summary>
+    private static SocketTextChannel? PickNoticeChannel(SocketGuild guild)
+    {
+        if (guild.SystemChannel is { } system && CanPost(system)) return system;
+
+        return guild.TextChannels
+            .OrderBy(c => c.Position)
+            .FirstOrDefault(CanPost);
+    }
+
+    private static bool CanPost(SocketTextChannel channel)
+        => channel.Guild.CurrentUser.GetPermissions(channel).SendMessages;
+
+    /// <summary>沒有授權時要講的話（順便告訴他「怎麼拿到授權」）。</summary>
+    private string NotAuthorizedMessage()
+    {
+        var listConfigured = _options.AdminUserIds.Length > 0;
+
+        return "這個指令需要授權。有兩種方式：\n" +
+               "• **主機端名單**：把自己加進 `LLM_ADMIN_IDS`（那會同時給全域權限，" +
+               "通常只有主機主人需要）\n" +
+               "• **請來源伺服器同意**（推薦）：用 `/ai pset from:<伺服器ID>` —— " +
+               "我會在**那個伺服器**發一則通知，那邊的管理員按「同意」之後，" +
+               "你就能維護**這裡**的設定\n" +
+               (listConfigured ? "" : "\n（目前主機端沒有設定 `LLM_ADMIN_IDS`，所以名單那條路是空的）");
+    }
+
     private static string Truncate(string text, int max)
         => text.Length <= max ? text : text[..max] + "…";
 
@@ -274,28 +416,25 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     ///    斜線指令是 Discord 直接送到 Bot 的互動，**模型碰不到**，
     ///    而且少了 key 就不會出現在對話紀錄裡。真的被騙的風險在 `OwnerTools`（全域設定）那邊。
     /// </summary>
-    [SlashCommand("pset", "設定這個伺服器的自訂提示詞（只有後台指定的管理員能用）")]
+    [SlashCommand("pset", "設定這個伺服器的自訂提示詞（管理員，或經來源伺服器按鈕同意）")]
     public async Task PersonaSetAsync(
         [Summary("text", "要設定的內容（一句重點；留空＝只顯示目前的設定）")] string? text = null,
         [Summary("mode", "Append＝追加；Replace＝覆蓋掉這個伺服器現有的全部")] PersonaMode mode = PersonaMode.Append,
         [Summary("clear", "清空這個伺服器的自訂提示詞")] bool clear = false,
         [Summary("from", "複製來源：另一個伺服器的 ID 或名稱（把那邊的設定整套帶過來）")] string? from = null)
     {
-        // ── 授權：後台指定的管理員（fail closed：沒設定名單＝沒人能用）──
-        if (!_options.AdminUserIds.Contains(Context.User.Id))
-        {
-            await RespondAsync(
-                "這個指令只有後台指定的管理員能用（`LLM_ADMIN_IDS` 名單上的人）。\n" +
-                (Context.Guild is null ? "" : "你可以用 `@我 記住：…` 教它這個伺服器專屬的規矩。"),
-                ephemeral: true);
-            return;
-        }
-
         var guildId = Context.Guild?.Id ?? 0;
 
         if (guildId == 0)
         {
             await RespondAsync("這個指令要在伺服器裡使用（自訂提示詞是「每個伺服器一份」的）。", ephemeral: true);
+            return;
+        }
+
+        // ── 授權：主機端名單，或「來源伺服器按按鈕同意」───────
+        if (!CanSetPersona(guildId, Context.User.Id))
+        {
+            await RespondAsync(NotAuthorizedMessage(), ephemeral: true);
             return;
         }
 

@@ -2070,6 +2070,63 @@ public static class SelfTest
             && emptyCopy.Lines.Count == 3,
             $"copied={emptyCopy.Copied}, 目標 {emptyCopy.Lines.Count} 條");
 
+        // ── 4e) 跨伺服器授權：在來源伺服器按「同意」的按鈕 ─────────────
+        //     使用者要的是「讓他在另一個伺服器傳授權通知按鈕」：
+        //     請求者在 B、通知發在 A、由 A 的人按下同意。
+        var grants = new PersonaGrantStore();
+        var gnow = new DateTimeOffset(2026, 7, 5, 12, 0, 0, TimeSpan.Zero);
+
+        Check("一開始沒有待處理的請求", grants.PendingCount == 0);
+
+        var request = grants.Request(
+            sourceGuildId: 1111UL, targetGuildId: 2222UL, targetChannelId: 3333UL,
+            requesterId: 7UL, mode: PersonaGrantModes.CopyReplace, now: gnow);
+
+        Check("★ 建立請求會拿到一組編號（按鈕的 custom_id 帶著它）",
+            request.Id.Length == 8 && grants.PendingCount == 1, request.Id);
+
+        Check("★ 同意前：請求者在那個伺服器**還沒有**任何授權",
+            grants.PeekAuthority(2222UL, 7UL, gnow) is null);
+
+        Check("★ 授權是「按伺服器」給的（別的伺服器不會跟著開）",
+            grants.Authorize(2222UL, 7UL, gnow) is { } auth
+            && auth.ExpiresAt == gnow + PersonaGrantStore.AuthorityTtl
+            && grants.PeekAuthority(2222UL, 7UL, gnow) is not null
+            && grants.PeekAuthority(1111UL, 7UL, gnow) is null
+            && grants.PeekAuthority(2222UL, 99UL, gnow) is null);
+
+        Check("授權有期限（30 天後失效）",
+            grants.PeekAuthority(2222UL, 7UL, gnow + PersonaGrantStore.AuthorityTtl) is null);
+
+        Check("★ 請求可以用編號查回來（按鈕靠它）",
+            grants.Peek(request.Id, gnow)?.TargetGuildId == 2222UL);
+
+        var taken = grants.Take(request.Id, gnow);
+        Check("★ 同意之後要把請求拿走（同一顆按鈕不能按兩次，否則會重複複製）",
+            taken is not null && grants.Peek(request.Id, gnow) is null && grants.PendingCount == 0);
+
+        // 過期的請求不能用
+        var expired = grants.Request(1111UL, 2222UL, 3333UL, 7UL, PersonaGrantModes.CopyAppend, gnow);
+        Check("★ 超過 24 小時的請求會失效（不會放到天荒地老）",
+            grants.Peek(expired.Id, gnow + PersonaGrantStore.RequestTtl) is null,
+            $"存活時間 {PersonaGrantStore.RequestTtl.TotalHours:0} 小時");
+
+        Check("編號亂打 / 空白都不會丟例外",
+            grants.Peek("不存在", gnow) is null
+            && grants.Peek("", gnow) is null
+            && grants.Peek(null, gnow) is null);
+
+        // Purge 會清掉過期的請求與授權
+        var toPurge = new PersonaGrantStore();
+        var stale = toPurge.Request(1UL, 2UL, 3UL, 4UL, PersonaGrantModes.CopyAppend, gnow);
+        toPurge.Authorize(2UL, 4UL, gnow);
+
+        Check("★ Purge 會清掉過期的請求與授權（記憶體不會一直長大）",
+            toPurge.PendingCount == 1 && toPurge.AuthorityCount == 1
+            && toPurge.Purge(gnow + TimeSpan.FromDays(31)) == 2
+            && toPurge.PendingCount == 0 && toPurge.AuthorityCount == 0,
+            $"請求 {stale.Id}");
+
         // ── 5) 忘記與重設 ────────────────────────────────
         var before = store.Lines(guildA).Count;
         Check("★ 用關鍵字刪掉符合的規則", store.Forget(guildA, "條列") == 1 && store.Lines(guildA).Count == before - 1);

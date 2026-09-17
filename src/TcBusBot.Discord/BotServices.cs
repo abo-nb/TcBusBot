@@ -84,6 +84,9 @@ internal static class BotServices
         services.AddSingleton(sp => new GuildPersonaStore(
             sp.GetRequiredService<ILlmStateStore>(), cfg.Llm.BuildPersonaLimits()));
 
+        // 跨伺服器授權（按鈕同意）——只在記憶體，重啟後重新請求即可
+        services.AddSingleton<PersonaGrantStore>();
+
         services.AddSingleton<IChatToolProvider>(sp =>
             cfg.Llm.IsConfigured && cfg.Llm.ToolsEnabled
                 ? new BotToolProvider(

@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 561 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 571 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 561 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 571 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3591,6 +3591,57 @@ Discord 上有兩種名字，而且常常不一樣：
 
 `--dryrun` 另外用 **IL 掃描**確認 `CopyFromAsync` 真的呼叫 `GuildPersonaStore.CopyFrom`
 而且**有**呼叫 `SocketGuild.GetUser`（= 真的檢查「你也在來源伺服器裡」）。
+
+#### 20.20.2 授權改用「來源伺服器按按鈕同意」（不用改環境變數）
+
+原本 `/ai pset from:` 的規則是「你是 `LLM_ADMIN_IDS` 名單上的人，而且**你也在來源伺服器裡**」。
+那條規則在真實情境下很怪：
+
+* 想把設定給**朋友那個伺服器**時，你不在那邊 —— 於是只剩下「把對方加進 `LLM_ADMIN_IDS`」，
+  但那是一個**主機端名單**：加人等於給他**全域**權限（改所有伺服器都適用的規則）。
+  只是要讓他自己那個伺服器能設定提示詞，卻順便送了全域權限。
+* 而且改名單要重啟服務，不是「當場」能決定的事。
+
+改成：**請求者在目標伺服器發起 → Bot 在來源伺服器發一則通知 → 那邊的人按按鈕同意**。
+
+```
+（B 伺服器）/ai pset from:<A> mode:Replace
+      ↓  建立 PendingGrant（24 小時有效，8 碼編號）
+（A 伺服器）🤝 授權通知  [✅ 同意並複製] [🚫 拒絕]
+      ↓  按下同意（按鈕的 custom_id 帶著請求編號）
+  Authorize(targetGuild, requester, 30 天) ＋ CopyFrom(...) ＋ 回報到 B 的頻道
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 通知發在**來源**伺服器（不是請求者那邊） | 要給出去的是那邊的東西，同意的人當然要在那邊 —— 這就是「在另一個伺服器傳授權通知」 |
+| 同意的資格＝**伺服器擁有者／Manage Server／主機名單** | 這是「在伺服器裡驗證」：直接用 Discord 的權限，不必維護第二份名單 |
+| 授權是 **(伺服器, 使用者)** 而不是「這個人」 | 他拿到的是「可以設定 B」，不是「變成萬用管理員」（測試就是在驗這件事） |
+| 同意之後**同時**給 30 天的 `/ai pset` 權限 | 不然他下次想改一個字又要再請一次，流程就變成麻煩而不是安全 |
+| 請求要被 **Take（消耗）** 而不是只查 | 同一顆按鈕能按兩次的話，會重複複製、也會重複發授權 |
+| 請求 24 小時、授權 30 天，全部都只在記憶體 | 跟訂閱與對話記憶同一個取捨：重啟就沒了，重新請求一次即可 |
+| 發起請求需要**目標**伺服器的 Manage Server | 不然任何路人都能讓別人的伺服器跳通知（變成通知洗頻器） |
+| 按下按鈕之後把通知**改寫**成結果（誰、什麼時候、同意或拒絕） | 決定留在頻道上，事後查得到 |
+| 找不到可發言的頻道時明確報錯（不是靜默） | 「通知發不出去」一定要讓請求者知道，否則他會一直等一個永遠不會來的回覆 |
+
+驗收（`tcbus selftest` 第 23 節新增 **10 項**）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| 建立請求拿到 8 碼編號、能用編號查回來 | 按鈕靠編號找回請求 |
+| 同意前沒有任何授權 | 不會「請求＝已授權」 |
+| 授權只開**那一個伺服器**（別的伺服器、別的人都拿不到） | 權限範圍 |
+| 授權 30 天後失效 | 期限 |
+| `Take` 之後查不到（同一顆按鈕不能按兩次） | 不會重複複製 |
+| 請求超過 24 小時失效 | 期限 |
+| 亂打／空白編號不丟例外 | 邊界 |
+| `Purge` 清掉過期的請求與授權 | 記憶體不會一直長大 |
+
+`--dryrun` 用 **IL 掃描**確認：`CanSetPersona` 同時檢查 `LLM_ADMIN_IDS` 與 `PeekAuthority`、
+`CopyFromAsync` 有 `RequestGrantAsync` 這條路，
+以及授權按鈕的 `IsApprover` 真的檢查 `OwnerId`／`GuildPermissions`／`LLM_ADMIN_IDS`，
+`HandleAsync` 真的會 `Take`（消耗請求）＋`Authorize`＋`CopyFrom`。
+
 
 
 
