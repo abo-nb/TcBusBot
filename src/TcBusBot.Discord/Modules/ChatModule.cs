@@ -83,7 +83,17 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 snapshot is null
                     ? "（空的，還沒聊過）"
                     : $"{snapshot.SegmentCount} 段／目前 {snapshot.CurrentTurnCount} 則" +
+                      (snapshot.AmbientTurnCount > 0 ? $"（含 {snapshot.AmbientTurnCount} 則偷聽到的閒聊）" : "") +
                       (snapshot.Idle is { } idle ? $"（最後一次 {idle.TotalMinutes:0} 分鐘前）" : ""),
+                inline: false)
+            .AddField("偷聽",
+                !_options.Eavesdrop || _options.EavesdropMaxMessages <= 0 || _options.EavesdropSeconds <= 0
+                    ? "❌ 已關閉（只回 @ 它或回覆它的訊息）"
+                    : snapshot is { ListenRemaining: > 0 }
+                        ? $"👂 正在偷聽：還能判斷 {snapshot.ListenRemaining} 則／" +
+                          $"安靜 {snapshot.ListenTimeLeft?.TotalSeconds:0} 秒後停止"
+                        : $"✅ 已啟用（回完話後開始聽：最多判斷 {_options.EavesdropMaxMessages} 則／" +
+                          $"安靜 {_options.EavesdropSeconds} 秒後回到「等 @」）",
                 inline: false)
             .WithFooter("用法：@ 我 或 回覆我的訊息就會回話｜/ai forget 可以清掉這個頻道的記憶");
 

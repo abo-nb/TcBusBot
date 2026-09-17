@@ -583,8 +583,8 @@ public static class Program
                               : ""));
         Console.WriteLine($"  面板動作　　 ：{(cfg.Llm.UiActions ? "模型可以幫使用者按按鈕（開面板／設起訖／找路線／訂閱／復原）" : "關閉")}");
         Console.WriteLine($"  偷聽模式　　 ：{(cfg.Llm.Eavesdrop
-            ? $"回完話後再聽 {cfg.Llm.EavesdropMaxMessages} 則／{cfg.Llm.EavesdropSeconds} 秒" +
-              "（判斷不是對它說的就停止、回到等 @）"
+            ? $"回完話後繼續聽（最多判斷 {cfg.Llm.EavesdropMaxMessages} 則／安靜 {cfg.Llm.EavesdropSeconds} 秒後回到等 @）" +
+              (cfg.Llm.EavesdropContext ? "；聽到的閒聊會留下來當上下文" : "")
             : "關閉")}");
         Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
         Console.WriteLine();

@@ -5,6 +5,7 @@ using Discord.Interactions;
 using Discord.WebSocket;
 using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Bus;
+using TcBusBot.Core.Chat;
 using TcBusBot.Core.Configuration;
 using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Models;
@@ -448,6 +449,9 @@ public static class DryRun
 
         // ── 模型「幫使用者按按鈕」（UI 動作）──────────────────
         AuditUiTools(data);
+
+        // ── 偷聽模式的入口（「後面的訊息全被忽略」的那個 bug）────
+        AuditEavesdropWiring();
 
         // ── DI 容器（與真正的 Bot 用同一份註冊程式碼）──────────
         using var client = new DiscordSocketClient(new DiscordSocketConfig
@@ -1299,7 +1303,7 @@ public static class DryRun
     /// 剛好掃到別人運算元裡的位元組時，解析結果不會是
     /// <c>InteractionModuleBase</c>／<c>ISocketMessageChannel</c>／本模組的方法，會直接被丟掉。
     /// </summary>
-    private static List<string> CollectCalls(MethodInfo method)
+    private static List<string> CollectCalls(MethodInfo method, bool resolveAll = false)
     {
         var target = method;
 
@@ -1332,7 +1336,8 @@ public static class DryRun
             catch (Exception) { continue; }
 
             var owner = called?.DeclaringType?.Name ?? "";
-            var interesting = owner == nameof(SayModule)
+            var interesting = resolveAll
+                              || owner == nameof(SayModule)
                               || owner.StartsWith("InteractionModuleBase", StringComparison.Ordinal)
                               || owner is "ISocketMessageChannel" or "IMessageChannel";
 
@@ -1508,6 +1513,36 @@ public static class DryRun
         using (var doc = System.Text.Json.JsonDocument.Parse("""{"id":"1"}"""))
             Expect("沒有 flags 欄位 → 0（保守判斷成沒開）",
                 MessageContentIntentProbe.ParseFlags(doc.RootElement) == 0);
+
+        // ── 偷聽設定本身合不合理 ─────────────────────────
+        //    這裡的錯誤都要等「真的有人在頻道上聊天」才會出現，
+        //    所以離線就要先問一次。
+        var ev = llm.Eavesdrop;
+        var evMsgs = llm.EavesdropMaxMessages;
+        var evSec = llm.EavesdropSeconds;
+
+        if (ev && (evMsgs <= 0 || evSec <= 0))
+        {
+            Console.WriteLine($"  ℹ 偷聽已停用（上限設 0：判斷 {evMsgs} 則／{evSec} 秒）→ " +
+                              "只回 @ 它或回覆它的訊息");
+        }
+        else if (ev)
+        {
+            Console.WriteLine($"  ℹ 偷聽：回完話後最多判斷 {evMsgs} 則，安靜 {evSec} 秒後回到「等 @」" +
+                              (llm.EavesdropContext ? "；聽到的閒聊會留下來當上下文" : "；不保留閒聊"));
+
+            if (evMsgs < 5)
+                Console.WriteLine("  ℹ 提示：一群人在聊天時，中間被 @ 一次就會重新開窗。" +
+                                  "判斷上限太小（例如 3）會讓它講兩句就退出 —— 使用者會覺得「後面的訊息被忽略」");
+
+            if (evSec < 30)
+                Problem($"偷聽的閒置時間只有 {evSec} 秒 —— 一群人聊天很容易超過，Bot 會中途退出");
+        }
+
+        // 判斷成本（每一則要問一次模型）→ 讓使用者看得到「最壞情況花多少」
+        if (ev && evMsgs > 0)
+            Console.WriteLine($"  ℹ 最壞情況：一輪偷聽會多花約 {evMsgs} 次短判斷" +
+                              $"（每次約 250 tokens，合計約 {evMsgs * 250:N0} tokens）");
     }
 
     /// <summary>
@@ -1863,6 +1898,116 @@ public static class DryRun
                 Problem($"「{text}」只是普通回覆，卻被當成「聲稱做了動作」");
 
         Console.WriteLine("  ✔ 誠實檢查：聲稱做完了卻沒呼叫工具時會加警告（一般回覆不會誤判）");
+    }
+
+    /// <summary>
+    /// **偷聽模式的入口檢查**：訊息要真的進得到偷聽那段程式。
+    ///
+    /// 為什麼需要這一關（真的出過包）：偷聽的功能、判斷器、窗口全都寫好了，
+    /// 但入口那行 <c>if (!mentioned && !replyAddressed) return;</c> 會在**到達偷聽之前**就返回 ——
+    /// 所以「回完話後繼續聽」從來沒有生效過，使用者看到的是
+    /// 「@ 它講一句之後，其他人再講什麼它都當作沒看到」。
+    /// 這種「功能寫好了但接不到」的 bug，元件限制與單元測試都抓不到，
+    /// 只有把**入口的判斷**與**實際呼叫到的方法**一起驗才抓得到。
+    /// </summary>
+    private static void AuditEavesdropWiring()
+    {
+        Console.WriteLine("▶ 偷聽入口檢查  沒被 @ 的訊息要進得到偷聽（曾經整段接不到）");
+
+        // ── 1) 入口判斷的真值表 ──────────────────────────
+        var cases = new (bool Mentioned, bool Reply, bool Listening, bool Expected, string Why)[]
+        {
+            (true, false, false, true, "@ 它 → 要處理"),
+            (false, true, false, true, "回覆它（或回覆記憶裡的訊息）→ 要處理"),
+            (false, false, true, true, "★ 沒 @ 沒回覆，但正在偷聽 → 一定要處理（這就是以前漏掉的）"),
+            (false, false, false, false, "什麼都沒有 → 不處理（維持原本「看到訊息就回」的禁令）")
+        };
+
+        foreach (var (mentioned, reply, listening, expected, why) in cases)
+        {
+            var actual = LlmChatService.ShouldHandle(mentioned, reply, listening);
+
+            if (actual != expected)
+                Problem($"入口判斷錯了（{why}）：ShouldHandle({mentioned}, {reply}, {listening}) = {actual}");
+        }
+
+        Console.WriteLine("  ✔ 入口判斷：@ 它／回覆它／**正在偷聽** 三種都會進來，其他一律不理");
+
+        // ── 2) 實際的入口程式碼有沒有用到那個判斷 ──────────
+        var handle = typeof(LlmChatService).GetMethod("HandleCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        if (handle is null)
+        {
+            Problem("找不到 LlmChatService.HandleCoreAsync —— 無法驗證偷聽入口");
+            return;
+        }
+
+        var calls = CollectCalls(handle, resolveAll: true);
+
+        // 真正交給 Core 的那一行在 AnswerAsync（HandleCoreAsync 只是入口與冷卻）
+        var answer = typeof(LlmChatService).GetMethod("AnswerAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        if (answer is not null) calls.AddRange(CollectCalls(answer, resolveAll: true));
+
+        calls = calls.Distinct(StringComparer.Ordinal).ToList();
+
+        var interesting = calls
+            .Where(c => c.Contains("Chat") || c.Contains("Listen") || c.Contains("ShouldHandle"))
+            .Distinct()
+            .ToList();
+
+        Console.WriteLine($"  ℹ 訊息入口會呼叫：{string.Join("、", interesting)}");
+
+        if (!calls.Contains("LlmChatService.ShouldHandle"))
+            Problem("訊息入口沒有用 ShouldHandle —— 沒被 @ 的訊息可能在到達偷聽之前就被丟掉了");
+
+        if (!calls.Contains("ConversationStore.PeekListening"))
+            Problem("訊息入口沒有查偷聽窗口 —— 偷聽永遠不會生效");
+
+        if (!calls.Contains("ChatOrchestrator.AskAsync"))
+            Problem("訊息入口沒有把訊息交給 AskAsync —— 所有規則（偷聽判斷、上下文、額度）都在那裡");
+
+        // 舊版的 bug：看到「@ 了別人」就**停止偷聽**（多人頻道裡 @ 別人太常見）。
+        // 現在那條路徑只是「不插話」，退出與否交給 Core 的判斷。
+        if (calls.Contains("ConversationStore.StopListening"))
+            Problem("訊息入口直接停止了偷聽 —— 「@ 了別人」等情況應該留在頻道裡繼續聽（交給 Core 判斷）");
+
+        Console.WriteLine("  ✔ 入口真的會：查偷聽窗口 → 交給 ShouldHandle → 再交給 AskAsync（不會自己決定退出）");
+
+        // ── 3) Core 的偷聽路徑本身有沒有「留在頻道裡」────────────────
+        var ask = typeof(ChatOrchestrator).GetMethod(nameof(ChatOrchestrator.AskAsync));
+
+        if (ask is null)
+        {
+            Problem("找不到 ChatOrchestrator.AskAsync —— 無法驗證偷聽的核心規則");
+            return;
+        }
+
+        var coreCalls = CollectCalls(ask, resolveAll: true);
+
+        // 「@ 了別人」這種不花錢的訊息：只延後到期，不扣判斷次數
+        if (!coreCalls.Contains("ConversationStore.TouchListen"))
+            Problem("AskAsync 沒有在「@ 了別人」時 TouchListen —— 那種訊息會把判斷額度吃掉");
+
+        // 每一則判斷過／聽到的訊息都要留下來當上下文（先經過 orchestrator 自己的 RecordAmbient）
+        if (!coreCalls.Contains("ChatOrchestrator.RecordAmbient"))
+            Problem("AskAsync 沒有把偷聽到的訊息記進上下文 —— 「閒聊帶不進去」的 bug 會回來");
+
+        if (!coreCalls.Contains("ConversationStore.ConsumeListen"))
+            Problem("AskAsync 沒有消耗偷聽額度 —— 窗口永遠不會結束");
+
+        // 再往下一層：ChatOrchestrator.RecordAmbient 真的要寫進對話記憶（而且設定關掉時不寫）
+        var remember = typeof(ChatOrchestrator).GetMethod(nameof(ChatOrchestrator.RecordAmbient));
+        var rememberCalls = remember is null ? [] : CollectCalls(remember, resolveAll: true);
+
+        if (!rememberCalls.Contains("ConversationStore.RecordAmbient"))
+            Problem("ChatOrchestrator.RecordAmbient 沒有真的寫進對話記憶");
+        else if (!rememberCalls.Contains("LlmOptions.get_EavesdropContext"))
+            Problem("ChatOrchestrator.RecordAmbient 沒有看 LLM_EAVESDROP_CONTEXT 設定 —— 關不掉會很花 token");
+
+        Console.WriteLine("  ✔ 核心真的會：TouchListen（@ 別人）／ConsumeListen（判斷）／RecordAmbient（留下上下文）");
     }
 
     /// <summary>

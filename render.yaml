@@ -101,13 +101,18 @@ services:
       # 讓模型幫使用者按面板按鈕（開面板／設起訖／找路線／訂閱／復原）
       - key: LLM_UI_ACTIONS
         value: "true"
-      # 偷聽模式：回完話後再聽幾句，判斷不是對它說的就停止
+      # 偷聽模式：回完話後繼續聽沒 @ 它的訊息（接話／先不出聲／退出三種判斷）
       - key: LLM_EAVESDROP
         value: "true"
+      # 判斷上限（成本上限；一群人聊天很容易超過，設太小會讓它聊兩句就退出）
       - key: LLM_EAVESDROP_MESSAGES
-        value: "3"
+        value: "12"
+      # 閒置窗：最後一則訊息之後這麼久沒人講話才停止偷聽（每則訊息都會往後延）
       - key: LLM_EAVESDROP_SECONDS
         value: "120"
+      # 偷聽到的閒聊留下來當上下文（之後被 @ 時才接得上大家在聊什麼）
+      - key: LLM_EAVESDROP_CONTEXT
+        value: "true"
 
       - key: DOTNET_ENVIRONMENT
         value: Production

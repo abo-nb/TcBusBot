@@ -163,7 +163,7 @@ public sealed class ChatOrchestrator
     /// ⚠️ 順序有意義：學到的規則放最後，模型對「最後的指示」通常最聽話，
     /// 也才壓得過前面那些通用規則（使用者教它「講話簡短一點」就該真的簡短）。
     /// </summary>
-    public string EffectiveSystemPrompt(ulong guildId, bool isOwner = false)
+    public string EffectiveSystemPrompt(ulong guildId, bool isOwner = false, bool ambientContext = false)
     {
         var prompt = isOwner
             ? OwnerInstructions.TrimStart() + "\n\n" + _options.SystemPrompt
@@ -172,8 +172,27 @@ public sealed class ChatOrchestrator
         if (_options.ToolsEnabled && _tools is not NoChatTools)
             prompt += ToolInstructions;
 
+        // 上下文裡有「偷聽到的閒聊」時才加這一段：
+        // 那些句子長得跟「對 Bot 說的話」一模一樣（「你要不要一起去？」），
+        // 不講清楚的話模型會把它們當成在問它。
+        if (ambientContext)
+            prompt += AmbientContextNote;
+
         return prompt + _personas.Overlay(guildId);
     }
+
+    /// <summary>
+    /// 上下文裡有 `[閒聊]` 時附加的說明（只在真的有閒聊時才出現，平常不會浪費 token）。
+    /// </summary>
+    public const string AmbientContextNote = """
+
+
+        【頻道背景】
+        這個頻道是多人聊天，歷史中標了 `[閒聊]` 的是**其他人互相講的話**（不是對你說的）。
+        它們只是背景資訊：不要回覆它們、也不要以為那些問題是在問你，
+        但可以拿來理解大家正在聊什麼、剛剛提到哪條公車或哪個地點。
+        你只需要回應**最後一則**訊息。
+        """;
 
     /// <summary>
     /// 回答一則訊息。
@@ -185,7 +204,11 @@ public sealed class ChatOrchestrator
     /// <param name="addressed">
     /// 這一則有沒有明確對 Bot 說話（@ 提及或回覆）。
     /// <c>false</c> 代表這是**偷聽到的**訊息：會先問 LLM「這是在跟我說話嗎」，
-    /// 不是就回傳 <see cref="ChatAnswer.Ignored"/> 並停止偷聽（呼叫端不要送任何訊息）。
+    /// 不是就回傳 <see cref="ChatAnswer.Ignored"/>（呼叫端不要送任何訊息）。
+    /// </param>
+    /// <param name="mentionsOtherHuman">
+    /// 這一則 @ 了**別的真人**嗎（<paramref name="addressed"/> 為 false 時才有意義）。
+    /// 這是「在跟別人說話」的鐵證：不插話、**不花錢判斷**，但**繼續偷聽**。
     /// </param>
     public async Task<ChatAnswer> AskAsync(
         ulong guildId,
@@ -193,12 +216,27 @@ public sealed class ChatOrchestrator
         ChatTurn incoming,
         ChatTurn? replyTarget,
         CancellationToken cancellationToken = default,
-        bool addressed = true)
+        bool addressed = true,
+        bool mentionsOtherHuman = false)
     {
         var startedAt = DateTimeOffset.UtcNow;
         var now = DateTimeOffset.UtcNow;
 
-        // ── 0a) 偷聽判斷（只在「偷聽到的訊息」時做）──────────
+        // ── 0a) 主人授權（必須在「寫進對話記憶」之前）──────────
+        //    ⚠️ key 一定要在這一刻就從內容裡拿掉：否則它會進到歷史、提示詞與 log。
+        //    偷聽也會把訊息寫進記憶（見下面的 RecordAmbient），
+        //    所以這一關必須排在偷聽之前。
+        var admin = AdminAuthorizer.Check(incoming.AuthorId, incoming.Content, _options);
+
+        if (admin.KeyPresent || admin.CleanedContent != incoming.Content)
+        {
+            incoming = incoming with { Content = admin.CleanedContent };
+
+            if (admin.UnauthorizedAttempt)
+                Console.WriteLine($"[授權] ⚠️ 使用者 {incoming.AuthorId} 帶了 key 但不在主人名單裡 → 當一般訊息處理");
+        }
+
+        // ── 0b) 偷聽判斷（只在「偷聽到的訊息」時做）──────────
         var listenTokens = 0;
         var botName = _client ?? "Bot";
 
@@ -210,7 +248,17 @@ public sealed class ChatOrchestrator
             if (_conversations.PeekListening(guildId, channelId, now) is null)
                 return Ignored(startedAt, "沒有在偷聽（沒有人對它說話）");
 
-            _conversations.ConsumeListen(guildId, channelId, now);
+            // ★「@ 了別人」＝ 鐵證：這句是在跟那個人說話。
+            //   不插話、**不問模型（不花錢）**，但**繼續偷聽** ——
+            //   多人頻道裡 @ 別人太常見，以前在這裡直接停止偷聽，
+            //   結果就是「有人 @ 別人之後，Bot 之後的訊息全部不理」。
+            if (mentionsOtherHuman)
+            {
+                RecordAmbient(guildId, channelId, incoming, "偷聽到的訊息（@ 了別人）");
+                _conversations.TouchListen(guildId, channelId, now);
+
+                return Ignored(startedAt, "訊息 @ 了別人 → 這句不插話（繼續偷聽）");
+            }
 
             var draftForCheck = _conversations.Draft(guildId, channelId, incoming, replyTarget);
             var detector = new AddresseeDetector(_llm, _options);
@@ -240,24 +288,29 @@ public sealed class ChatOrchestrator
                 _budget.Record(usage.InputTokens, usage.OutputTokens, guildId, DateTimeOffset.UtcNow);
             }
 
-            if (!verdict.Addressed)
+            // 判斷完就扣掉一次判斷額度（並把窗口往後延）——
+            // ⚠️ 一定要在「要不要退出」之前扣：判斷本身已經花錢了。
+            var stillListening = _conversations.ConsumeListen(guildId, channelId, now) is not null;
+
+            if (verdict.Verdict != Addressee.Reply)
             {
-                // ★ 不是在跟我說話 → 停止偷聽、回到等 @ 的模式，而且**什麼都不送**
-                _conversations.StopListening(guildId, channelId);
+                // ★ 不是在跟 Bot 說話 → **什麼都不送**，但這一則要留下來當上下文
+                //   （使用者要的是「我們剛剛聊的，之後 @ 它時它接得上」）。
+                RecordAmbient(guildId, channelId, incoming,
+                    verdict.Verdict == Addressee.Stop ? "偷聽結束前聽到的對話" : "偷聽到的閒聊");
+
+                if (verdict.Verdict == Addressee.Stop)
+                {
+                    _conversations.StopListening(guildId, channelId);
+                    return Ignored(startedAt, verdict.Detail);
+                }
+
+                // SKIP：不出聲，但留在頻道裡繼續聽（下一次才接得上）
                 return Ignored(startedAt, verdict.Detail);
             }
-        }
 
-        // ── 0b) 主人授權（必須在「寫進對話記憶」之前）──────────
-        //    ⚠️ key 一定要在這一刻就從內容裡拿掉：否則它會進到歷史、提示詞與 log。
-        var admin = AdminAuthorizer.Check(incoming.AuthorId, incoming.Content, _options);
-
-        if (admin.KeyPresent || admin.CleanedContent != incoming.Content)
-        {
-            incoming = incoming with { Content = admin.CleanedContent };
-
-            if (admin.UnauthorizedAttempt)
-                Console.WriteLine($"[授權] ⚠️ 使用者 {incoming.AuthorId} 帶了 key 但不在主人名單裡 → 當一般訊息處理");
+            if (!stillListening)
+                Console.WriteLine("[llm] 👂 判斷額度用完 → 這一則回完就回到「等 @」");
         }
 
         var draft = _conversations.Draft(guildId, channelId, incoming, replyTarget);
@@ -323,7 +376,10 @@ public sealed class ChatOrchestrator
         var plugins = _options.ToolsEnabled ? _tools.CreateFor(toolContext, toolLog) : [];
 
         var request = new LlmRequest(
-            SystemPrompt: EffectiveSystemPrompt(guildId, admin.IsAdmin),
+            SystemPrompt: EffectiveSystemPrompt(
+                guildId,
+                admin.IsAdmin,
+                ambientContext: trimmed.Turns.Any(t => t.Ambient)),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,
@@ -404,6 +460,19 @@ public sealed class ChatOrchestrator
                 ToolChangedState = toolLog.ChangedState
             };
         }
+    }
+
+    /// <summary>
+    /// 把「偷聽到的訊息」留下來當上下文（設定 `LLM_EAVESDROP_CONTEXT=false` 時什麼都不做）。
+    ///
+    /// 為什麼放在 orchestrator 而不是 Discord 那一層：這是**規則**
+    /// （哪些訊息會變成上下文、要不要留），跟「誰在偷聽」一樣必須能離線測試。
+    /// </summary>
+    public void RecordAmbient(ulong guildId, ulong channelId, ChatTurn turn, string reason)
+    {
+        if (!_options.EavesdropContext) return;
+
+        _conversations.RecordAmbient(guildId, channelId, turn, reason);
     }
 
     /// <summary>把 Bot 的回覆記進同一段（附上真正的訊息 ID）。</summary>

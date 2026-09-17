@@ -118,7 +118,7 @@ public static class SelfTest
         Section("27. 面板與 LLM 用同一套站牌解析（同名站牌找不到的根因）");
         TestSharedStopPicks();
 
-        Section("28. 偷聽模式（回完話後再聽幾句，不是對它說的就停）");
+        Section("28. 偷聽模式（回完話後繼續聽：接話／先不出聲／退出，閒聊要留下來）");
         TestEavesdrop();
 
         Console.WriteLine();
@@ -2435,23 +2435,29 @@ public static class SelfTest
     }
 
     /// <summary>
-    /// 偷聽模式：回完話之後順便聽幾句，如果判斷不是在對它說話就停止、回到等 @。
+    /// 偷聽模式：回完話之後順便聽幾句，判斷不是對它說話就安靜（或退出）。
     ///
-    /// 這裡驗三件事：
-    ///   1. 判斷器的解析（模型常常多講幾句；看不懂就當成「不是對我說」＝不要插話）
-    ///   2. 偷聽窗口的生命週期（開始／消耗／用完／過期／主動停止）
-    ///   3. 兩個上限都要生效（只限則數會被慢慢講拖著花錢；只限時間會被連續灌訊息）
+    /// 這裡驗四件事：
+    ///   1. 判斷器的解析（REPLY／SKIP／STOP；模型常多講幾句；看不懂就當成「先不出聲」）
+    ///   2. 偷聽窗口的生命週期（開始／消耗／用完／**滑動**過期／主動停止）
+    ///   3. 兩個上限都要生效（判斷則數 ＋ 閒置秒數）
+    ///   4. **多人頻道真的會用到的情境**：@ 別人之後還能繼續聽、
+    ///      SKIP 不會退出、**閒聊會被帶進上下文**
     /// </summary>
     private static void TestEavesdrop()
     {
-        // ── 1) 解析 ──────────────────────────────────────
-        Check("解析「YES」→ 是在對我說話", AddresseeDetector.Parse("YES") == true);
-        Check("解析「NO」→ 不是對我說", AddresseeDetector.Parse("NO") == false);
+        // ── 1) 解析（三種結果）────────────────────────────
+        Check("解析「REPLY」→ 接話", AddresseeDetector.Parse("REPLY") == Addressee.Reply);
+        Check("解析「SKIP」→ 不出聲但繼續聽", AddresseeDetector.Parse("SKIP") == Addressee.Skip);
+        Check("解析「STOP」→ 退出、回到等 @", AddresseeDetector.Parse("STOP") == Addressee.Stop);
+
         Check("★ 模型多講幾句時以最後出現的結論為準",
-            AddresseeDetector.Parse("先看有沒有問句… 我覺得 YES，但其實是在問別人 → NO") == false);
-        Check("看不懂的回答 → null（呼叫端當成「不是對我說」＝不插話）",
+            AddresseeDetector.Parse("看起來像在問我 REPLY，但其實是在約別人 → STOP") == Addressee.Stop);
+        Check("★ 看不懂的回答 → null（呼叫端當成「先不出聲」，而不是退出）",
             AddresseeDetector.Parse("我不確定") is null);
         Check("空字串 → null", AddresseeDetector.Parse("") is null);
+        Check("★ 舊版的 YES／NO 不會再被誤判成三種之一（換過提示詞就不該沿用）",
+            AddresseeDetector.Parse("YES") is null && AddresseeDetector.Parse("NO") is null);
 
         // ── 2) 提示詞內容 ────────────────────────────────
         var history = new List<ChatTurn>
@@ -2468,8 +2474,10 @@ public static class SelfTest
         Check("提示詞有最近的對話與新訊息",
             prompt.Contains("300 幾點來", StringComparison.Ordinal)
             && prompt.Contains("那我要不要等他", StringComparison.Ordinal));
-        Check("★ 指示「不確定時回 NO」（寧可少回一句也不要插話）",
-            AddresseeDetector.SystemPrompt.Contains("不確定時 → NO", StringComparison.Ordinal));
+        Check("★ 指示「不確定時 → SKIP」（不要插話，但也不要離開）",
+            AddresseeDetector.SystemPrompt.Contains("不確定時 → SKIP", StringComparison.Ordinal));
+        Check("★ 提示詞說明「離開之後就接不上了」（這是多人頻道被忽略的根因）",
+            AddresseeDetector.SystemPrompt.Contains("離開之後你就接不上了", StringComparison.Ordinal));
 
         // ── 3) 偷聽窗口 ──────────────────────────────────
         var options = new LlmOptions { Eavesdrop = true, EavesdropMaxMessages = 3, EavesdropSeconds = 120 };
@@ -2493,21 +2501,32 @@ public static class SelfTest
             store.PeekListening(guild, 99UL, now) is null);
 
         // 消耗
-        Check("消耗一次 → 剩 2 則", store.ConsumeListen(guild, channel, now)?.RemainingMessages == 2);
-        Check("再消耗 → 剩 1 則", store.ConsumeListen(guild, channel, now)?.RemainingMessages == 1);
-        Check("★ 用完最後一則 → 自動停止偷聽（回到等 @）",
+        Check("消耗一次 → 還剩 2 次判斷", store.ConsumeListen(guild, channel, now)?.RemainingMessages == 2);
+        Check("再消耗 → 還剩 1 次", store.ConsumeListen(guild, channel, now)?.RemainingMessages == 1);
+        Check("★ 用完最後一次判斷 → 自動停止偷聽（回到等 @）",
             store.ConsumeListen(guild, channel, now) is null
             && store.PeekListening(guild, channel, now) is null);
 
-        // 時間到
+        // ★ 滑動窗：每一則訊息都往後延，不是「從開窗起算」
+        store.StartListening(guild, channel, 120, 5, now);
+        var slid = store.TouchListen(guild, channel, now.AddSeconds(100));
+        Check("★ 時間窗是滑動的（100 秒後有人講話 → 再往後 120 秒，不會中途退出）",
+            slid is not null && slid.Until == now.AddSeconds(220),
+            $"到期 = 開窗後 {(slid!.Until - now).TotalSeconds:0} 秒");
+        Check("★ @ 了別人只是「延後到期」，不扣判斷次數",
+            slid.RemainingMessages == 5);
+        Check("判斷也一樣會把窗口往後延（ConsumeListen）",
+            store.ConsumeListen(guild, channel, now.AddSeconds(200))?.Until == now.AddSeconds(320));
+
+        // 閒置到時間到
         store.StartListening(guild, channel, 60, 5, now);
-        Check("★ 超過時間 → 自動停止",
+        Check("★ 超過時間沒人講話 → 自動停止",
             store.PeekListening(guild, channel, now.AddSeconds(61)) is null);
 
-        // 主動停止（判斷「不是在跟我說話」時走這條）
+        // 主動停止（判斷 STOP 時走這條）
         store.StartListening(guild, channel, 60, 5, now);
         var stopped = store.StopListening(guild, channel);
-        Check("★ 可以主動停止（判斷不是對它說的時候）",
+        Check("★ 可以主動停止（判斷 STOP 的時候）",
             stopped is not null && store.PeekListening(guild, channel, now) is null);
         Check("已經沒在偷聽時再停止回傳 null（不丟例外）",
             store.StopListening(guild, channel) is null);
@@ -2521,23 +2540,64 @@ public static class SelfTest
         // ── 4) snapshot 要看得到偷聽狀態（/ai status 用）──
         store.StartListening(guild, channel, 120, 2, now);
         var snapshot = store.Snapshot(guild, channel, now);
-        Check("★ `/ai status` 看得到「還在偷聽幾則／剩幾秒」",
+        Check("★ `/ai status` 看得到「還能判斷幾則／剩幾秒」",
             snapshot is { ListenRemaining: 2 } && snapshot.ListenTimeLeft > TimeSpan.Zero,
             $"{snapshot?.ListenRemaining} 則／{snapshot?.ListenTimeLeft?.TotalSeconds:0} 秒");
 
-        // ── 5) 「不是在跟我說話」的完整流程（偷聽 → 判斷 → 回到等 @）──
+        // ── 5) 「偷聽到的閒聊」要留下來當上下文 ────────────
+        var ambientStore = new ConversationStore(new LlmOptions { EavesdropContext = true });
+        var chatter = new List<ChatTurn>
+        {
+            new(ChatRole.User, "阿美", 88UL, 700UL, "你們晚餐要吃什麼？", now),
+            new(ChatRole.User, "小華", 89UL, 701UL, "都可以啊，不要太遠", now.AddSeconds(10))
+        };
+
+        foreach (var turn in chatter)
+            ambientStore.RecordAmbient(guild, channel, turn, "偷聽到的閒聊");
+
+        var after = ambientStore.Snapshot(guild, channel, now.AddSeconds(10));
+        Check("★ 偷聽到的閒聊會進到上下文（不是只有 Bot 回過的才記）",
+            after is { AmbientTurnCount: 2, CurrentTurnCount: 2 },
+            $"{after?.CurrentTurnCount} 則（其中閒聊 {after?.AmbientTurnCount}）");
+
+        Check("★ 閒聊在提示詞裡標成 [閒聊]（否則模型會以為那是在問它）",
+            (chatter[0] with { Ambient = true }).ToPromptText().StartsWith("[閒聊]", StringComparison.Ordinal)
+            && (chatter[0] with { Ambient = true }).ToPromptText()
+                .Contains("你們晚餐要吃什麼", StringComparison.Ordinal));
+        Check("一般訊息不會被標成閒聊（只有偷聽到的才會）",
+            !chatter[0].ToPromptText().Contains("[閒聊]", StringComparison.Ordinal));
+
+        // 同一則不會被記兩次
+        ambientStore.RecordAmbient(guild, channel, chatter[0], "重複");
+        Check("同一則訊息重複進來只記一次",
+            ambientStore.Snapshot(guild, channel, now.AddSeconds(10))?.CurrentTurnCount == 2);
+
+        // 有閒聊時才加說明；沒有閒聊就不浪費 token
+        var chat = new ChatOrchestrator(
+            new CountingLlmClient("REPLY"), new LlmOptions { SystemPrompt = "人格" },
+            new ConversationStore(new LlmOptions()), new WeeklyTokenBudget(new LlmOptions()),
+            NoChatTools.Instance, new GuildPersonaStore());
+
+        Check("★ 上下文裡有閒聊時，提示詞會說明「那是背景、不要回它們」",
+            chat.EffectiveSystemPrompt(guild, ambientContext: true)
+                .Contains("不要回覆它們", StringComparison.Ordinal));
+        Check("沒有閒聊時不會多送那一段（省 token）",
+            !chat.EffectiveSystemPrompt(guild).Contains("頻道背景", StringComparison.Ordinal));
+
+        // ── 6) 三種判斷結果的完整流程 ─────────────────────
         //    用假 LLM 數**呼叫次數**：判斷要花錢，所以「沒窗口時一次都不該問」是重點。
         var eavesdropOptions = new LlmOptions
         {
             Eavesdrop = true,
-            EavesdropMaxMessages = 3,
+            EavesdropMaxMessages = 5,
+            EavesdropContext = true,
             ToolsEnabled = false,
             TopicDetect = false,
             SystemPrompt = "測試",
             ApiKey = "test"
         };
 
-        var fakeLlm = new CountingLlmClient("YES");
+        var fakeLlm = new CountingLlmClient("REPLY");
         var eavesdropChat = new ChatOrchestrator(
             fakeLlm, eavesdropOptions, new ConversationStore(eavesdropOptions),
             new WeeklyTokenBudget(eavesdropOptions), NoChatTools.Instance, new GuildPersonaStore())
@@ -2554,30 +2614,91 @@ public static class SelfTest
             strayAnswer.Ignored && fakeLlm.Calls == 0,
             $"ignored={strayAnswer.Ignored}／LLM 呼叫 {fakeLlm.Calls} 次");
 
-        eavesdropChat.Conversations.StartListening(guild, channel, 120, 3, now);
+        eavesdropChat.Conversations.StartListening(guild, channel, 120, 5, now);
 
+        // ① REPLY：判斷 1 次 ＋ 回答 1 次
         var heardAnswer = eavesdropChat.AskAsync(
             guild, channel,
             new ChatTurn(ChatRole.User, "阿華", 77UL, 501UL, "那 304 呢？", now),
             null, cancellationToken: default, addressed: false).GetAwaiter().GetResult();
 
-        Check("★ 有窗口且判斷 YES → 照常回答（判斷 1 次 ＋ 回答 1 次）",
+        Check("★ 判斷 REPLY → 照常回答（判斷 1 次 ＋ 回答 1 次）",
             !heardAnswer.Ignored && heardAnswer.Ok && fakeLlm.Calls == 2,
             $"ignored={heardAnswer.Ignored}／LLM 呼叫 {fakeLlm.Calls} 次");
 
-        Check("回答完窗口繼續（3 則用掉 1 則，剩 2 則）",
-            eavesdropChat.Conversations.PeekListening(guild, channel, now)?.RemainingMessages == 2);
+        Check("回答完窗口繼續（5 次判斷用掉 1 次，剩 4 次）",
+            eavesdropChat.Conversations.PeekListening(guild, channel, now)?.RemainingMessages == 4);
 
-        fakeLlm.Reply = "NO";
-        var notForMe = eavesdropChat.AskAsync(
+        // ② SKIP：不出聲，但**不退出**（這是「後面說的被忽略」的主要修正）
+        fakeLlm.Reply = "SKIP";
+        var sideNote = eavesdropChat.AskAsync(
             guild, channel,
-            new ChatTurn(ChatRole.User, "阿美", 88UL, 502UL, "你要不要一起去吃火鍋？", now),
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 502UL, "我今天不想搭公車", now),
             null, cancellationToken: default, addressed: false).GetAwaiter().GetResult();
 
-        Check("★ 判斷 NO → 忽略並停止偷聽（回到等 @，只花 1 次判斷）",
-            notForMe.Ignored && fakeLlm.Calls == 3
+        Check("★ 判斷 SKIP → 不回話，但**繼續偷聽**（不是退出）",
+            sideNote.Ignored && fakeLlm.Calls == 3
+            && eavesdropChat.Conversations.PeekListening(guild, channel, now) is not null,
+            $"{sideNote.IgnoreReason ?? "（沒有說明）"}");
+
+        Check("★ SKIP 的訊息也留下來當上下文（之後 @ 它時接得上）",
+            eavesdropChat.Conversations.Snapshot(guild, channel, now)?.AmbientTurnCount >= 1);
+
+        // ③ @ 了別人：不問模型、不扣判斷次數，但繼續聽
+        var before = eavesdropChat.Conversations.PeekListening(guild, channel, now)!.RemainingMessages;
+
+        var otherPerson = eavesdropChat.AskAsync(
+            guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 503UL, "@小華 你要幾點到？", now),
+            null, cancellationToken: default, addressed: false, mentionsOtherHuman: true)
+            .GetAwaiter().GetResult();
+
+        Check("★ @ 了別人 → 不插話而且**不花錢判斷**（LLM 呼叫次數不變）",
+            otherPerson.Ignored && fakeLlm.Calls == 3, $"LLM 呼叫 {fakeLlm.Calls} 次");
+        Check("★ @ 了別人之後**還在偷聽**（以前在這裡直接退出，之後的訊息全被忽略）",
+            eavesdropChat.Conversations.PeekListening(guild, channel, now) is { } w
+            && w.RemainingMessages == before,
+            $"判斷次數 {before} → {eavesdropChat.Conversations.PeekListening(guild, channel, now)?.RemainingMessages}");
+
+        // ④ STOP：明確是別人之間的對話 → 退出、回到等 @
+        fakeLlm.Reply = "STOP";
+        var goodbye = eavesdropChat.AskAsync(
+            guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 504UL, "你要不要一起去吃火鍋？", now),
+            null, cancellationToken: default, addressed: false).GetAwaiter().GetResult();
+
+        Check("★ 判斷 STOP → 退出偷聽（回到等 @）",
+            goodbye.Ignored && fakeLlm.Calls == 4
             && eavesdropChat.Conversations.PeekListening(guild, channel, now) is null,
-            $"{notForMe.IgnoreReason ?? "（沒有說明）"}／LLM 呼叫 {fakeLlm.Calls} 次");
+            $"{goodbye.IgnoreReason ?? "（沒有說明）"}");
+
+        Check("★ STOP 之前聽到的內容仍然留在上下文裡",
+            eavesdropChat.Conversations.Snapshot(guild, channel, now)?.AmbientTurnCount >= 2);
+
+        // ⑤ 退出之後就真的不理了（連判斷都不問）
+        var afterStop = eavesdropChat.AskAsync(
+            guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 505UL, "那 300 呢？", now),
+            null, cancellationToken: default, addressed: false).GetAwaiter().GetResult();
+
+        Check("★ 退出後再講話 → 忽略（連判斷都不問）",
+            afterStop.Ignored && fakeLlm.Calls == 4);
+
+        // ⑥ 「再被 @ 一次」會重新開窗（多人頻道裡這是最常見的循環）
+        var restartConv = new ChannelConversation { GuildId = guild, ChannelId = channel };
+        var restartSegment = new ConversationSegment
+        {
+            GuildId = guild, ChannelId = channel, StartedAt = now, LastActivityAt = now
+        };
+        restartConv.Segments.Add(restartSegment);
+
+        eavesdropChat.RecordReply(
+            new ContextDecision(restartConv, restartSegment, [], NewSegment: false, Reason: "測試", ReplyTarget: null),
+            "好喔", messageId: 900UL, botId: 1UL, botName: "笨蛋猫猫", at: now);
+
+        Check("★ 又被 @ 一次 → 重新開一個完整的偷聽窗口",
+            eavesdropChat.Conversations.PeekListening(guild, channel, now)?.RemainingMessages
+                == eavesdropOptions.EavesdropMaxMessages);
     }
 
     /// <summary>測試用的假 LLM：固定回一句話，並記住被呼叫幾次（用來驗證「該不該花錢」）。</summary>

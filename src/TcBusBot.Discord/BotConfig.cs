@@ -272,12 +272,16 @@ public sealed class BotConfig
         if (!string.IsNullOrWhiteSpace(eavesdrop)) cfg.Llm.Eavesdrop = !IsFalsy(eavesdrop!);
 
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-eavesdrop-messages", file,
-                ["LLM_EAVESDROP_MESSAGES"]).Value, out var evMsgs) && evMsgs is >= 0 and <= 20)
+                ["LLM_EAVESDROP_MESSAGES"]).Value, out var evMsgs) && evMsgs is >= 0 and <= 100)
             cfg.Llm.EavesdropMaxMessages = evMsgs;
 
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-eavesdrop-seconds", file,
                 ["LLM_EAVESDROP_SECONDS"]).Value, out var evSec) && evSec is >= 0 and <= 3600)
             cfg.Llm.EavesdropSeconds = evSec;
+
+        var eavesContext = SettingResolver.Resolve(args, "--llm-eavesdrop-context", file,
+            ["LLM_EAVESDROP_CONTEXT"]).Value;
+        if (!string.IsNullOrWhiteSpace(eavesContext)) cfg.Llm.EavesdropContext = !IsFalsy(eavesContext!);
 
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
         cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;

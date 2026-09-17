@@ -30,6 +30,9 @@ public sealed class ConversationSegment
 
     public int TurnCount => Turns.Count;
 
+    /// <summary>其中幾則是「偷聽到的閒聊」（不是對 Bot 說的，只是留下來當背景）。</summary>
+    public int AmbientCount => Turns.Count(t => t.Ambient);
+
     public string Describe()
         => $"{Id}（{Turns.Count} 則，{StartedAt.ToLocalTime():MM-dd HH:mm} 開始，" +
            $"最後 {LastActivityAt.ToLocalTime():HH:mm}）" + (Reason.Length > 0 ? $"｜{Reason}" : "");
@@ -92,7 +95,9 @@ public sealed record ConversationSnapshot(
     string CurrentReason,
     TimeSpan? Idle,
     int ListenRemaining = 0,
-    TimeSpan? ListenTimeLeft = null);
+    TimeSpan? ListenTimeLeft = null,
+    /// <summary>目前這一段裡有幾則是「偷聽到的閒聊」（背景資訊）。</summary>
+    int AmbientTurnCount = 0);
 
 /// <summary>偷聽窗口的狀態。</summary>
 public sealed record ListenWindow(DateTimeOffset Until, int RemainingMessages)
@@ -222,6 +227,60 @@ public sealed class ConversationStore
         TrimSegment(decision.Segment);
     }
 
+    /// <summary>
+    /// 把「不是在跟 Bot 說話」的訊息也記進對話裡（**不呼叫 LLM、不產生回覆**）。
+    ///
+    /// 為什麼要記：使用者要的是「我們剛剛聊的事情，之後 @ 它時它接得上」。
+    /// 只記「Bot 有回覆的訊息」會讓上下文缺一大塊 ——
+    /// 一群人在聊、Bot 中間插一句，之後再 @ 它，它完全不知道大家在聊什麼。
+    ///
+    /// 這些訊息會標成 <see cref="ChatTurn.Ambient"/>（提示詞裡是 `[閒聊]`），
+    /// 讓模型知道那是別人之間的對話、只是背景。
+    ///
+    /// ⚠️ 刻意**不**問「要不要開新的一段」：這個路徑每一則都會走，
+    /// 不能在那裡花 LLM 呼叫。規則很簡單 —— 距離上一則沒超過
+    /// <see cref="LlmOptions.SegmentGap"/> 就接在目前這一段後面，否則開新的一段。
+    /// </summary>
+    public ConversationSegment RecordAmbient(
+        ulong guildId, ulong channelId, ChatTurn turn, string reason)
+    {
+        var conv = _map.GetOrAdd((guildId, channelId), key => new ChannelConversation
+        {
+            GuildId = key.GuildId,
+            ChannelId = key.ChannelId
+        });
+
+        var current = conv.Current;
+
+        var segment = current is not null && turn.At - current.LastActivityAt <= _options.SegmentGap
+            ? current
+            : new ConversationSegment
+            {
+                GuildId = conv.GuildId,
+                ChannelId = conv.ChannelId,
+                StartedAt = turn.At,
+                LastActivityAt = turn.At,
+                Reason = reason
+            };
+
+        if (!ReferenceEquals(segment, current)) conv.Segments.Add(segment);
+
+        var ambient = turn with { Ambient = true, Role = ChatRole.User };
+
+        // 同一則不要記兩次（MessageId = 0 的是合成訊息，不去重）
+        if (ambient.MessageId == 0 || segment.Turns.All(t => t.MessageId != ambient.MessageId))
+            segment.Turns.Add(ambient);
+
+        segment.LastActivityAt = turn.At;
+        conv.LastActivityAt = turn.At;
+
+        TrimSegment(segment);
+        TrimSegments(conv);
+        TrimChannels();
+
+        return segment;
+    }
+
     /// <summary>`/ai forget`：忘掉這個頻道的全部對話。</summary>
     public bool Reset(ulong guildId, ulong channelId)
         => _map.TryRemove((guildId, channelId), out _);
@@ -254,17 +313,22 @@ public sealed class ConversationStore
             CurrentReason: current?.Reason ?? "",
             Idle: current is null ? null : now - current.LastActivityAt,
             ListenRemaining: listen?.RemainingMessages ?? 0,
-            ListenTimeLeft: listen is null ? null : listen.Until - now);
+            ListenTimeLeft: listen is null ? null : listen.Until - now,
+            AmbientTurnCount: current?.AmbientCount ?? 0);
     }
 
     // ─────────────────────────────────────────────────────
     //  偷聽窗口
     //
     //  使用者要的是「回完話之後順便聽一下」：如果接下來幾句是在跟它講話，
-    //  就繼續回；如果判斷不是對它說的，就**停止偷聽並回到等 @ 的模式**。
+    //  就繼續回；如果確定是別人之間的對話，就**停止偷聽並回到等 @ 的模式**。
     //
     //  兩個上限缺一不可：只限則數會被「慢慢講」拖著一直花錢判斷，
     //  只限時間則會被連續灌訊息。所以兩者都有（先到先停）。
+    //
+    //  ⚠️ 時間是**滑動**的（每一則訊息都往後延 <see cref="LlmOptions.EavesdropSeconds"/> 秒），
+    //     不是「從開窗起算」。理由：一群人聊天常常超過兩分鐘，
+    //     從開窗起算會讓 Bot 聊到一半就退出，使用者看到的是「後面的訊息被忽略」。
     // ─────────────────────────────────────────────────────
 
     /// <summary>
@@ -302,7 +366,8 @@ public sealed class ConversationStore
     }
 
     /// <summary>
-    /// 消耗一次偷聽額度（每一則被偷聽的訊息都要呼叫，不管最後有沒有回覆）。
+    /// 消耗一次偷聽額度（每一則**需要判斷**的訊息都要呼叫，不管最後有沒有回覆），
+    /// 並把到期時間往後延（對話還在繼續就一直聽下去）。
     /// 回傳**還剩多少**；<c>null</c> 代表這次消耗把窗口用完了（已經自動停止）。
     /// </summary>
     public ListenWindow? ConsumeListen(ulong guildId, ulong channelId, DateTimeOffset now)
@@ -319,7 +384,26 @@ public sealed class ConversationStore
         }
 
         if (_map.TryGetValue((guildId, channelId), out var conv))
-            conv.Listen = window with { RemainingMessages = remaining };
+            conv.Listen = window with
+            {
+                Until = now.AddSeconds(_options.EavesdropSeconds),
+                RemainingMessages = remaining
+            };
+
+        return conv.Listen;
+    }
+
+    /// <summary>
+    /// 不花判斷額度的一則（例如「@ 了別人」的訊息，很明顯不是對 Bot 說的）：
+    /// 只把窗口往後延，不扣判斷次數。
+    /// </summary>
+    public ListenWindow? TouchListen(ulong guildId, ulong channelId, DateTimeOffset now)
+    {
+        var window = PeekListening(guildId, channelId, now);
+        if (window is null) return null;
+
+        if (_map.TryGetValue((guildId, channelId), out var conv))
+            conv.Listen = window with { Until = now.AddSeconds(_options.EavesdropSeconds) };
 
         return conv.Listen;
     }

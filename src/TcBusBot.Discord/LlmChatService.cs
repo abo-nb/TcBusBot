@@ -133,13 +133,22 @@ public sealed class LlmChatService : IDisposable
                                  || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
                                  || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id));
 
-        if (!mentioned && !replyAddressed) return;
+        var now = DateTimeOffset.UtcNow;
+
+        // ── 偷聽中的訊息也要進來處理 ─────────────────────────
+        //    ⚠️ 這裡出過大包：原本的判斷只有「@ 它」與「回覆它」，
+        //    沒被叫到的訊息會在**到達偷聽那段程式之前**就 return，
+        //    所以「回完話後繼續聽」從來沒有真的生效過（使用者看到的是後面的訊息全被忽略）。
+        var listening = !mentioned && !replyAddressed
+                        && _chat.Conversations.PeekListening(guildId, message.Channel.Id, now) is not null;
+
+        if (!ShouldHandle(mentioned, replyAddressed, listening)) return;
 
         // 沒開 Message Content 意圖時，Discord 會把「沒有 @ 到 Bot」的訊息內容清空
         if (raw.Length == 0 && !mentioned)
         {
             if (Interlocked.Exchange(ref _emptyContentWarned, 1) == 0)
-                Console.WriteLine("[llm] ⚠️ 收到「回覆了 Bot 但內容是空的」的訊息 —— " +
+                Console.WriteLine("[llm] ⚠️ 收到「沒有 @ 它、內容卻是空的」的訊息 —— " +
                                   "幾乎一定是沒開 Message Content Intent（見啟動說明）");
 
             return;
@@ -156,11 +165,15 @@ public sealed class LlmChatService : IDisposable
 
         text = MentionFormatter.Expand(text, mentions, _options.ExposeUserIds);
 
-        var now = DateTimeOffset.UtcNow;
-
         // ── 偷聽模式：這一則沒有 @ 它、也不是回覆它 ──────────
-        //   如果剛剛回過話（偷聽窗口還開著），就讓它聽一下並自己判斷是不是在跟它講話。
+        //   如果剛剛回過話（偷聽窗口還開著），就讓它聽一下並自己判斷要不要接話。
         var addressed = mentioned || replyAddressed;
+
+        // 訊息 @ 了**別的真人**（不是 Bot）→ 那是在跟那個人說話，這是鐵證。
+        // 交給 Core 處理：不插話、**不花錢判斷**，但**繼續偷聽**
+        // （以前的版本在這裡直接停止偷聽 —— 一群人聊天時只要有人 @ 別人，
+        //   之後的訊息就全部被忽略了）。
+        var mentionsOtherHuman = userMessage.MentionedUsers.Any(u => u.Id != botId && !u.IsBot);
 
         if (!addressed)
         {
@@ -168,24 +181,19 @@ public sealed class LlmChatService : IDisposable
 
             if (listen is null) return;   // 沒在偷聽 → 當作沒看到（維持原本行為）
 
-            // ★ 決定性的規則（不花錢也不靠模型判斷）：
-            //   訊息 @ 了**別的真人**（不是 Bot）→ 那是在跟那個人說話，直接停止偷聽。
-            //   為什麼要這一條：模型對「你要不要一起去？」這種邀請常常誤判成在問它，
-            //   而「@ 了別人」是鐵證，不需要問 LLM。
-            if (userMessage.MentionedUsers.Any(u => u.Id != botId && !u.IsBot))
-            {
-                _chat.Conversations.StopListening(guildId, message.Channel.Id);
-                Console.WriteLine($"[llm] 👂 @ 了別人 → 停止偷聽、回到等 @｜{DescribeWhere(guildId, message)}");
-                return;
-            }
-
-            Console.WriteLine($"[llm] 👂 偷聽中（剩 {listen.RemainingMessages} 則／" +
-                              $"{Math.Max(0, (listen.Until - now).TotalSeconds):0} 秒）：{Preview(text)}");
+            Console.WriteLine($"[llm] 👂 偷聽中（還能判斷 {listen.RemainingMessages} 則，全程 {_options.EavesdropSeconds} 秒安靜就停）：" +
+                              $"{Preview(text)}");
         }
 
         if (text.Length == 0)
         {
-            await SafeReplyAsync(userMessage, "要問什麼呢？（直接 @ 我然後打訊息就好）");
+            // 偷聽到的空訊息（純貼圖、只有附件、或沒開 Message Content 意圖）
+            // **不可以**回「要問什麼呢？」—— 那句話沒有人在問它，插話比不回答更糟。
+            if (addressed)
+                await SafeReplyAsync(userMessage, "要問什麼呢？（直接 @ 我然後打訊息就好）");
+            else
+                Console.WriteLine($"[llm] 👂 偷聽到一則沒有文字的訊息 → 忽略（{DescribeWhere(guildId, message)}）");
+
             return;
         }
 
@@ -203,16 +211,21 @@ public sealed class LlmChatService : IDisposable
         var gate = _channelGates.GetOrAdd(message.Channel.Id, _ => new SemaphoreSlim(1, 1));
         if (!await gate.WaitAsync(TimeSpan.Zero))
         {
-            // 偷聽到的訊息搶不到就**直接放棄**（不要回「我還在想」去打斷別人聊天）
+            // 偷聽到的訊息搶不到就**直接放棄**（不要回「我還在想」去打斷別人聊天），
+            // 但**內容要留下來當上下文** —— 不然 Bot 在想上一題的時候，
+            // 群組裡發生的事它就完全不知道了。
             if (addressed)
                 Console.WriteLine($"[llm] 略過一則（{DescribeWhere(guildId, message)} 還在想上一題）");
+            else
+                _chat.RecordAmbient(guildId, message.Channel.Id,
+                                    BuildTurn(userMessage, text), "Bot 還在回上一題時聽到的");
 
             return;
         }
 
         try
         {
-            await AnswerAsync(userMessage, guildId, text, referenced, addressed);
+            await AnswerAsync(userMessage, guildId, text, referenced, addressed, mentionsOtherHuman);
         }
         finally
         {
@@ -220,10 +233,22 @@ public sealed class LlmChatService : IDisposable
         }
     }
 
-    private async Task AnswerAsync(
-        SocketUserMessage message, ulong guildId, string text, IMessage? referenced, bool addressed = true)
-    {
-        var incoming = new ChatTurn(
+    /// <summary>
+    /// 這則訊息要不要進到 AI 流程？三個入口：**@ 它**、**回覆它**（含回覆記憶裡的訊息）、
+    /// **正在偷聽**。
+    ///
+    /// ⚠️ 抽成公開的純函式是因為這裡真的出過大包：偷聽的程式碼寫好了，
+    /// 但上面那行 `if (!mentioned && !replyAddressed) return;` 會在到達偷聽之前就返回，
+    /// 所以「回完話後繼續聽」**從來沒有真的生效過** —— 使用者看到的是
+    /// 「@ 它講一句之後，其他人再講什麼它都當作沒看到」。
+    /// 現在這個判斷有離線測試與 `--dryrun` 的檢查盯著。
+    /// </summary>
+    public static bool ShouldHandle(bool mentioned, bool replyAddressed, bool listening)
+        => mentioned || replyAddressed || listening;
+
+    /// <summary>把 Discord 的訊息轉成對話裡的一則（含「暱稱(@帳號, ID)」標籤）。</summary>
+    private ChatTurn BuildTurn(SocketUserMessage message, string text)
+        => new(
             ChatRole.User,
             message.Author.Username,
             message.Author.Id,
@@ -236,6 +261,16 @@ public sealed class LlmChatService : IDisposable
                 message.Author.Id,
                 _options.ExposeUserIds));
 
+    private async Task AnswerAsync(
+        SocketUserMessage message,
+        ulong guildId,
+        string text,
+        IMessage? referenced,
+        bool addressed = true,
+        bool mentionsOtherHuman = false)
+    {
+        var incoming = BuildTurn(message, text);
+
         var replyTarget = referenced is null ? null : ToTurn(referenced, _client.CurrentUser?.Id ?? 0);
         var where = DescribeWhere(guildId, message);
 
@@ -247,7 +282,8 @@ public sealed class LlmChatService : IDisposable
         try
         {
             answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget,
-                                          cancellationToken: default, addressed: addressed);
+                                          cancellationToken: default, addressed: addressed,
+                                          mentionsOtherHuman: mentionsOtherHuman);
         }
         finally
         {
@@ -403,6 +439,12 @@ public sealed class LlmChatService : IDisposable
 
         return claims.Any(c => reply.Contains(c, StringComparison.Ordinal));
     }
+
+    /// <summary>
+    /// 偷聽時把「不是在跟 Bot 說話」的訊息留下來當上下文（設 `LLM_EAVESDROP_CONTEXT=false` 就什麼都不做）。
+    /// </summary>
+    public void RecordAmbient(ulong guildId, ulong channelId, ChatTurn turn, string reason)
+        => _chat.RecordAmbient(guildId, channelId, turn, reason);
 
     private MessageComponent? BuildUndoComponents(SocketUserMessage message)
     {

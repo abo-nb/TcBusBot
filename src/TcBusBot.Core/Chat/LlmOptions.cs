@@ -130,20 +130,44 @@ public sealed class LlmOptions
     public bool UiActions { get; set; } = true;
 
     /// <summary>
-    /// **偷聽模式**：回完話之後，接下來幾則「沒有 @ 它」的訊息也聽一下，
-    /// 由 LLM 判斷是不是在跟它講話 —— 不是就停止偷聽、回到「等 @」的模式。
+    /// **偷聽模式**：回完話之後，接下來「沒有 @ 它」的訊息也聽一下，
+    /// 由 LLM 判斷要不要接話（<see cref="Addressee"/>：接話／先不出聲繼續聽／退出）。
     ///
     /// ⚠️ 需要 Message Content 特權意圖才做得到（沒有意圖時，非提及訊息的內容是空的）。
-    /// ⚠️ 每一則偷聽的訊息都會多花一次判斷的錢（約 200~300 tokens），
-    ///    所以有「最多幾則」與「幾秒內」兩個上限，而且會記進每週額度。
+    /// ⚠️ 每一則需要判斷的訊息都會多花一次判斷的錢（約 200~300 tokens），
+    ///    所以有「最多判斷幾則」與「安靜幾秒後停止」兩個上限，而且會記進每週額度。
     /// </summary>
     public bool Eavesdrop { get; set; } = true;
 
-    /// <summary>偷聽最多幾則訊息（每一則都會消耗一次判斷）。</summary>
-    public int EavesdropMaxMessages { get; set; } = 3;
+    /// <summary>
+    /// 偷聽期間最多**判斷**幾則（每一則都要問一次模型）。
+    ///
+    /// ⚠️ 這個數字要當成「成本上限」，不是「對話長度上限」：
+    /// 一群人在聊天的時候，Bot 在中間被 @ 一次就會重新開窗，
+    /// 太小（例如 3）會讓它講兩句就退出，使用者看到的是「後面的訊息全被忽略」。
+    /// </summary>
+    public int EavesdropMaxMessages { get; set; } = 12;
 
-    /// <summary>偷聽的時間窗（超過就停止，回到等 @）。</summary>
+    /// <summary>
+    /// 偷聽的**閒置**時間窗：最後一則訊息之後幾秒沒人講話就停止偷聽、回到等 @。
+    ///
+    /// ⚠️ 是滑動的（每一則訊息都往後延），不是「從開窗起算」——
+    /// 否則一群人聊超過這個秒數之後，Bot 就會中途退出。
+    /// </summary>
     public int EavesdropSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// 偷聽到的訊息要不要**留下來當上下文**。
+    ///
+    /// 使用者要的是「我們剛剛聊的事情，之後 @ 它時它接得上」：
+    /// 只記 Bot 有回覆的訊息會讓上下文缺一大塊（一群人在聊、Bot 中間插一句，
+    /// 之後再 @ 它，它完全不知道大家在聊什麼）。
+    /// 這些訊息在對話裡標成 <see cref="ChatTurn.Ambient"/>，提示詞中以 `[閒聊]` 呈現，
+    /// 讓模型知道那是背景、不要回它們。
+    ///
+    /// 關掉只影響「要不要記」，不影響判斷與回話。
+    /// </summary>
+    public bool EavesdropContext { get; set; } = true;
 
     /// <summary>帶進提示詞的歷史上限（則）。</summary>
     public int MaxContextTurns { get; set; } = 20;
