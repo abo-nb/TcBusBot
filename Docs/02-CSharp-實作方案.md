@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 527 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 535 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 527 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 535 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3383,6 +3383,8 @@ AskAsync(addressed: false)
 | 偷聽到的訊息標成 `ChatTurn.Ambient`，提示詞裡是 `[閒聊]` | 那些句子長得跟「對它說的話」一模一樣（「你要不要一起去？」），不標記的話模型會去回答它們 |
 | 只在上下文真的有 `[閒聊]` 時才附上說明 | 平常不浪費 token（`EffectiveSystemPrompt(..., ambientContext)`） |
 | 主人 key 的剝除**排在偷聽之前** | 偷聽也會寫進記憶，所以「key 不進記憶／提示詞／log」的保證必須先發生 |
+| 「正在輸入…」用**回呼**（`onReplying`）在「確定要回話」時才觸發 | 判斷結果可能是「不插話」；一開始就顯示的話，頻道上會出現「Bot 顯示正在輸入，然後什麼都沒說」——旁人看起來像它正在回應某人，或像它壞掉了 |
+| 回呼包在 `SafeCallback` 裡（例外只印一行 log） | 打字動畫壞掉不該變成「使用者問了問題卻收到錯誤訊息」 |
 
 #### 20.16.3 驗收
 
@@ -3392,6 +3394,7 @@ AskAsync(addressed: false)
 | **入口真的接得到**：`ShouldHandle` 真值表、入口 IL 掃描（有呼叫 `ShouldHandle`／`PeekListening`／`AskAsync`，且**沒有**直接 `StopListening`）、Core 的 IL 掃描（`TouchListen`／`ConsumeListen`／`RecordAmbient`＋`LLM_EAVESDROP_CONTEXT` 判斷） | `--dryrun` 的「偷聽入口檢查」（與 Bot 同一份程式碼；**這種「功能寫好但接不到」的 bug，元件檢查與單元測試都抓不到**） |
 | 三段判斷在真實模型上的表現：6 個多人聊天情境（延續話題→REPLY／私人邀約→STOP／離題閒聊→SKIP／追問公車→REPLY／互相道別→STOP／晚餐閒聊→SKIP）**6/6 正確**，每次約 305~313 in／2~3 out tokens | 真實 API（`deepseek-flash`） |
 | 閒聊真的進得了上下文：Bot 被 @ 一次 → 群組閒聊 3 句（不插話）→ 再被 @ 問「我們剛剛在聊什麼？」→ 正確回答「你們剛剛在聊晚餐要吃什麼」 | 真實 API ＋ 真的 `ChatOrchestrator` |
+| **「正在輸入…」的時機**：SKIP／STOP／@ 別人／沒在偷聽 → 回呼 0 次；REPLY、被 @、額度不足（仍會回一句）→ 剛好 1 次；回呼丟例外時回覆照樣正常 | `tcbus selftest` 第 28 節（**8 項**，用假的 `onReplying` 回呼數次數） |
 
 ### 20.17 對話記憶的容量（全部都是環境變數可調）
 

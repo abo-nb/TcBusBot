@@ -2821,6 +2821,97 @@ public static class SelfTest
         Check("★ 又被 @ 一次 → 重新開一個完整的偷聽窗口",
             eavesdropChat.Conversations.PeekListening(guild, channel, now)?.RemainingMessages
                 == eavesdropOptions.EavesdropMaxMessages);
+
+        // ⑦「正在輸入…」的時機：只有**真的會回話**才顯示
+        //    （不然頻道上會出現「Bot 顯示正在輸入，然後什麼都沒說」——
+        //      旁人看起來像它正在回應，或像它壞掉了）
+        var typing = 0;
+        void OnReplying() => typing++;
+
+        eavesdropChat.Conversations.StartListening(guild, channel, 120, 5, now);
+
+        fakeLlm.Reply = "SKIP";
+        eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 601UL, "我今天不想搭公車", now),
+            null, cancellationToken: default, addressed: false, onReplying: OnReplying)
+            .GetAwaiter().GetResult();
+
+        Check("★ 判斷 SKIP 時**不會**顯示「正在輸入…」（沒有訊息就不該有動畫）",
+            typing == 0, $"{typing} 次");
+
+        fakeLlm.Reply = "STOP";
+        eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 602UL, "你要不要一起去吃火鍋？", now),
+            null, cancellationToken: default, addressed: false, onReplying: OnReplying)
+            .GetAwaiter().GetResult();
+
+        Check("★ 判斷 STOP 時也不會顯示「正在輸入…」", typing == 0, $"{typing} 次");
+
+        eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 603UL, "@小華 你幾點到？", now),
+            null, cancellationToken: default, addressed: false, mentionsOtherHuman: true,
+            onReplying: OnReplying).GetAwaiter().GetResult();
+
+        Check("★ @ 了別人（不問模型的那條路）也不會顯示「正在輸入…」", typing == 0, $"{typing} 次");
+
+        // 沒在偷聽時連判斷都不做 → 當然也沒有動畫
+        eavesdropChat.Conversations.StopListening(guild, channel);
+        eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 604UL, "有人在嗎", now),
+            null, cancellationToken: default, addressed: false, onReplying: OnReplying)
+            .GetAwaiter().GetResult();
+
+        Check("★ 沒在偷聽時忽略 → 沒有「正在輸入…」", typing == 0, $"{typing} 次");
+
+        // 判斷 REPLY → 要顯示（而且是在判斷完、真的要回話的那一刻）
+        fakeLlm.Reply = "REPLY";
+        eavesdropChat.Conversations.StartListening(guild, channel, 120, 5, now);
+
+        var replied = eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "阿華", 77UL, 605UL, "那 304 呢？", now),
+            null, cancellationToken: default, addressed: false, onReplying: OnReplying)
+            .GetAwaiter().GetResult();
+
+        Check("★ 判斷 REPLY → 才顯示「正在輸入…」（而且剛好一次）",
+            !replied.Ignored && typing == 1, $"{typing} 次");
+
+        // 被 @ 的訊息：一定回話 → 一開始就顯示
+        typing = 0;
+        eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "小明", 100UL, 606UL, "@笨蛋猫猫 300 幾點？", now),
+            null, cancellationToken: default, addressed: true, onReplying: OnReplying)
+            .GetAwaiter().GetResult();
+
+        Check("★ 被 @ 的訊息一定顯示「正在輸入…」", typing == 1, $"{typing} 次");
+
+        // 額度不足被擋下時：會回一句「額度用完了」→ 也該顯示
+        typing = 0;
+        var broke = new ChatOrchestrator(
+            fakeLlm, new LlmOptions { SystemPrompt = "測試", ApiKey = "test", WeeklyTokenLimit = 1 },
+            new ConversationStore(new LlmOptions()), new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 1 }),
+            NoChatTools.Instance, new GuildPersonaStore())
+        {
+            BotName = "笨蛋猫猫"
+        };
+
+        var refused = broke.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "小明", 100UL, 607UL, "@笨蛋猫猫 300 幾點？", now),
+            null, cancellationToken: default, addressed: true, onReplying: OnReplying)
+            .GetAwaiter().GetResult();
+
+        Check("★ 額度不足（還是會回一句「額度用完了」）→ 也要顯示「正在輸入…」",
+            refused.Refused && typing == 1, $"refused={refused.Refused}／{typing} 次");
+
+        // 回呼丟例外不能把回覆弄壞
+        typing = 0;
+        var angry = eavesdropChat.AskAsync(guild, channel,
+            new ChatTurn(ChatRole.User, "小明", 100UL, 608UL, "@笨蛋猫猫 302 呢？", now),
+            null, cancellationToken: default, addressed: true,
+            onReplying: () => throw new InvalidOperationException("模擬動畫失敗"))
+            .GetAwaiter().GetResult();
+
+        Check("★ 「正在輸入…」回呼壞掉時，回覆照樣正常（動畫不該拖垮對話）",
+            !angry.Ignored && angry.Text.Length > 0, $"ok={angry.Ok}");
     }
 
     /// <summary>測試用的假 LLM：固定回一句話，並記住被呼叫幾次（用來驗證「該不該花錢」）。</summary>

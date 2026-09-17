@@ -274,27 +274,43 @@ public sealed class LlmChatService : IDisposable
         var replyTarget = referenced is null ? null : ToTurn(referenced, _client.CurrentUser?.Id ?? 0);
         var where = DescribeWhere(guildId, message);
 
-        // 呼叫期間讓 Discord 顯示「正在輸入…」（推理模型可能要想十幾秒）
+        // 呼叫期間讓 Discord 顯示「正在輸入…」（推理模型可能要想十幾秒）。
+        //
+        // ⚠️ 但**偷聽到的訊息不能一開始就顯示**：那一步只是「判斷要不要插話」，
+        //    判斷結果是 SKIP／STOP 時什麼都不會送出去 —— 頻道上就會出現
+        //    「Bot 顯示正在輸入，然後什麼都沒說」，旁人看起來像它正在回應，
+        //    或像它壞掉了。
+        //    所以改成**確定要回話才開始顯示**（由 Core 在正確的時機回呼，見 onReplying）。
         using var typingCts = new CancellationTokenSource();
-        var typing = KeepTypingAsync(message.Channel, typingCts.Token);
+        Task? typing = null;
+
+        void StartTypingOnce()
+        {
+            typing ??= KeepTypingAsync(message.Channel, typingCts.Token);
+        }
 
         ChatAnswer answer;
         try
         {
             answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget,
                                           cancellationToken: default, addressed: addressed,
-                                          mentionsOtherHuman: mentionsOtherHuman);
+                                          mentionsOtherHuman: mentionsOtherHuman,
+                                          onReplying: StartTypingOnce);
         }
         finally
         {
             typingCts.Cancel();
-            try { await typing; } catch (Exception) { /* 只是打字動畫 */ }
+            if (typing is not null)
+            {
+                try { await typing; } catch (Exception) { /* 只是打字動畫 */ }
+            }
         }
 
         // ── 偷聽時判斷「不是在跟我說話」→ 什麼都不送，回到等 @ 的模式 ──
         if (answer.Ignored)
         {
-            Console.WriteLine($"[llm] 👂 {answer.IgnoreReason}｜{where}");
+            Console.WriteLine($"[llm] 👂 {answer.IgnoreReason}｜沒有送出訊息，" +
+                              "也沒有顯示「正在輸入…」｜" + where);
             return;
         }
 

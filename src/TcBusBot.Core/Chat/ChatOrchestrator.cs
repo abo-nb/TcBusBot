@@ -210,6 +210,16 @@ public sealed class ChatOrchestrator
     /// 這一則 @ 了**別的真人**嗎（<paramref name="addressed"/> 為 false 時才有意義）。
     /// 這是「在跟別人說話」的鐵證：不插話、**不花錢判斷**，但**繼續偷聽**。
     /// </param>
+    /// <param name="onReplying">
+    /// 「確定要回話了」的時機點 —— 呼叫端用它在頻道顯示「正在輸入…」。
+    ///
+    /// ⚠️ 為什麼要這個回呼而不是讓呼叫端自己決定：偷聽到的訊息要先花一次判斷才知道
+    /// 要不要插話，而**判斷結果可能是「不插話」**。如果一開始就顯示「正在輸入…」，
+    /// 頻道上就會出現「Bot 顯示正在輸入，然後什麼都沒說」——
+    /// 旁人看起來像它正在回應某個人，或像它壞掉了。
+    /// 被 @ 的訊息會在進入本函式後（問模型之前）立刻回呼；偷聽到的訊息則要等判斷
+    /// 結果是 <see cref="Addressee.Reply"/> 才回呼。
+    /// </param>
     public async Task<ChatAnswer> AskAsync(
         ulong guildId,
         ulong channelId,
@@ -217,10 +227,14 @@ public sealed class ChatOrchestrator
         ChatTurn? replyTarget,
         CancellationToken cancellationToken = default,
         bool addressed = true,
-        bool mentionsOtherHuman = false)
+        bool mentionsOtherHuman = false,
+        Action? onReplying = null)
     {
         var startedAt = DateTimeOffset.UtcNow;
         var now = DateTimeOffset.UtcNow;
+
+        // 被明確叫到的訊息：馬上就可以顯示「正在輸入…」（一定會回話）
+        if (addressed) SafeCallback(onReplying);
 
         // ── 0a) 主人授權（必須在「寫進對話記憶」之前）──────────
         //    ⚠️ key 一定要在這一刻就從內容裡拿掉：否則它會進到歷史、提示詞與 log。
@@ -311,6 +325,10 @@ public sealed class ChatOrchestrator
 
             if (!stillListening)
                 Console.WriteLine("[llm] 👂 判斷額度用完 → 這一則回完就回到「等 @」");
+
+            // ★ 到這裡才確定「真的會回話」→ 這時候才顯示「正在輸入…」
+            //   （判斷成 SKIP／STOP 的路徑都已經在上面 return，不會顯示）
+            SafeCallback(onReplying);
         }
 
         var draft = _conversations.Draft(guildId, channelId, incoming, replyTarget);
@@ -473,6 +491,20 @@ public sealed class ChatOrchestrator
         if (!_options.EavesdropContext) return;
 
         _conversations.RecordAmbient(guildId, channelId, turn, reason);
+    }
+
+    /// <summary>
+    /// 呼叫「確定要回話」的回呼 —— **永遠不讓它把整條路徑弄壞**。
+    ///
+    /// 這個回呼在 Discord 那一層是「顯示正在輸入…」，失敗了頂多沒有動畫；
+    /// 如果讓它的例外往上傳，變成「使用者問了問題卻收到錯誤訊息」，那就本末倒置了。
+    /// </summary>
+    private static void SafeCallback(Action? callback)
+    {
+        if (callback is null) return;
+
+        try { callback(); }
+        catch (Exception ex) { Console.WriteLine($"[llm] 「正在輸入…」回呼失敗（不影響回覆）：{ex.Message}"); }
     }
 
     /// <summary>把 Bot 的回覆記進同一段（附上真正的訊息 ID）。</summary>
