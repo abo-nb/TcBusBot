@@ -189,6 +189,12 @@ public sealed class BotConfig
         cfg.Llm.Model = SettingResolver.Resolve(args, "--llm-model", file,
             ["LLM_MODEL", "OPENAI_MODEL"]).Value ?? cfg.Llm.Model;
 
+        // 極短判斷（是在跟我說話嗎／換話題了沒）專用的模型；留空＝跟主模型一樣
+        var judgeModel = SettingResolver.Resolve(args, "--llm-judge-model", file,
+            ["LLM_JUDGE_MODEL", "LLM_SMALL_MODEL"]).Value;
+
+        if (!string.IsNullOrWhiteSpace(judgeModel)) cfg.Llm.JudgeModel = judgeModel!.Trim();
+
         var systemPrompt = SettingResolver.Resolve(args, "--llm-prompt", file, ["LLM_SYSTEM_PROMPT"]).Value;
         if (!string.IsNullOrWhiteSpace(systemPrompt)) cfg.Llm.SystemPrompt = systemPrompt!;
 

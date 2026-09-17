@@ -23,6 +23,7 @@
 "LLM_API_KEY","OPENAI_API_KEY / OPENAI_KEY / DEEPSEEK_API_KEY","選填","（無）","OpenAI 相容 API 金鑰；有填才會啟用 AI 聊天","新增（AI 聊天）","AI 聊天"
 "LLM_BASE_URL","OPENAI_BASE_URL / LLM_ENDPOINT","選填","https://api.deepseek.com/v1","OpenAI 相容端點（要含 /v1）","新增（AI 聊天）","AI 聊天"
 "LLM_MODEL","OPENAI_MODEL","選填","deepseek-flash","模型名稱","新增（AI 聊天）","AI 聊天"
+"LLM_JUDGE_MODEL","LLM_SMALL_MODEL","選填","（無）","「這句話是在跟我說話嗎」「換話題了沒」這類極短判斷用的模型（留空＝跟 LLM_MODEL 一樣）。這兩種判斷只要回一個單字但次數多，用便宜的小模型就夠；聊天與工具呼叫仍走主模型","新增（AI 聊天）","AI 聊天"
 "LLM_SYSTEM_PROMPT","（無）","選填","內建人格（台中公車助理／繁體中文／簡短）","系統提示；工具說明會由程式附加在後面","新增（AI 聊天）","AI 聊天"
 "LLM_WEEKLY_TOKENS","LLM_WEEKLY_LIMIT","選填","300000","每週 token 上限（全域，UTC 週一 00:00 重置；0 = 不限）","新增（AI 聊天）","AI 聊天"
 "LLM_SEGMENT_GAP_MINUTES","LLM_GAP_MINUTES","選填","30","超過幾分鐘沒說話就當成新的一段（不帶舊上下文）","新增（AI 聊天）","AI 聊天"

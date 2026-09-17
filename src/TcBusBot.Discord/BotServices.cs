@@ -132,6 +132,10 @@ internal static class BotServices
     /// <summary>
     /// 建立 LLM 客戶端。**不丟例外** —— 設定錯、連不上都只印警告，
     /// 讓公車功能照常運作（AI 是額外功能，不該拖垮主要功能）。
+    ///
+    /// 有設定 `LLM_JUDGE_MODEL` 時會建**第二個**客戶端（那個模型），
+    /// 再用 <see cref="RoutingLlmClient"/> 把短判斷導過去 ——
+    /// 為什麼不共用一個客戶端、在請求裡換模型名稱：SK 這個版本會忽略 `ModelId`（實測）。
     /// </summary>
     private static ILlmClient CreateLlmClient(LlmOptions options, Action<string> log)
     {
@@ -141,10 +145,20 @@ internal static class BotServices
             return DisabledLlmClient.Instance;
         }
 
-        var (client, message) = SemanticKernelLlmClient.Create(options);
+        // 判斷用的模型：只換 Model（其餘設定照舊，包含思考關閉與逾時）
+        var judgeOptions = options.HasSeparateJudgeModel ? options.Clone() : null;
+
+        if (judgeOptions is not null) judgeOptions.Model = options.JudgeModel!;
+
+        var (client, message) = RoutingLlmClient.Create(options, judgeOptions, opts =>
+        {
+            var (created, createdMessage) = SemanticKernelLlmClient.Create(opts);
+            return ((ILlmClient?)created, createdMessage);
+        });
+
         log(message);
 
-        return (ILlmClient?)client ?? DisabledLlmClient.Instance;
+        return client;
     }
 
     /// <summary>

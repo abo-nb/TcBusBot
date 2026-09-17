@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 571 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 586 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 571 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 586 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3647,8 +3647,70 @@ Discord 上有兩種名字，而且常常不一樣：
 
 ---
 
-## 21. 服務組裝改成 DI 容器（含儲存方案）
+### 20.21 兩個模型：主模型 ＋ 便宜的小模型（`LLM_JUDGE_MODEL`）
 
+這支 Bot 的工作分成兩類，成本結構完全不同：
+
+| 工作 | 每次的 token | 次數 | 需要的能力 |
+| --- | --- | --- | --- |
+| 聊天／工具呼叫／被 @ 的回答 | 大（上下文 + 工具定義） | 少 | 聽得懂話、選得對工具 |
+| 「這句是在跟我說話嗎」「換話題了沒」 | 極小（`max_tokens=8`／`16`、`temperature=0`） | **多**（偷聽中每一則沒被 @ 的訊息都要問一次） | 只要回一個單字 |
+
+所以新增 `LLM_JUDGE_MODEL`（別名 `LLM_SMALL_MODEL`）：留空＝跟 `LLM_MODEL` 一樣。
+
+#### 20.21.1 為什麼不是「在請求裡換模型名稱」
+
+直覺做法是 `OpenAIPromptExecutionSettings.ModelId`，但**這個版本會忽略它**。實測方式與結果：
+
+```
+把 ModelId 設成 definitely-not-a-real-model-xyz
+→ 請求**照樣成功**，回來的 model 仍是主模型 deepseek-flash
+```
+
+這跟 `ExtensionData` 被忽略是同一類問題（§20.10）：**「設定了某個屬性」不等於「送出去了」**。
+所以「換模型」只能在**建立連線**時決定 —— 建兩個客戶端，由新的
+`RoutingLlmClient` 依 `LlmRequest.JudgeCall` 分流：
+
+```
+RoutingLlmClient
+├─ JudgeCall = false → 主模型（聊天、工具呼叫、回答）
+└─ JudgeCall = true  → 判斷模型（AddresseeDetector、TopicSwitchDetector）
+```
+
+#### 20.21.2 實作時踩到的坑（離線測試也一起補上）
+
+建構流程本來寫成「用 `judgeOptions.HasSeparateJudgeModel` 決定要不要建第二個客戶端」，
+但 `judgeOptions` 是**把 `Model` 換成判斷模型之後的複本** —— 那時它自己的
+`Model == JudgeModel`，判斷結果永遠是 false，於是**永遠只建一個模型**。
+設定的顯示完全正常（`判斷用：xxx` 印得出來），只有真的打一次 API 才看得出「根本沒換」。
+
+修法：判斷「要不要建第二個」看的是**主設定** `mainOptions.HasSeparateJudgeModel`。
+離線測試另外釘住這件事（`RoutingLlmClient.Create` 的 factory 可以注入，所以不用連線就能測）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| 有設定判斷模型 → 建了 `big-model`、`cheap-model` 兩個客戶端 | 上面那個 bug 不會回來 |
+| 沒設定 → `ModelCount == 1` | 零額外成本 |
+| 判斷模型建不起來時 → 退回主模型 + 一行警告 | 第二個模型壞掉不該拖垮整個 AI 功能 |
+| `JudgeCall` 分流：短判斷 1 次／主模型 0 次，反之亦然 | 路由真的照旗標走 |
+| `AddresseeDetector`／`TopicSwitchDetector` 真的設了 `JudgeCall`（IL 掃描） | 「設定了但沒接」不會發生 |
+| `BotServices.CreateLlmClient` 真的呼叫 `RoutingLlmClient.Create`（IL 掃描） | 建立流程真的有那一層 |
+
+真實 API 實測（本專案的端點）：
+
+| 情境 | 結果 |
+| --- | --- |
+| 一般對話 | ✔ 成功，API 回報模型 `deepseek-flash` |
+| 短判斷（`JudgeCall=true`，判斷模型故意設成不存在的名稱） | ✔ 被拒絕：`The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed definitely-not-a-real-model-xyz` |
+| 兩個模型都建立 | ✔ 啟動訊息印出「短判斷（是在跟我說話嗎／換話題了沒）走另一個模型：…」 |
+
+> 順帶得到一個有用的資訊：這個端點可用的模型名稱就是 **`deepseek-flash`** 與
+> **`deepseek-v4-pro`**。想省錢可以 `LLM_MODEL=deepseek-v4-pro` ＋
+> `LLM_JUDGE_MODEL=deepseek-flash`；反過來（主模型用便宜的）也可以，只是回答品質會差一點。
+
+---
+
+## 21. 服務組裝改成 DI 容器（含儲存方案）
 ### 21.1 原本的樣子與問題
 
 原本**沒有** DI 容器：

@@ -13,6 +13,30 @@ public sealed class LlmOptions
 
     public string Model { get; set; } = "deepseek-flash";
 
+    /// <summary>
+    /// 給**極短判斷**（「這句話是在跟我說話嗎」「換話題了沒」）用的模型。
+    /// 環境變數：`LLM_JUDGE_MODEL`（別名 `LLM_SMALL_MODEL`）；留空＝跟 <see cref="Model"/> 一樣。
+    ///
+    /// 為什麼要分開：這兩種判斷只要回一個單字（`max_tokens = 8`、`temperature = 0`），
+    /// 但**次數多**（偷聽中每一則沒被 @ 的訊息都要問一次）。
+    /// 用便宜的小模型（例如 `deepseek-chat` 之類的輕量版）就夠了 ——
+    /// 聊天與工具呼叫還是走主模型，因為那才需要聽懂話與選對工具。
+    ///
+    /// ⚠️ 換成不存在的模型名稱時，會在**判斷的那一瞬間**失敗
+    ///    （偷聽會變成「判斷失敗 → 先不出聲」，不會亂回話）；
+    ///    啟動時與 `--dryrun` 都會把兩個模型名稱印出來，方便核對。
+    /// </summary>
+    public string? JudgeModel { get; set; }
+
+    /// <summary>判斷要用哪個模型（沒設定就沿用主模型）。</summary>
+    public string JudgeModelOrMain
+        => string.IsNullOrWhiteSpace(JudgeModel) ? Model : JudgeModel!;
+
+    /// <summary>有沒有另外指定判斷用的模型。</summary>
+    public bool HasSeparateJudgeModel
+        => !string.IsNullOrWhiteSpace(JudgeModel)
+           && !string.Equals(JudgeModel!.Trim(), Model, StringComparison.Ordinal);
+
     public string? ApiKey { get; set; }
 
     /// <summary>系統提示：決定 Bot 的人格與範圍。</summary>
@@ -315,7 +339,8 @@ public sealed class LlmOptions
         => IsConfigured
             ? $"{Model} @ {EndpointHost}（每週上限 " +
               (WeeklyTokenLimit > 0 ? $"{WeeklyTokenLimit:N0} tokens" : "不限") +
-              $"，思考：{ReasoningDescription}）"
+              $"，思考：{ReasoningDescription}" +
+              (HasSeparateJudgeModel ? $"，判斷用：{JudgeModel}" : "") + "）"
             : "未啟用（沒有 LLM_API_KEY）";
 
     /// <summary>

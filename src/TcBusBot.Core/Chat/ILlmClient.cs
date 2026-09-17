@@ -12,6 +12,17 @@ public sealed record LlmRequest(
     string? Tag = null)
 {
     /// <summary>
+    /// 這次是**極短判斷**（「這句話是在跟我說話嗎」「換話題了沒」）——
+    /// 只要回一個單字（`max_tokens = 8`），但**次數多**，所以適合用便宜的小模型。
+    ///
+    /// ⚠️ 實際要用哪個模型由 <see cref="RoutingLlmClient"/> 決定，**不是**在這裡塞模型名稱：
+    /// Semantic Kernel 這個版本會**忽略** <c>OpenAIPromptExecutionSettings.ModelId</c>
+    /// （實測：指定一個不存在的模型名稱，請求還是照樣成功，回來的 `model` 仍是主模型）。
+    /// 所以「換模型」只能在**建立連線**時決定 —— 這也是為什麼需要一層路由。
+    /// </summary>
+    public bool JudgeCall { get; init; }
+
+    /// <summary>
     /// 這次可以用的工具（Semantic Kernel 的 plugin）。
     ///
     /// 為什麼放在 request 而不是 kernel：工具需要**這一次互動的上下文**

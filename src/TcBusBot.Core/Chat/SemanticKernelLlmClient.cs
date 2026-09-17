@@ -115,6 +115,11 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
             MaxTokens = request.MaxTokens
         };
 
+        // ⚠️ 這裡**刻意不**設定 settings.ModelId：
+        //    實測 SK 1.66 會忽略它（用不存在的模型名稱測試，請求照樣成功、回來仍是主模型），
+        //    所以「換模型」只能靠 RoutingLlmClient 在建連線時決定。
+        //    留著這行只會讓人以為換得掉 —— 那是比沒有更糟的假象。
+
         // ── 工具（function calling）────────────────────────
         // 只有真的有工具時才啟用：不然模型會浪費一輪在想要不要呼叫工具。
         // 用 FunctionChoiceBehavior.Auto()：模型決定要不要呼叫、SK 負責執行、

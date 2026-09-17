@@ -2007,6 +2007,147 @@ public static class SelfTest
         Check("★ 指令設定與模型學到的是同一份（/ai learned 看得到、/rest 清得掉）",
             admin.Lines(psetGuild).Count > 0 && admin.Reset(psetGuild).Count > 0);
 
+        // ── 4c-2) 判斷用的模型（LLM_JUDGE_MODEL）──────────────────────
+        //     短判斷（「是在跟我說話嗎」「換話題了沒」）次數多、只要回一個單字，
+        //     可以用便宜的小模型；聊天與工具呼叫仍走主模型。
+        var judgeOptions = new LlmOptions
+        {
+            ApiKey = "test", Model = "big-model", JudgeModel = "cheap-model",
+            SystemPrompt = "測試", ToolsEnabled = false, TopicDetect = true
+        };
+
+        Check("★ 沒設定 LLM_JUDGE_MODEL 時沿用主模型（不會突然變成空字串）",
+            new LlmOptions { Model = "big-model" }.JudgeModelOrMain == "big-model"
+            && !new LlmOptions { Model = "big-model" }.HasSeparateJudgeModel);
+
+        Check("★ 設了就用指定的那個，而且看得出來「有分開」",
+            judgeOptions.JudgeModelOrMain == "cheap-model" && judgeOptions.HasSeparateJudgeModel);
+
+        Check("設成跟主模型一樣時不算「有分開」（等於沒設）",
+            !new LlmOptions { Model = "big-model", JudgeModel = "big-model" }.HasSeparateJudgeModel);
+
+        var judgeLlm = new CountingLlmClient("SKIP");
+        var judgeChat = new ChatOrchestrator(
+            judgeLlm, judgeOptions, new ConversationStore(judgeOptions),
+            new WeeklyTokenBudget(judgeOptions), NoChatTools.Instance, new GuildPersonaStore())
+        {
+            BotName = "笨蛋猫猫"
+        };
+
+        const ulong judgeGuild = 4444UL;
+        const ulong judgeChannel = 5555UL;
+        var judgeNow = DateTimeOffset.UtcNow;
+
+        judgeChat.Conversations.StartListening(judgeGuild, judgeChannel, 120, 5, judgeNow);
+
+        // ① 偷聽判斷 → 應該被標成 JudgeCall（由路由層導去小模型）
+        judgeChat.AskAsync(judgeGuild, judgeChannel,
+            new ChatTurn(ChatRole.User, "阿美", 88UL, 700UL, "晚餐吃什麼", judgeNow),
+            null, cancellationToken: default, addressed: false).GetAwaiter().GetResult();
+
+        Check("★ 偷聽的「是在跟我說話嗎」被標成短判斷（路由層才會導去小模型）",
+            judgeLlm.Last?.JudgeCall == true, $"JudgeCall={judgeLlm.Last?.JudgeCall}");
+
+        // ② 話題判斷 → 同樣是短判斷
+        var topicDetector = new TopicSwitchDetector(judgeLlm, judgeOptions);
+        topicDetector.DetectAsync(
+            [new ChatTurn(ChatRole.User, "小明", 1UL, 1UL, "300 幾點來", judgeNow)],
+            new ChatTurn(ChatRole.User, "小明", 1UL, 2UL, "晚餐吃什麼", judgeNow),
+            cancellationToken: default).GetAwaiter().GetResult();
+
+        Check("★ 「換話題了沒」也被標成短判斷",
+            judgeLlm.Last?.JudgeCall == true, $"JudgeCall={judgeLlm.Last?.JudgeCall}");
+
+        // ③ 真正的回答 → 不是短判斷（走主模型）
+        judgeChat.AskAsync(judgeGuild, judgeChannel,
+            new ChatTurn(ChatRole.User, "小明", 100UL, 701UL, "@笨蛋猫猫 300 幾點？", judgeNow),
+            null, cancellationToken: default, addressed: true).GetAwaiter().GetResult();
+
+        Check("★ 聊天／工具呼叫不會被標成短判斷（仍然用主模型）",
+            judgeLlm.Last?.JudgeCall == false, $"JudgeCall={judgeLlm.Last?.JudgeCall}");
+
+        // ④ 路由層：短判斷走小模型、其他走主模型
+        //    （為什麼要一層路由：SK 這個版本會**忽略**請求裡的 ModelId —— 實測
+        //      指定不存在的模型名稱照樣成功、回來的仍是主模型，所以只能在建連線時決定）
+        var mainClient = new CountingLlmClient("MAIN");
+        var smallClient = new CountingLlmClient("SMALL");
+        var router = new RoutingLlmClient(mainClient, smallClient);
+
+        LlmRequest Routed(bool judge) => new(
+            SystemPrompt: "x", History: [],
+            Incoming: new ChatTurn(ChatRole.User, "小明", 1UL, 1UL, "300 幾點", judgeNow),
+            MaxTokens: 8, Temperature: 0) { JudgeCall = judge };
+
+        router.CompleteAsync(Routed(judge: true), default).GetAwaiter().GetResult();
+        Check("★ 短判斷真的被送到「判斷用的模型」那條連線",
+            smallClient.Calls == 1 && mainClient.Calls == 0,
+            $"小模型 {smallClient.Calls} 次／主模型 {mainClient.Calls} 次");
+
+        router.CompleteAsync(Routed(judge: false), default).GetAwaiter().GetResult();
+        Check("★ 一般對話送到主模型那條連線",
+            mainClient.Calls == 1 && smallClient.Calls == 1,
+            $"小模型 {smallClient.Calls} 次／主模型 {mainClient.Calls} 次");
+
+        Check("路由層的說明看得到兩個模型",
+            router.Describe().Contains("短判斷走", StringComparison.Ordinal), router.Describe());
+
+        // 沒有第二個模型時：全部走主模型（沒設定＝零額外成本）
+        var single = new RoutingLlmClient(mainClient, null);
+        single.CompleteAsync(Routed(judge: true), default).GetAwaiter().GetResult();
+
+        Check("★ 沒設定判斷模型時，短判斷也走主模型（不會壞掉）",
+            single.ModelCount == 1 && mainClient.Calls == 2,
+            $"ModelCount={single.ModelCount}／主模型 {mainClient.Calls} 次");
+
+        Check("★ 設定摘要看得到判斷用的模型（才確認得了有沒有生效）",
+            judgeOptions.Describe().Contains("判斷用：cheap-model", StringComparison.Ordinal),
+            judgeOptions.Describe());
+
+        // ⑤ 建立流程本身：真的會建出「兩個模型」的那一層
+        //    ⚠️ 這裡驗的是「判斷的依據」：要用**主設定**決定要不要建第二個客戶端。
+        //       （複本自己的 Model 已經被換成判斷模型，拿它來判斷會永遠只有一個 ——
+        //         這個 bug 只有真的打一次 API 才看得出來，所以離線也要釘住。）
+        var created = new List<string>();
+
+        (ILlmClient?, string) FakeFactory(LlmOptions opts)
+        {
+            created.Add(opts.Model);
+            return (new CountingLlmClient("OK"), $"（測試）建立 {opts.Model}");
+        }
+
+        var routingOptions = new LlmOptions
+        {
+            ApiKey = "test", Model = "big-model", JudgeModel = "cheap-model"
+        };
+
+        var clonedJudge = routingOptions.Clone();
+        clonedJudge.Model = routingOptions.JudgeModel!;
+
+        var (built, builtMessage) = RoutingLlmClient.Create(routingOptions, clonedJudge, FakeFactory);
+
+        Check("★ 有設定判斷模型時會建兩個客戶端（主 ＋ 判斷）",
+            built.ModelCount == 2 && created.SequenceEqual(new[] { "big-model", "cheap-model" }),
+            $"建了 {string.Join("、", created)}");
+
+        Check("建的說明會講出短判斷走哪個模型",
+            builtMessage.Contains("短判斷", StringComparison.Ordinal), builtMessage.Replace("\n", " ｜ "));
+
+        var (noJudge, _) = RoutingLlmClient.Create(
+            new LlmOptions { ApiKey = "test", Model = "big-model" }, null, FakeFactory);
+
+        Check("★ 沒設定時只建一個（零額外成本）", noJudge.ModelCount == 1);
+
+        // 判斷模型建不起來時要退回主模型，而不是整個 AI 功能掛掉
+        (ILlmClient?, string) BrokenFactory(LlmOptions opts)
+            => opts.Model == "cheap-model" ? (null, "（測試）這個模型建不起來") : (new CountingLlmClient("OK"), "ok");
+
+        var (fellBack, fallbackMessage) = RoutingLlmClient.Create(routingOptions, clonedJudge, BrokenFactory);
+
+        Check("★ 判斷模型建不起來時退回主模型（AI 功能不會整個掛掉）",
+            fellBack.ModelCount == 1
+            && fallbackMessage.Contains("建立失敗", StringComparison.Ordinal),
+            fallbackMessage.Replace("\n", " ｜ "));
+
         // ── 4d) `/ai pset from:`：把某個伺服器的設定整套複製過來 ─────────
         //     使用者要的是「原本那個伺服器教了 40 條，新伺服器不想重教一次」。
         var copyStore = new GuildPersonaStore(limits: new PersonaLimits
@@ -3138,6 +3279,9 @@ public static class SelfTest
 
         public int Calls { get; private set; }
 
+        /// <summary>最後一次的請求（用來驗「這次用了哪個模型」）。</summary>
+        public LlmRequest? Last { get; private set; }
+
         public bool IsConfigured => true;
 
         public string Describe() => "（測試用假 LLM）";
@@ -3145,6 +3289,8 @@ public static class SelfTest
         public Task<LlmReply> CompleteAsync(LlmRequest request, CancellationToken cancellationToken)
         {
             Calls++;
+            Last = request;
+
             return Task.FromResult(new LlmReply(
                 Reply, InputTokens: 10, OutputTokens: 2, UsageReported: true,
                 Model: "fake", Elapsed: TimeSpan.FromMilliseconds(1)));

@@ -98,7 +98,11 @@ public sealed class TopicSwitchDetector
                 BuildUserPrompt(history, incoming), incoming.At),
             MaxTokens: 16,
             Temperature: 0,
-            Tag: "topic-detect");
+            Tag: "topic-detect")
+        {
+            // 同樣是「只回一個單字」的短判斷 → 交給 RoutingLlmClient 導去小模型
+            JudgeCall = _options.HasSeparateJudgeModel
+        };
 
         try
         {

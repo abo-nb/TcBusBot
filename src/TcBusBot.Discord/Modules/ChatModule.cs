@@ -72,6 +72,13 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .WithColor(enabled ? new Color(0x2B, 0x6C, 0xB0) : new Color(0x5A, 0x5A, 0x5A))
             .AddField("啟用", enabled ? "✅ 已啟用" : "❌ 未啟用（主機沒有設定 LLM_API_KEY）", inline: false)
             .AddField("模型", enabled ? $"{_options.Model} @ {_options.EndpointHost}" : "—", inline: false)
+            .AddField("判斷用的模型",
+                !enabled
+                    ? "—"
+                    : _options.HasSeparateJudgeModel
+                        ? $"{_options.JudgeModel}（「是在對我說話嗎」「換話題了沒」這類短判斷）"
+                        : $"同主模型（{_options.Model}）—— 要省錢可以設 `LLM_JUDGE_MODEL` 指向小的模型",
+                inline: false)
             .AddField("工具（可以真的動手）",
                 !enabled
                     ? "—"

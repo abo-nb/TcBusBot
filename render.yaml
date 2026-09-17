@@ -76,6 +76,10 @@ services:
         value: https://api.deepseek.com/v1
       - key: LLM_MODEL
         value: deepseek-flash
+      # 極短判斷（是在跟我說話嗎／換話題了沒）用的模型；留空＝跟主模型一樣。
+      # 這兩種判斷只要回一個單字但次數多，用便宜的小模型就夠。
+      - key: LLM_JUDGE_MODEL
+        sync: false
       # 每週 token 上限（全域；UTC 週一 00:00 重置）。0 = 不限。
       - key: LLM_WEEKLY_TOKENS
         value: "300000"

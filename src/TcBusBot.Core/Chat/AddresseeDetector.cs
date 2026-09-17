@@ -124,7 +124,11 @@ public sealed class AddresseeDetector
                 BuildUserPrompt(history, incoming, botName), incoming.At),
             MaxTokens: 8,
             Temperature: 0,
-            Tag: "addressee");
+            Tag: "addressee")
+        {
+            // 這種判斷只要回一個單字、而且次數多 → 交給 RoutingLlmClient 導去便宜的小模型
+            JudgeCall = _options.HasSeparateJudgeModel
+        };
 
         try
         {

@@ -1608,8 +1608,52 @@ public static class DryRun
             Expect("沒有 flags 欄位 → 0（保守判斷成沒開）",
                 MessageContentIntentProbe.ParseFlags(doc.RootElement) == 0);
 
-        // ── 名字（暱稱 vs @帳號）────────────────────────────
-        //    這決定了「模型認不認得大家在講誰」，也決定判斷器準不準。
+        // ── 兩個模型（主模型 vs 判斷用的小模型）──────────────
+        //    判斷用的模型只要回一個單字，而且次數多 —— 打錯名字時不會有錯誤訊息，
+        //    只會在偷聽那一瞬間變成「判斷失敗 → 先不出聲」，所以要印出來核對。
+        Console.WriteLine($"  ℹ 模型：主 {llm.Model}｜" +
+                          (llm.HasSeparateJudgeModel
+                              ? $"判斷 {llm.JudgeModel}（短判斷走便宜的小模型）"
+                              : "判斷 同主模型（沒有設定 LLM_JUDGE_MODEL）"));
+
+        if (llm.HasSeparateJudgeModel && llm.JudgeModel!.Contains(' ', StringComparison.Ordinal))
+            Problem($"LLM_JUDGE_MODEL 含有空白（「{llm.JudgeModel}」）—— 模型名稱通常不會有空白");
+
+        if (llm.HasSeparateJudgeModel && llm.JudgeModel == llm.Model)
+            Console.WriteLine("  ℹ 提示：LLM_JUDGE_MODEL 跟主模型一樣 → 等於沒有分開（可以直接不設）");
+
+        // ★ 接線：短判斷真的被標成 JudgeCall、而且真的有「兩個模型」那一層
+        //   （SK 會忽略請求裡的 ModelId，所以「換模型」只能靠 RoutingLlmClient 建兩條連線 ——
+        //     實測：把判斷模型設成不存在的名稱，短判斷會失敗、一般對話照樣成功。）
+        var addressee = typeof(AddresseeDetector).GetMethod(nameof(AddresseeDetector.DetectAsync));
+        var addresseeCalls = addressee is null ? [] : CollectCalls(addressee, resolveAll: true);
+
+        var topic = typeof(TopicSwitchDetector).GetMethod(nameof(TopicSwitchDetector.DetectAsync));
+        var topicCalls = topic is null ? [] : CollectCalls(topic, resolveAll: true);
+
+        var createClient = typeof(BotServices).GetMethod("CreateLlmClient",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        var createCalls = createClient is null ? [] : CollectCalls(createClient, resolveAll: true);
+
+        if (addressee is null || topic is null || createClient is null)
+        {
+            Problem("找不到 AddresseeDetector／TopicSwitchDetector／BotServices.CreateLlmClient");
+        }
+        else if (!addresseeCalls.Contains("LlmRequest.set_JudgeCall")
+                 || !topicCalls.Contains("LlmRequest.set_JudgeCall"))
+        {
+            Problem("短判斷沒有被標成 JudgeCall —— LLM_JUDGE_MODEL 不會生效（路由層認的就是這個旗標）");
+        }
+        else if (!createCalls.Contains("RoutingLlmClient.Create"))
+        {
+            Problem("BotServices 沒有用 RoutingLlmClient.Create —— 判斷模型不會被建立");
+        }
+        else
+        {
+            Console.WriteLine("  ✔ 短判斷被標成 JudgeCall，而且建立流程真的會建出「兩個模型」那一層");
+        }
+
+        // ── 名字（暱稱 vs @帳號）────────────────────────────        //    這決定了「模型認不認得大家在講誰」，也決定判斷器準不準。
         Console.WriteLine($"  ℹ 模型看到的名字：{(llm.ShowNicknames ? "Discord 暱稱（伺服器顯示名稱）" : "@帳號（username）")}" +
                           (llm.ExposeUserIds
                               ? (llm.ShowNicknames ? "＋@帳號＋ID" : "＋ID")
