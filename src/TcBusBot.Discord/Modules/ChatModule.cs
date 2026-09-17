@@ -86,6 +86,9 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                       (snapshot.AmbientTurnCount > 0 ? $"（含 {snapshot.AmbientTurnCount} 則偷聽到的閒聊）" : "") +
                       (snapshot.Idle is { } idle ? $"（最後一次 {idle.TotalMinutes:0} 分鐘前）" : ""),
                 inline: false)
+            .AddField("記憶容量（環境變數可調）",
+                _options.DescribeMemory(),
+                inline: false)
             .AddField("偷聽",
                 !_options.Eavesdrop || _options.EavesdropMaxMessages <= 0 || _options.EavesdropSeconds <= 0
                     ? "❌ 已關閉（只回 @ 它或回覆它的訊息）"
