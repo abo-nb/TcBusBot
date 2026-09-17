@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 553 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 561 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 553 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 561 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3557,6 +3557,41 @@ Discord 上有兩種名字，而且常常不一樣：
 | 追加／覆蓋（清掉幾條、剩幾條）／覆蓋失敗要還原（`TooLong` 時舊的還在）／空白內容什麼都不做／稽核紀錄／與模型學到的共用同一份 | `tcbus selftest` 第 23 節（**7 項**） |
 | 指令樹：`/ai` 有 5 個子指令、`/ai pset` 有三個選填參數、**IL 掃描**確認它真的檢查 `AdminUserIds` 而且走 `SetRules` | `--dryrun` 的命令樹與接線檢查 |
 | 實機：非名單成員 → 被擋（ephemeral）；名單成員 → 設定成功、`/ai learned` 看到、`/ai audit` 有紀錄 | 真實 Discord |
+
+#### 20.20.1 把整組設定複製到另一個伺服器（`/ai pset from:`）
+
+「原本那個伺服器教了 40 條，新伺服器不想重教一次」是很自然的下一步
+（自訂提示詞是**每個伺服器一份**，所以換伺服器等於從零開始）。
+
+```
+/ai pset from:<伺服器ID 或名稱> [mode:Append|Replace]
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 來源要**驗三個條件**：Bot 在來源、**你也在來源**、來源≠目標 | 這些內容常常包含只有那個伺服器才有的自訂表情名稱、稱呼與內規。管理員是自己人，但「能不能把 A 的內規搬進 B」仍然要在意 —— 所以在兩個地方都擋 |
+| 找來源接受 **ID 或完整名稱**，名稱重複時要求改用 ID | 猜錯的代價是「把別的伺服器的設定寫進來」，而那種錯誤很難發現（兩個伺服器看起來都正常，但規矩是錯的） |
+| 覆蓋模式**直接寫入來源原文**（不重新走 `Learn` 的清理與驗證） | 來源的內容本來就通過驗證了；重新清理只會讓「當初允許、現在不允許（例如上限被調小）」的規則莫名其妙消失 |
+| 追加模式一條一條走 `Learn`，撞到上限就停，並回報 **Dropped** 幾條 | 「默默地少帶幾條」是最糟的結果 —— 使用者會以為複製完成，實際上設定少了一半 |
+| 複製也寫進**同一份稽核**（「從伺服器 X 複製提示詞（覆蓋，共 N 條）」） | 這是「有人改了設定」的一種，而且來源是多一個要追的資訊 |
+| 來源＝目標時直接回 0 | 那個 case 會先把目標清掉、再從（已清空的）來源複製 —— 等於**用一個打錯的指令把設定全刪了** |
+| `/ai pset` 的資訊卡會顯示「這個伺服器 ID」 | 要複製到別的伺服器時，得先拿得到來源 ID（否則只能靠開發者模式） |
+
+驗收（`tcbus selftest` 第 23 節新增 **8 項**）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| 追加複製 3 條、來源不受影響 | 複製不是搬移 |
+| 再複製一次 → `copied=0, skipped=3` | 不會長出重複的規則 |
+| 目標已有 1 條、來源 4 條（上限 4）→ `copied=3, dropped=1` | 上限與「沒帶過來幾條」的回報 |
+| 覆蓋 → 目標變成跟來源同一組、舊的自己的規矩消失 | Replace 語意 |
+| 稽核紀錄含「從伺服器 1111 …」 | 事後查得到來源 |
+| 來源＝目標 → 0 且來源完好 | 打錯字不會清掉自己 |
+| 來源沒有內容 → 0、目標不動 | 邊界 |
+
+`--dryrun` 另外用 **IL 掃描**確認 `CopyFromAsync` 真的呼叫 `GuildPersonaStore.CopyFrom`
+而且**有**呼叫 `SocketGuild.GetUser`（= 真的檢查「你也在來源伺服器裡」）。
+
 
 
 ---

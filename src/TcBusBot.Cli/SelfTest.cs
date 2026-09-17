@@ -2007,6 +2007,69 @@ public static class SelfTest
         Check("★ 指令設定與模型學到的是同一份（/ai learned 看得到、/rest 清得掉）",
             admin.Lines(psetGuild).Count > 0 && admin.Reset(psetGuild).Count > 0);
 
+        // ── 4d) `/ai pset from:`：把某個伺服器的設定整套複製過來 ─────────
+        //     使用者要的是「原本那個伺服器教了 40 條，新伺服器不想重教一次」。
+        var copyStore = new GuildPersonaStore(limits: new PersonaLimits
+        {
+            MaxLinesPerGuild = 4, MaxLineLength = 50
+        });
+
+        const ulong oldGuild = 1111UL;
+        const ulong newGuild = 2222UL;
+
+        copyStore.SetRules(oldGuild, 7UL, "一律用繁體中文", replace: false);
+        copyStore.SetRules(oldGuild, 7UL, "回答前先確認站名", replace: false);
+        copyStore.SetRules(oldGuild, 7UL, "不要用條列", replace: false);
+
+        var copiedA = copyStore.CopyFrom(newGuild, oldGuild, 7UL, replace: false);
+
+        Check("★ 複製到新的伺服器（追加）：3 條都帶過來",
+            copiedA.Ok && copiedA.Copied == 3 && copiedA.Lines.Count == 3
+            && copiedA.Lines[0] == "一律用繁體中文",
+            $"帶過來 {copiedA.Copied} 條");
+
+        Check("★ 來源不會被動到（複製不是搬移）", copyStore.Lines(oldGuild).Count == 3);
+
+        // 再複製一次 → 全部都是重複的
+        var copiedAgain = copyStore.CopyFrom(newGuild, oldGuild, 7UL, replace: false);
+        Check("★ 重複複製不會長出重複的規則",
+            copiedAgain.Copied == 0 && copiedAgain.Skipped == 3 && copiedAgain.Lines.Count == 3,
+            $"copied={copiedAgain.Copied}, skipped={copiedAgain.Skipped}");
+
+        // 追加時撞到上限 → 要回報「有幾條沒帶過來」（目標已經有 1 條，所以只能再帶 3 條）
+        copyStore.SetRules(oldGuild, 7UL, "第四條", replace: false);
+
+        const ulong smallGuild = 3333UL;
+        copyStore.SetRules(smallGuild, 7UL, "新伺服器自己的規矩", replace: false);
+
+        var capped = copyStore.CopyFrom(smallGuild, oldGuild, 7UL, replace: false);
+        Check("★ 追加時超過上限（4 條）會回報「幾條沒帶過來」，而不是默默少掉",
+            capped.Copied == 3 && capped.Dropped == 1 && capped.Lines.Count == 4,
+            $"copied={capped.Copied}, dropped={capped.Dropped}, 共 {capped.Lines.Count} 條");
+
+        // 覆蓋模式：整組換掉（含來源的第 4 條；原本自己的那條會被換掉）
+        var replacedCopy = copyStore.CopyFrom(smallGuild, oldGuild, 7UL, replace: true);
+        Check("★ 覆蓋模式：目標變成跟來源一樣的一組（舊的自己的規矩消失）",
+            replacedCopy.Copied == 4 && replacedCopy.Removed == 4
+            && replacedCopy.Lines.Count == 4
+            && replacedCopy.Lines.Contains("第四條", StringComparer.Ordinal)
+            && !replacedCopy.Lines.Contains("新伺服器自己的規矩", StringComparer.Ordinal),
+            $"copied={replacedCopy.Copied}, removed={replacedCopy.Removed}");
+
+        Check("★ 複製也會留下稽核紀錄（/ai audit 看得到是從哪個伺服器搬過來的）",
+            copyStore.AuditLog(20).Any(e => e.Action.Contains($"從伺服器 {oldGuild}", StringComparison.Ordinal)),
+            string.Join("｜", copyStore.AuditLog(20).Select(e => e.Action)));
+
+        var selfCopy = copyStore.CopyFrom(oldGuild, oldGuild, 7UL, replace: true);
+        Check("★ 來源＝目標時什麼都不做（不會把自己清掉）",
+            selfCopy.Copied == 0 && copyStore.Lines(oldGuild).Count == 4);
+
+        var emptyCopy = copyStore.CopyFrom(newGuild, 9999UL, 7UL, replace: false);
+        Check("來源沒有內容時回報 0（目標一個字都不動、也不丟例外）",
+            emptyCopy.Copied == 0 && emptyCopy.Lines.Count == copyStore.Lines(newGuild).Count
+            && emptyCopy.Lines.Count == 3,
+            $"copied={emptyCopy.Copied}, 目標 {emptyCopy.Lines.Count} 條");
+
         // ── 5) 忘記與重設 ────────────────────────────────
         var before = store.Lines(guildA).Count;
         Check("★ 用關鍵字刪掉符合的規則", store.Forget(guildA, "條列") == 1 && store.Lines(guildA).Count == before - 1);

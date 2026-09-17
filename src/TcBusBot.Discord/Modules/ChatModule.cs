@@ -145,6 +145,104 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             ephemeral: true);
     }
 
+    /// <summary>
+    /// `/ai pset from:`：把另一個伺服器的自訂提示詞整套帶過來。
+    ///
+    /// 為什麼需要「來源必須是我還在的伺服器、而且你也在裡面」：
+    /// 自訂提示詞是**那個伺服器的東西**（常常包含只有那裡才有的自訂表情名稱、稱呼、
+    /// 內規）。管理員是自己人，但「能不能把 A 伺服器的內容搬進 B」仍然要在意 ——
+    /// 所以在兩個地方都擋：Bot 要在來源、**你也**要在來源。
+    /// </summary>
+    private async Task CopyFromAsync(ulong targetGuildId, string source, PersonaMode mode)
+    {
+        var (sourceId, error) = ResolveSourceGuild(source);
+
+        if (sourceId is null)
+        {
+            await RespondAsync($"❌ {error}", ephemeral: true);
+            return;
+        }
+
+        if (sourceId.Value == targetGuildId)
+        {
+            await RespondAsync("❌ 來源就是這個伺服器本身（不用複製）。", ephemeral: true);
+            return;
+        }
+
+        var guild = Context.Client.GetGuild(sourceId.Value);
+
+        if (guild is null)
+        {
+            await RespondAsync(
+                $"❌ 我不在「{source}」那個伺服器裡，所以讀不到它的設定。\n" +
+                "（如果那個伺服器已經不在了，可以先用 `/ai learned` 把內容複製下來，再用 " +
+                "`/ai pset text:…` 一條一條寫進來。）",
+                ephemeral: true);
+            return;
+        }
+
+        if (guild.GetUser(Context.User.Id) is null)
+        {
+            await RespondAsync($"❌ 你不在「{guild.Name}」裡面，不能把它的設定搬過來。", ephemeral: true);
+            return;
+        }
+
+        var sourceLines = _personas.Lines(sourceId.Value);
+
+        if (sourceLines.Count == 0)
+        {
+            await RespondAsync($"ℹ️「{guild.Name}」沒有任何自訂提示詞（沒有東西可以複製）。", ephemeral: true);
+            return;
+        }
+
+        var replace = mode == PersonaMode.Replace;
+        var outcome = _personas.CopyFrom(targetGuildId, sourceId.Value, Context.User.Id, replace);
+
+        var summary = replace
+            ? $"✅ 已從「{guild.Name}」複製 **{outcome.Copied}** 條（覆蓋掉原本的 {outcome.Removed} 條）"
+            : $"✅ 已從「{guild.Name}」複製 **{outcome.Copied}** 條";
+
+        if (outcome.Skipped > 0) summary += $"，跳過 {outcome.Skipped} 條重複的";
+        if (outcome.Dropped > 0) summary += $"，**{outcome.Dropped} 條因為超過上限沒帶過來**";
+        if (!replace && outcome.Dropped > 0)
+            summary += "（可以改用 `mode:Replace` 覆蓋）";
+
+        await RespondAsync(
+            $"{summary}\n目前共 {outcome.Lines.Count}/{_personas.Limits.MaxLinesPerGuild} 條：" +
+            Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000),
+            ephemeral: true);
+    }
+
+    /// <summary>
+    /// 解析 `from:`：接受伺服器 ID 或**完整名稱**。
+    ///
+    /// 名稱重複時要求改用 ID —— 猜錯的代價是「把別的伺服器的設定寫進來」，
+    /// 那種錯誤很難發現（兩個伺服器看起來都正常，但規矩是錯的）。
+    /// </summary>
+    private (ulong? Id, string? Error) ResolveSourceGuild(string raw)
+    {
+        var trimmed = raw.Trim();
+
+        // 容忍貼上 <#123>／<@123> 之類的寫法（Discord 的 ID 常常是這樣複製的）
+        var digits = new string(trimmed.Where(char.IsDigit).ToArray());
+
+        if (digits.Length > 0 && ulong.TryParse(digits, out var id) && id != 0)
+            return (id, null);
+
+        var matches = Context.Client.Guilds
+            .Where(g => string.Equals(g.Name, trimmed, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (matches.Count == 1) return (matches[0].Id, null);
+
+        if (matches.Count > 1)
+            return (null, $"有 {matches.Count} 個伺服器叫「{trimmed}」，請改用伺服器 ID" +
+                          "（開啟開發者模式 → 對伺服器按右鍵 → 複製伺服器 ID）。");
+
+        return (null, $"找不到「{trimmed}」這個伺服器 —— 我只找得到我加入的伺服器，" +
+                      "也可以直接給伺服器 ID。");
+    }
+
     private static string Truncate(string text, int max)
         => text.Length <= max ? text : text[..max] + "…";
 
@@ -179,8 +277,9 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     [SlashCommand("pset", "設定這個伺服器的自訂提示詞（只有後台指定的管理員能用）")]
     public async Task PersonaSetAsync(
         [Summary("text", "要設定的內容（一句重點；留空＝只顯示目前的設定）")] string? text = null,
-        [Summary("mode", "Append＝追加一條；Replace＝覆蓋掉這個伺服器現有的全部")] PersonaMode mode = PersonaMode.Append,
-        [Summary("clear", "清空這個伺服器的自訂提示詞")] bool clear = false)
+        [Summary("mode", "Append＝追加；Replace＝覆蓋掉這個伺服器現有的全部")] PersonaMode mode = PersonaMode.Append,
+        [Summary("clear", "清空這個伺服器的自訂提示詞")] bool clear = false,
+        [Summary("from", "複製來源：另一個伺服器的 ID 或名稱（把那邊的設定整套帶過來）")] string? from = null)
     {
         // ── 授權：後台指定的管理員（fail closed：沒設定名單＝沒人能用）──
         if (!_options.AdminUserIds.Contains(Context.User.Id))
@@ -197,6 +296,13 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         if (guildId == 0)
         {
             await RespondAsync("這個指令要在伺服器裡使用（自訂提示詞是「每個伺服器一份」的）。", ephemeral: true);
+            return;
+        }
+
+        // ── 從另一個伺服器複製 ────────────────────────────
+        if (!string.IsNullOrWhiteSpace(from))
+        {
+            await CopyFromAsync(guildId, from!, mode);
             return;
         }
 
@@ -234,9 +340,10 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 embed: new EmbedBuilder()
                     .WithColor(new Color(0x2B, 0x6C, 0xB0))
                     .WithTitle("🛠 這個伺服器的自訂提示詞")
-                    .WithDescription(Truncate(body, 4000))
+                    .WithDescription(Truncate(body, 3500))
+                    .AddField("這個伺服器 ID（複製到別的伺服器時會用到）", $"`{guildId}`", inline: false)
                     .WithFooter($"共 {current.Count}/{_personas.Limits.MaxLinesPerGuild} 條｜" +
-                                $"用法：/ai pset text:<內容> mode:Append｜/ai pset clear:True")
+                                "用法：/ai pset text:<內容>｜/ai pset from:<伺服器ID> mode:Replace｜/ai pset clear:True")
                     .Build(),
                 ephemeral: true);
             return;

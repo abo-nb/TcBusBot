@@ -1186,6 +1186,8 @@ public static class DryRun
 
                 if (!opts.Contains("text") || !opts.Contains("mode") || !opts.Contains("clear"))
                     Problem("/ai pset 少了參數（需要 text／mode／clear）");
+                else if (!opts.Contains("from"))
+                    Problem("/ai pset 少了 from 參數 —— 沒辦法把另一個伺服器的設定整套複製過來");
                 else if (pset.Parameters.Any(p => p.IsRequired))
                     Problem("/ai pset 不該有必填參數 —— 不給參數時應該顯示目前的設定");
             }
@@ -1194,14 +1196,23 @@ public static class DryRun
             var psetAsync = typeof(ChatModule).GetMethod(nameof(ChatModule.PersonaSetAsync));
             var psetCalls = psetAsync is null ? [] : CollectCalls(psetAsync, resolveAll: true);
 
+            var copyAsync = typeof(ChatModule).GetMethod("CopyFromAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var copyCalls = copyAsync is null ? [] : CollectCalls(copyAsync, resolveAll: true);
+
             if (psetAsync is null)
                 Problem("找不到 ChatModule.PersonaSetAsync");
             else if (!psetCalls.Contains("LlmOptions.get_AdminUserIds"))
                 Problem("/ai pset 沒有檢查 LLM_ADMIN_IDS —— 任何人都能改伺服器的提示詞");
             else if (!psetCalls.Contains("GuildPersonaStore.SetRules"))
                 Problem("/ai pset 沒有走 GuildPersonaStore.SetRules（覆蓋模式的安全順序會失效）");
+            else if (copyAsync is null || !copyCalls.Contains("GuildPersonaStore.CopyFrom"))
+                Problem("/ai pset from: 沒有走 GuildPersonaStore.CopyFrom");
+            else if (!copyCalls.Contains("SocketGuild.GetUser"))
+                Problem("/ai pset from: 沒有檢查「你也在來源伺服器裡」—— 可以把別人的設定搬走");
             else
-                Console.WriteLine("  ✔ /ai pset 真的會擋人（檢查 LLM_ADMIN_IDS）而且走的是可測試的 SetRules");
+                Console.WriteLine("  ✔ /ai pset 真的會擋人（LLM_ADMIN_IDS）＋複製前確認來源（GetGuild／GetUser）" +
+                                  "，而且走的是可測試的 SetRules／CopyFrom");
         }
 
         // ── /rest（重設這個伺服器學到的規矩）────────────────

@@ -315,6 +315,83 @@ public sealed class GuildPersonaStore
     }
 
     /// <summary>
+    /// **把另一個伺服器的自訂提示詞複製過來**（`/ai pset from:`）的結果。
+    ///
+    /// 為什麼不沿用 <see cref="PersonaSetResult"/>：複製是一對多的操作，
+    /// 「帶過來幾條／跳過幾條重複／因為上限少帶幾條」都必須講清楚 ——
+    /// 不然使用者只看到「成功」，卻不知道少了什麼。
+    /// </summary>
+    public sealed record PersonaCopyResult(
+        int Copied, int Skipped, int Dropped, int Removed, IReadOnlyList<string> Lines)
+    {
+        public bool Ok => Copied > 0;
+    }
+
+    /// <summary>
+    /// 把 <paramref name="sourceGuildId"/> 的自訂提示詞複製到 <paramref name="targetGuildId"/>。
+    ///
+    /// <paramref name="replace"/> 為 true 時**先備份目標的舊內容再整個換掉**
+    /// （目標是空的時候行為等同於複製全部）。
+    ///
+    /// 兩種模式的差別（都刻意保留來源的原文，不重新清理）：
+    ///   * 覆蓋：直接把來源那一批寫進去（來源的內容本來就通過驗證了，
+    ///     重新清理只會讓「當初允許、現在不允許」的規則莫名其妙消失）
+    ///   * 追加：一條一條走 <see cref="Learn"/>（去重、驗長度、算上限），
+    ///     撞到上限就停，並把「沒帶過來幾條」回報給使用者
+    /// </summary>
+    public PersonaCopyResult CopyFrom(ulong targetGuildId, ulong sourceGuildId, ulong userId, bool replace)
+    {
+        if (targetGuildId == sourceGuildId) return new PersonaCopyResult(0, 0, 0, 0, Lines(targetGuildId));
+
+        var source = Lines(sourceGuildId);
+        if (source.Count == 0) return new PersonaCopyResult(0, 0, 0, 0, Lines(targetGuildId));
+
+        if (replace)
+        {
+            var backup = Reset(targetGuildId);
+            var taken = source.Take(Limits.MaxLinesPerGuild).ToList();
+
+            PutBack(targetGuildId, taken);
+            AuditAdmin(userId,
+                $"從伺服器 {sourceGuildId} 複製提示詞（覆蓋，共 {taken.Count} 條）",
+                $"{taken.Count} 條");
+
+            return new PersonaCopyResult(
+                taken.Count, 0, source.Count - taken.Count, backup.Count, Lines(targetGuildId));
+        }
+
+        var copied = 0;
+        var skipped = 0;
+        var dropped = 0;
+
+        foreach (var line in source)
+        {
+            var result = Learn(targetGuildId, line);
+
+            switch (result)
+            {
+                case LearnResult.Added: copied++; break;
+                case LearnResult.Duplicate: skipped++; break;
+                default: dropped++; break;
+            }
+
+            // 撞到上限之後就不用再試了（後面的每一條都會失敗）
+            if (result == LearnResult.TooMany)
+            {
+                dropped += source.Count - copied - skipped - dropped;
+                break;
+            }
+        }
+
+        if (copied > 0)
+            AuditAdmin(userId,
+                $"從伺服器 {sourceGuildId} 複製提示詞（追加 {copied} 條）",
+                $"{copied} 條");
+
+        return new PersonaCopyResult(copied, skipped, dropped, 0, Lines(targetGuildId));
+    }
+
+    /// <summary>
     /// **管理員用指令設定這個伺服器的自訂提示詞**（`/ai pset`）的結果。
     /// <see cref="Lines"/> 是設定完之後的完整內容（給指令直接顯示，不用再查一次）。
     /// </summary>
