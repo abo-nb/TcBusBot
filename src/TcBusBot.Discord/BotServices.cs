@@ -81,7 +81,8 @@ internal static class BotServices
         services.AddSingleton<ILlmClient>(_ => CreateLlmClient(cfg.Llm, log));
 
         services.AddSingleton<BusActionService>();
-        services.AddSingleton(sp => new GuildPersonaStore(sp.GetRequiredService<ILlmStateStore>()));
+        services.AddSingleton(sp => new GuildPersonaStore(
+            sp.GetRequiredService<ILlmStateStore>(), cfg.Llm.BuildPersonaLimits()));
 
         services.AddSingleton<IChatToolProvider>(sp =>
             cfg.Llm.IsConfigured && cfg.Llm.ToolsEnabled

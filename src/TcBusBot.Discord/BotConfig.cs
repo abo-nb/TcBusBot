@@ -227,6 +227,28 @@ public sealed class BotConfig
                 ["LLM_CHANNEL_TTL_HOURS"]).Value, out var ttlHours) && ttlHours is >= 0.25 and <= 8760)
             cfg.Llm.ChannelTtl = TimeSpan.FromHours(ttlHours);
 
+        // ── 「學到的提示詞」的容量（每伺服器幾條／每條幾個字／總長…）────
+        //    ⚠️ 這些同時是「提示詞會多長」（＝每次的錢）與「別人能叫它記多少」的上限。
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-guild-rules", file,
+                ["LLM_MAX_GUILD_RULES"]).Value, out var guildRules) && guildRules is >= 1 and <= 500)
+            cfg.Llm.MaxGuildRules = guildRules;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-rule-chars", file,
+                ["LLM_MAX_RULE_CHARS"]).Value, out var ruleChars) && ruleChars is >= 20 and <= 4000)
+            cfg.Llm.MaxRuleChars = ruleChars;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-persona-guilds", file,
+                ["LLM_MAX_PERSONA_GUILDS"]).Value, out var personaGuilds) && personaGuilds is >= 1 and <= 10_000)
+            cfg.Llm.MaxPersonaGuilds = personaGuilds;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-overlay-chars", file,
+                ["LLM_MAX_OVERLAY_CHARS"]).Value, out var overlayChars) && overlayChars is >= 100 and <= 20_000)
+            cfg.Llm.MaxOverlayChars = overlayChars;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-audit-entries", file,
+                ["LLM_MAX_AUDIT_ENTRIES"]).Value, out var auditEntries) && auditEntries is >= 0 and <= 10_000)
+            cfg.Llm.MaxAuditEntries = auditEntries;
+
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-max-output", file,
                 ["LLM_MAX_OUTPUT_TOKENS"]).Value, out var maxOut) && maxOut is > 0 and <= 8192)
             cfg.Llm.MaxOutputTokens = maxOut;

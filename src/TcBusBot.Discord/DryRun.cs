@@ -1560,6 +1560,24 @@ public static class DryRun
         if (llm.MaxChannels * (long)llm.MaxSegmentsPerChannel * llm.MaxTurnsPerSegment > 2_000_000)
             Problem($"對話記憶的最壞情況超過 200 萬則訊息（{llm.DescribeMemory()}）—— " +
                     "記憶體會爆掉，請調整 LLM_MAX_CHANNELS／LLM_MAX_SEGMENTS_PER_CHANNEL／LLM_MAX_TURNS_PER_SEGMENT");
+
+        // ── 「學到的提示詞」的容量（也是環境變數可調）────────
+        var limits = llm.BuildPersonaLimits();
+
+        Console.WriteLine($"  ℹ 學到的規矩：{limits.Describe()}");
+
+        if (limits.MaxOverlayLength < limits.MaxLineLength)
+            Problem($"LLM_MAX_OVERLAY_CHARS（{limits.MaxOverlayLength}）比單一條的上限" +
+                    $"（LLM_MAX_RULE_CHARS={limits.MaxLineLength}）還小 —— 一條都可能塞不進提示詞");
+
+        if (limits.MaxLinesPerGuild * limits.MaxLineLength > limits.MaxOverlayLength * 4)
+            Console.WriteLine($"  ℹ 提示：每伺服器最多 {limits.MaxLinesPerGuild} 條 × {limits.MaxLineLength} 字，" +
+                              $"但接進提示詞只留 {limits.MaxOverlayLength} 字 —— " +
+                              "後面的規則會被截掉（想全部生效就調高 LLM_MAX_OVERLAY_CHARS）");
+
+        if (limits.MaxLinesPerGuild > 100)
+            Console.WriteLine($"  ℹ 提示：LLM_MAX_GUILD_RULES={limits.MaxLinesPerGuild} 很大 —— " +
+                              "公開伺服器上任何人都能叫它記東西，這個數字是濫用風險的上限");
     }
 
     /// <summary>

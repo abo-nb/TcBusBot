@@ -6,6 +6,48 @@ using TcBusBot.Core.Storage;
 namespace TcBusBot.Core.Chat;
 
 /// <summary>
+/// 「學到的提示詞」的容量上限。**全部都可以用環境變數調**。
+///
+/// 為什麼要可調：這些上限直接決定「提示詞會變多長」（＝每一次對話的錢）
+/// 與「儲存會長多大」，而不同伺服器的需求差很多 ——
+/// 三兩好友的私人伺服器可能想多記一點，公開的大伺服器則要嚴格限制
+/// （不然任何人都能叫 Bot 記 40 條，把它變成別人的記事本）。
+///
+/// 對應的環境變數：
+///   * <see cref="MaxLinesPerGuild"/>　`LLM_MAX_GUILD_RULES`（預設 40）
+///   * <see cref="MaxLineLength"/>　　 `LLM_MAX_RULE_CHARS`（預設 300）
+///   * <see cref="MaxGuilds"/>　　　　 `LLM_MAX_PERSONA_GUILDS`（預設 200）
+///   * <see cref="MaxOverlayLength"/>　`LLM_MAX_OVERLAY_CHARS`（預設 2000）
+///   * <see cref="MaxAuditEntries"/>　 `LLM_MAX_AUDIT_ENTRIES`（預設 200）
+/// </summary>
+public sealed record PersonaLimits
+{
+    /// <summary>沒設定時用的預設值。</summary>
+    public static readonly PersonaLimits Default = new();
+
+    /// <summary>每個伺服器最多幾條（全域規則那個桶子也共用這個上限）。</summary>
+    public int MaxLinesPerGuild { get; init; } = 40;
+
+    /// <summary>每一條最多幾個字。</summary>
+    public int MaxLineLength { get; init; } = 300;
+
+    /// <summary>最多幾個伺服器可以有自己的規則（超過淘汰「條數最少」的那個）。</summary>
+    public int MaxGuilds { get; init; } = 200;
+
+    /// <summary>接進提示詞的總長上限（字元）。這是「每次對話要多花多少 token」的煞車。</summary>
+    public int MaxOverlayLength { get; init; } = 2000;
+
+    /// <summary>主人操作紀錄最多留幾筆。</summary>
+    public int MaxAuditEntries { get; init; } = 200;
+
+    /// <summary>給 log／`--dryrun`／`/ai status` 看的一行摘要。</summary>
+    public string Describe()
+        => $"每伺服器最多 {MaxLinesPerGuild} 條 × {MaxLineLength} 字、" +
+           $"最多 {MaxGuilds} 個伺服器有規則、接進提示詞最多 {MaxOverlayLength} 字、" +
+           $"主人紀錄 {MaxAuditEntries} 筆";
+}
+
+/// <summary>
 /// **可以被「馴服」的提示詞**：每個伺服器各自一份、可以事後加上去的規則。
 ///
 /// 使用者要的是「讓機器人修改自己的提示詞，但只限那個伺服器」——
@@ -23,18 +65,28 @@ namespace TcBusBot.Core.Chat;
 ///   * **自訂表情的意思**：「某個表情 是 委屈」（Discord 的自訂表情每個伺服器都不一樣，
 ///     所以這種知識只能存在該伺服器，而且只能由那個伺服器的人教它）
 ///
-/// 邊界（避免被拿來當無限的記事本或塞爆提示詞）：
-///   * 每個伺服器最多 <see cref="MaxLinesPerGuild"/> 條、每條 <see cref="MaxLineLength"/> 字
-///   * 進提示詞的總長再截到 <see cref="MaxOverlayLength"/>
+/// 邊界（避免被拿來當無限的記事本或塞爆提示詞）——全部都是環境變數可調，見 <see cref="PersonaLimits"/>：
+///   * 每個伺服器最多 `LLM_MAX_GUILD_RULES` 條、每條 `LLM_MAX_RULE_CHARS` 字
+///   * 進提示詞的總長再截到 `LLM_MAX_OVERLAY_CHARS`
 ///   * 完全相同的內容不會重複加（AI 很容易講兩次同一件事）
 ///   * `/rest` 可以整個重設（回傳被清掉的內容，讓使用者可以複製回去）
 /// </summary>
 public sealed class GuildPersonaStore
 {
-    public const int MaxLinesPerGuild = 40;
-    public const int MaxLineLength = 300;
-    public const int MaxGuilds = 200;
-    public const int MaxOverlayLength = 2000;
+    private readonly ILlmStateStore? _store;
+    private readonly object _gate = new();
+
+    private readonly Dictionary<string, List<string>> _lines = new(StringComparer.Ordinal);
+
+    public GuildPersonaStore(ILlmStateStore? store = null, PersonaLimits? limits = null)
+    {
+        _store = store;
+        Limits = limits ?? PersonaLimits.Default;
+        Load();
+    }
+
+    /// <summary>這個實例實際套用的容量上限（`/ai status`、工具訊息都拿這裡的數字）。</summary>
+    public PersonaLimits Limits { get; }
 
     /// <summary>持久化用的鍵名（與每週用量共用同一個 blob 區）。</summary>
     public const string BlobKey = "guild_personas";
@@ -48,17 +100,6 @@ public sealed class GuildPersonaStore
     /// 就把全體規則清掉了）。
     /// </summary>
     public const string GlobalKey = "*";
-
-    private readonly ILlmStateStore? _store;
-    private readonly object _gate = new();
-
-    private readonly Dictionary<string, List<string>> _lines = new(StringComparer.Ordinal);
-
-    public GuildPersonaStore(ILlmStateStore? store = null)
-    {
-        _store = store;
-        Load();
-    }
 
     /// <summary>學到了幾條（全部伺服器加起來，不含全域）——`/ai status` 用。</summary>
     public int TotalLines
@@ -110,7 +151,7 @@ public sealed class GuildPersonaStore
 
             foreach (var line in global)
             {
-                if (sb.Length + line.Length > MaxOverlayLength) break;
+                if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
                 sb.AppendLine($"• {line}");
             }
 
@@ -124,7 +165,7 @@ public sealed class GuildPersonaStore
 
             foreach (var line in local)
             {
-                if (sb.Length + line.Length > MaxOverlayLength) break;
+                if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
                 sb.AppendLine($"• {line}");
             }
         }
@@ -192,14 +233,14 @@ public sealed class GuildPersonaStore
     {
         var clean = Clean(text);
         if (clean.Length == 0) return LearnResult.Empty;
-        if (clean.Length > MaxLineLength) return LearnResult.TooLong;
+        if (clean.Length > Limits.MaxLineLength) return LearnResult.TooLong;
 
         lock (_gate)
         {
             if (!_lines.TryGetValue(key, out var list))
             {
                 // 太多伺服器時淘汰「最少條」的那個（通常是很少用的）
-                if (evict && _lines.Count(kv => kv.Key != GlobalKey) >= MaxGuilds)
+                if (evict && _lines.Count(kv => kv.Key != GlobalKey) >= Limits.MaxGuilds)
                 {
                     var victim = _lines.Where(kv => kv.Key != GlobalKey)
                                        .OrderBy(kv => kv.Value.Count)
@@ -213,7 +254,7 @@ public sealed class GuildPersonaStore
             }
 
             if (list.Any(l => string.Equals(l, clean, StringComparison.Ordinal))) return LearnResult.Duplicate;
-            if (list.Count >= MaxLinesPerGuild) return LearnResult.TooMany;
+            if (list.Count >= Limits.MaxLinesPerGuild) return LearnResult.TooMany;
 
             list.Add(clean);
         }
@@ -281,7 +322,7 @@ public sealed class GuildPersonaStore
 
         var local = count == 0
             ? "還沒學到東西（可以教它，例如「講話再簡短一點」或「<表情> 是 什麼意思」）"
-            : $"已學到 {count}/{MaxLinesPerGuild} 條（這個伺服器專用）";
+            : $"已學到 {count}/{Limits.MaxLinesPerGuild} 條（這個伺服器專用）";
 
         var auditNote = _audit.Count == 0 ? "" : $"｜主人操作紀錄 {_audit.Count} 筆";
 
@@ -313,9 +354,6 @@ public sealed class GuildPersonaStore
 
     private readonly List<AuditEntry> _audit = new();
 
-    /// <summary>最多留幾筆（舊的一直丟掉，避免無限長大）。</summary>
-    public const int MaxAuditEntries = 200;
-
     public IReadOnlyList<AuditEntry> AuditLog(int limit = 10)
     {
         lock (_gate) return _audit.TakeLast(Math.Max(1, limit)).Reverse().ToList();
@@ -329,7 +367,7 @@ public sealed class GuildPersonaStore
         lock (_gate)
         {
             _audit.Add(entry);
-            while (_audit.Count > MaxAuditEntries) _audit.RemoveAt(0);
+            while (_audit.Count > Limits.MaxAuditEntries) _audit.RemoveAt(0);
             SaveLocked();
         }
 
@@ -350,7 +388,7 @@ public sealed class GuildPersonaStore
 
     /// <summary>要存下來的內容（規則 ＋ 主人操作紀錄）。</summary>
     private Persisted Snapshot()
-        => new(_lines, _audit.TakeLast(MaxAuditEntries).ToList());
+        => new(_lines, _audit.TakeLast(Limits.MaxAuditEntries).ToList());
 
     /// <summary>存檔格式（舊版的「純字典」也讀得進來）。</summary>
     private sealed record Persisted(
@@ -385,10 +423,10 @@ public sealed class GuildPersonaStore
                 _audit.Clear();
 
                 foreach (var (key, value) in current?.Lines ?? legacy ?? [])
-                    if (value is { Count: > 0 }) _lines[key] = value.Take(MaxLinesPerGuild).ToList();
+                    if (value is { Count: > 0 }) _lines[key] = value.Take(Limits.MaxLinesPerGuild).ToList();
 
                 if (current?.Audit is { Count: > 0 })
-                    _audit.AddRange(current.Audit.TakeLast(MaxAuditEntries));
+                    _audit.AddRange(current.Audit.TakeLast(Limits.MaxAuditEntries));
             }
         }
         catch (Exception ex)

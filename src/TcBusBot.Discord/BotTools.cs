@@ -207,10 +207,10 @@ public sealed class PersonaTools
             GuildPersonaStore.LearnResult.Duplicate => "這件事之前就記過了，不用再加一次（告訴使用者已記住）。",
 
             GuildPersonaStore.LearnResult.TooLong =>
-                $"這句話太長了（上限 {GuildPersonaStore.MaxLineLength} 字），請縮短成一句重點。",
+                $"這句話太長了（上限 {_personas.Limits.MaxLineLength} 字），請縮短成一句重點。",
 
             GuildPersonaStore.LearnResult.TooMany =>
-                $"這個伺服器已經記了 {GuildPersonaStore.MaxLinesPerGuild} 條（上限），" +
+                $"這個伺服器已經記了 {_personas.Limits.MaxLinesPerGuild} 條（上限），" +
                 "請告訴使用者要先刪掉一些（或請他用 /rest 重設）。",
 
             _ => "沒有內容可以記。"
@@ -383,8 +383,8 @@ public sealed class OwnerTools
                 $"✅ 已記成全域規則（所有伺服器都適用）：{GuildPersonaStore.Clean(rule)}",
             GuildPersonaStore.LearnResult.Duplicate => "這條全域規則已經有了。",
             GuildPersonaStore.LearnResult.TooLong =>
-                $"太長了（上限 {GuildPersonaStore.MaxLineLength} 字），請縮短。",
-            GuildPersonaStore.LearnResult.TooMany => "全域規則數量已達上限，請先刪掉一些。",
+                $"太長了（上限 {_personas.Limits.MaxLineLength} 字），請縮短。",
+            GuildPersonaStore.LearnResult.TooMany => $"全域規則數量已達上限（{_personas.Limits.MaxLinesPerGuild} 條），請先刪掉一些。",
             _ => "沒有內容可以記。"
         };
     }

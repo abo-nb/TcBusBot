@@ -588,6 +588,7 @@ public static class Program
             : "關閉")}");
         Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
         Console.WriteLine($"  對話記憶　　 ：{cfg.Llm.DescribeMemory()}");
+        Console.WriteLine($"  學到的規矩　 ：{cfg.Llm.BuildPersonaLimits().Describe()}");
         Console.WriteLine();
     }
 

@@ -1875,7 +1875,7 @@ public static class SelfTest
             store.Lines(guildA)[^1] == "換行 也要 變成空白", store.Lines(guildA)[^1]);
 
         // ── 4) 上限 ──────────────────────────────────────
-        var longLine = new string('長', GuildPersonaStore.MaxLineLength + 1);
+        var longLine = new string('長', PersonaLimits.Default.MaxLineLength + 1);
         Check("★ 太長的一條會被拒絕（不讓它變成記事本）",
             store.Learn(guildA, longLine) == GuildPersonaStore.LearnResult.TooLong);
 
@@ -1883,16 +1883,84 @@ public static class SelfTest
         var added = 0;
         var tooMany = GuildPersonaStore.LearnResult.Added;
 
-        for (var i = 0; i < GuildPersonaStore.MaxLinesPerGuild + 5; i++)
+        for (var i = 0; i < PersonaLimits.Default.MaxLinesPerGuild + 5; i++)
         {
             tooMany = store.Learn(guildC, $"規則 {i}");
             if (tooMany == GuildPersonaStore.LearnResult.Added) added++;
         }
 
-        Check($"★ 每個伺服器最多 {GuildPersonaStore.MaxLinesPerGuild} 條（再多會被擋）",
-            added == GuildPersonaStore.MaxLinesPerGuild
+        Check($"★ 每個伺服器最多 {PersonaLimits.Default.MaxLinesPerGuild} 條（再多會被擋）",
+            added == PersonaLimits.Default.MaxLinesPerGuild
             && tooMany == GuildPersonaStore.LearnResult.TooMany,
             $"加了 {added} 條，最後一次：{tooMany}");
+
+        // ── 4b) 上限是環境變數可調的（LLM_MAX_GUILD_RULES／_RULE_CHARS／
+        //        _PERSONA_GUILDS／_OVERLAY_CHARS／_AUDIT_ENTRIES）──────
+        var tight = new GuildPersonaStore(limits: new PersonaLimits
+        {
+            MaxLinesPerGuild = 3,
+            MaxLineLength = 10,
+            MaxGuilds = 2,
+            MaxOverlayLength = 500,
+            MaxAuditEntries = 2
+        });
+
+        Check("★ LLM_MAX_RULE_CHARS：每條字數上限跟著設定（設 10 就只收 10 字以內）",
+            tight.Learn(guildA, new string('字', 11)) == GuildPersonaStore.LearnResult.TooLong
+            && tight.Learn(guildA, new string('字', 10)) == GuildPersonaStore.LearnResult.Added);
+
+        var tightAdded = 0;
+        var tightLast = GuildPersonaStore.LearnResult.Added;
+
+        for (var i = 0; i < 5; i++)
+        {
+            tightLast = tight.Learn(guildA, $"規則{i}");
+            if (tightLast == GuildPersonaStore.LearnResult.Added) tightAdded++;
+        }
+
+        Check("★ LLM_MAX_GUILD_RULES：每伺服器條數上限跟著設定（設 3 就是 3 條）",
+            tight.Lines(guildA).Count == 3 && tightLast == GuildPersonaStore.LearnResult.TooMany,
+            $"{tight.Lines(guildA).Count} 條，最後一次：{tightLast}");
+
+        // 最多 2 個伺服器有規則（第 3、4 個進來就把條數最少的踢掉）
+        tight.Learn(444UL, "甲的規則");
+        tight.Learn(555UL, "乙的規則");
+        tight.Learn(666UL, "丙的規則");
+
+        Check("★ LLM_MAX_PERSONA_GUILDS：同時最多幾個伺服器有規則（超過淘汰條數最少的）",
+            tight.GuildCount == 2, $"{tight.GuildCount} 個伺服器（上限 2）");
+
+        // 接進提示詞的總長上限（設 120 字就不能把 10 條全部塞進去）
+        var narrow = new GuildPersonaStore(limits: new PersonaLimits { MaxOverlayLength = 120 });
+
+        for (var i = 0; i < 10; i++) narrow.Learn(777UL, $"第 {i} 條規則內容");
+
+        var narrowOverlay = narrow.Overlay(777UL);
+
+        Check("★ LLM_MAX_OVERLAY_CHARS：接進提示詞的總長有上限（這是每次多花的 token）",
+            narrowOverlay.Length <= 140 && !narrowOverlay.Contains("第 9 條", StringComparison.Ordinal),
+            $"{narrowOverlay.Length} 字（上限 120），學了 {narrow.Lines(777UL).Count} 條");
+
+        // 主人稽核紀錄的筆數上限（設 2 就只留最近 2 筆）
+        var grantOptions = new LlmOptions { AdminUserIds = [7UL], AdminKey = "KEY-TEST" };
+        var grant = AdminAuthorizer.Check(7UL, "KEY-TEST 記住：這是測試", grantOptions).Grant;
+
+        Check("測試用的主人憑證拿得到", grant is not null);
+
+        if (grant is not null)
+        {
+            for (var i = 0; i < 4; i++) tight.LearnGlobal(grant, $"全域 {i}");
+
+            Check("★ LLM_MAX_AUDIT_ENTRIES：主人操作紀錄有筆數上限（不會無限長大）",
+                tight.AuditLog(100).Count <= 2 && tight.AuditLog(100).Count > 0,
+                $"{tight.AuditLog(100).Count} 筆（上限 2）");
+            Check("★ 留下來的是最近幾筆（舊的一直丟掉）",
+                tight.AuditLog(100).All(a => a.Action.Contains("全域", StringComparison.Ordinal)));
+        }
+
+        Check("★ 摘要印得出這幾個上限（改環境變數後看得出有沒有生效）",
+            new PersonaLimits().Describe().Contains("40 條", StringComparison.Ordinal),
+            new PersonaLimits().Describe());
 
         // ── 5) 忘記與重設 ────────────────────────────────
         var before = store.Lines(guildA).Count;

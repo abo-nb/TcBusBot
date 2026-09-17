@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 519 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 527 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 519 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 527 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3138,7 +3138,7 @@ Discord/BusToolProvider       每次提問現做一份 plugin（帶著「誰在�
 | 只影響一個伺服器 | key 是 GuildId，`Overlay(guildId)` 只讀自己那份 | 實測：在 B 伺服器問「我教過你什麼」→ 它說「這個伺服器沒有記下任何規矩」 |
 | 可以由對話教 | 工具 `remember_rule` / `list_rules` / `forget_rule`（`persona` plugin） | 使用者只要 @ 它講「記住…」就會生效 |
 | 自訂表情 | 就記成一句「表情名稱 是 意思」 | Discord 的自訂表情**每個伺服器各自一組**，這種知識只對該伺服器有意義 |
-| 不會被當記事本 | 每伺服器 ≤ 40 條、每條 ≤ 300 字、overlay ≤ 2000 字；完全相同的不重複加 | 提示詞是有成本的（token），也怕被塞爆 |
+| 不會被當記事本 | 每伺服器 ≤ 40 條、每條 ≤ 300 字、overlay ≤ 2000 字；完全相同的不重複加（**這幾個數字都是環境變數可調**，見 §20.18） | 提示詞是有成本的（token），也怕被塞爆 |
 | 可以重設 | `/rest`（`ResetModule`）：清掉該伺服器的規則（可選順便清該頻道對話記憶），並**原文列出清掉的內容** | 教壞了想重來只要三個字；列出來是為了讓想留的人可以複製回去 |
 | 看得到學了什麼 | `/ai learned`；`/ai status` 也會顯示條數 | 「看不到的東西」不該存在 |
 | 跨重啟保留 | 借 `ILlmStateStore` 的 blob（MongoDB／SQLite／文字檔／記憶體） | 學到的東西重開就不見會很氣人 |
@@ -3426,6 +3426,41 @@ AskAsync(addressed: false)
 | 用 3 個頻道 → 只剩 2 個，且**留下的正好是最近有動靜的** | `LLM_MAX_CHANNELS`（淘汰策略是「最久沒動」，不是隨機） |
 | 超過 TTL 後 `Purge` 清掉、清掉後查不到 | `LLM_CHANNEL_TTL_HOURS` |
 | `DescribeMemory()` 含實際數字 | 摘要真的跟著設定走（改環境變數後看得出有沒有效） |
+
+### 20.18 「學到的提示詞」的容量（一樣是環境變數可調）
+
+§20.11 的 overlay 有五個上限，原本是 `GuildPersonaStore` 裡的 `const`（每伺服器 40 條、
+每條 300 字、最多 200 個伺服器、overlay 2000 字、主人紀錄 200 筆）。
+這些數字同時決定**每一次對話要多花多少 token**（overlay 全部接在系統提示後面）
+與**任何人都能叫 Bot 記多少東西**（公開伺服器的濫用風險），
+所以一樣拉成環境變數，並收進 `PersonaLimits`：
+
+| 環境變數 | 預設 | 對應的 `LlmOptions` | 為什麼要調 |
+| --- | --- | --- | --- |
+| `LLM_MAX_GUILD_RULES` | `40` | `MaxGuildRules` | 私人小伺服器想多記一點；公開伺服器要收緊 |
+| `LLM_MAX_RULE_CHARS` | `300` | `MaxRuleChars` | 太長的一條就等於一段提示詞 |
+| `LLM_MAX_PERSONA_GUILDS` | `200` | `MaxPersonaGuilds` | Bot 被加到很多伺服器時的儲存上限 |
+| `LLM_MAX_OVERLAY_CHARS` | `2000` | `MaxOverlayChars` | **每次對話多花的 token** 的煞車 |
+| `LLM_MAX_AUDIT_ENTRIES` | `200` | `MaxAuditEntries` | 主人操作紀錄（稽核用）的保留量 |
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 上限從 `const` 改成**實例上的 `Limits`（`PersonaLimits`）** | 這是一個「每個部署可能不同」的設定；`const` 沒辦法由設定決定。`Limits` 同時是**唯一可信的來源**：工具訊息（「已經記了 N 條（上限）」）、`/ai learned` 頁尾、`/ai status`、`--dryrun` 全部讀同一個實例，不會出現「文件寫 40、程式擋在 50」 |
+| `PersonaLimits.Default` 保留一份預設值 | 測試與 CLI 的臨時 `new GuildPersonaStore()` 不用每次傳設定，行為與正式路徑一致 |
+| 超過上限時回傳 `TooMany`／`TooLong` 而不是默默丟掉 | 模型會拿到明確訊息（「請先刪掉一些／請縮短」），使用者才會知道發生什麼事 |
+| `--dryrun` 檢查矛盾組合 | `LLM_MAX_OVERLAY_CHARS < LLM_MAX_RULE_CHARS`（一條都塞不進去）、規則總量遠大於 overlay（後面的規則等於白記）、`LLM_MAX_GUILD_RULES > 100`（濫用風險） |
+
+驗收（`tcbus selftest` 第 23 節新增 **8 項**，用自訂 `PersonaLimits` 的 store 跑）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| 設 10 字 → 11 字被拒、10 字通過 | `LLM_MAX_RULE_CHARS` 真的生效 |
+| 設 3 條 → 第 4 條起 `TooMany` | `LLM_MAX_GUILD_RULES` |
+| 3 個伺服器只留 2 個（淘汰條數最少的） | `LLM_MAX_PERSONA_GUILDS` |
+| 設 120 字 → 10 條只進去一部分（實測 114 字） | `LLM_MAX_OVERLAY_CHARS`（每次多花的 token） |
+| 設 2 筆 → 稽核紀錄只留最近 2 筆 | `LLM_MAX_AUDIT_ENTRIES` |
+| `PersonaLimits.Describe()` 含實際數字 | 摘要跟著設定走（啟動 log／`--dryrun`／`/ai status` 都印同一份） |
+
 
 
 ---

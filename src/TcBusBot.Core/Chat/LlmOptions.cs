@@ -205,6 +205,39 @@ public sealed class LlmOptions
     /// </summary>
     public TimeSpan ChannelTtl { get; set; } = TimeSpan.FromHours(12);
 
+    // ─────────────────────────────────────────────────────
+    //  「學到的提示詞」（每個伺服器一份的 overlay）容量上限
+    //
+    //  為什麼這幾個要可調：它們同時決定**提示詞會多長**（＝每次對話的錢）
+    //  與**任何人都能叫 Bot 記多少東西**（公開伺服器的濫用風險）。
+    //  私人小伺服器可以放寬，公開大伺服器建議收緊。
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>每個伺服器最多學幾條規則（環境變數 `LLM_MAX_GUILD_RULES`，預設 40）。</summary>
+    public int MaxGuildRules { get; set; } = 40;
+
+    /// <summary>每一條規則最多幾個字（環境變數 `LLM_MAX_RULE_CHARS`，預設 300）。</summary>
+    public int MaxRuleChars { get; set; } = 300;
+
+    /// <summary>最多幾個伺服器可以有自己的規則（環境變數 `LLM_MAX_PERSONA_GUILDS`，預設 200）。</summary>
+    public int MaxPersonaGuilds { get; set; } = 200;
+
+    /// <summary>規則接進提示詞的總長上限（環境變數 `LLM_MAX_OVERLAY_CHARS`，預設 2000）。</summary>
+    public int MaxOverlayChars { get; set; } = 2000;
+
+    /// <summary>主人操作紀錄最多留幾筆（環境變數 `LLM_MAX_AUDIT_ENTRIES`，預設 200）。</summary>
+    public int MaxAuditEntries { get; set; } = 200;
+
+    /// <summary>把上面五個組成 <see cref="PersonaLimits"/>（給 `GuildPersonaStore` 用）。</summary>
+    public PersonaLimits BuildPersonaLimits() => new()
+    {
+        MaxLinesPerGuild = MaxGuildRules,
+        MaxLineLength = MaxRuleChars,
+        MaxGuilds = MaxPersonaGuilds,
+        MaxOverlayLength = MaxOverlayChars,
+        MaxAuditEntries = MaxAuditEntries
+    };
+
     /// <summary>私訊要不要回（預設不要：私訊沒有「@ 機器人」這個動作，容易被誤觸）。</summary>
     public bool AllowDm { get; set; }
 

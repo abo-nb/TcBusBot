@@ -140,7 +140,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 .WithColor(new Color(0x2B, 0x6C, 0xB0))
                 .WithTitle("📚 這個伺服器學到的規矩")
                 .WithDescription(description)
-                .WithFooter($"共 {lines.Count}/{GuildPersonaStore.MaxLinesPerGuild} 條｜只對這個伺服器生效｜/rest 可以重設")
+                .WithFooter($"共 {lines.Count}/{_personas.Limits.MaxLinesPerGuild} 條｜只對這個伺服器生效｜/rest 可以重設")
                 .Build(),
             ephemeral: true);
     }

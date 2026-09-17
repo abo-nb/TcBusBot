@@ -122,6 +122,17 @@ services:
         value: "500"
       - key: LLM_CHANNEL_TTL_HOURS
         value: "12"
+      # ── 「學到的提示詞」要存多少（私人伺服器可放寬、公開的建議收緊）──
+      - key: LLM_MAX_GUILD_RULES
+        value: "40"
+      - key: LLM_MAX_RULE_CHARS
+        value: "300"
+      - key: LLM_MAX_PERSONA_GUILDS
+        value: "200"
+      - key: LLM_MAX_OVERLAY_CHARS
+        value: "2000"
+      - key: LLM_MAX_AUDIT_ENTRIES
+        value: "200"
 
       - key: DOTNET_ENVIRONMENT
         value: Production
