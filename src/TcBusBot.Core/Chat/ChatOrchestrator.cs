@@ -163,11 +163,16 @@ public sealed class ChatOrchestrator
     /// ⚠️ 順序有意義：學到的規則放最後，模型對「最後的指示」通常最聽話，
     /// 也才壓得過前面那些通用規則（使用者教它「講話簡短一點」就該真的簡短）。
     /// </summary>
-    public string EffectiveSystemPrompt(ulong guildId, bool isOwner = false, bool ambientContext = false)
+    public string EffectiveSystemPrompt(
+        ulong guildId, bool isOwner = false, bool ambientContext = false, string? selfName = null)
     {
         var prompt = isOwner
             ? OwnerInstructions.TrimStart() + "\n\n" + _options.SystemPrompt
             : _options.SystemPrompt;
+
+        // 「你在這裡叫什麼」——伺服器把 Bot 改暱稱時，有人喊那個名字它才知道是在叫它。
+        if (_options.TellSelfName && SelfNameNote(ResolveSelfName(selfName)) is { } note)
+            prompt += note;
 
         if (_options.ToolsEnabled && _tools is not NoChatTools)
             prompt += ToolInstructions;
@@ -220,6 +225,10 @@ public sealed class ChatOrchestrator
     /// 被 @ 的訊息會在進入本函式後（問模型之前）立刻回呼；偷聽到的訊息則要等判斷
     /// 結果是 <see cref="Addressee.Reply"/> 才回呼。
     /// </param>
+    /// <param name="selfName">
+    /// **它在這個伺服器被叫什麼**（Discord 暱稱）。給了就會寫進提示詞與判斷器
+    /// （「大家叫你『貓貓』」），沒給就用 <see cref="BotName"/>（通常是帳號名）。
+    /// </param>
     public async Task<ChatAnswer> AskAsync(
         ulong guildId,
         ulong channelId,
@@ -228,7 +237,8 @@ public sealed class ChatOrchestrator
         CancellationToken cancellationToken = default,
         bool addressed = true,
         bool mentionsOtherHuman = false,
-        Action? onReplying = null)
+        Action? onReplying = null,
+        string? selfName = null)
     {
         var startedAt = DateTimeOffset.UtcNow;
         var now = DateTimeOffset.UtcNow;
@@ -252,7 +262,10 @@ public sealed class ChatOrchestrator
 
         // ── 0b) 偷聽判斷（只在「偷聽到的訊息」時做）──────────
         var listenTokens = 0;
-        var botName = _client ?? "Bot";
+
+        // 判斷器要知道「你是誰」才會知道「是不是在叫你」——
+        // 伺服器把 Bot 改暱稱時，用暱稱（selfName）比用帳號準得多。
+        var botName = ResolveSelfName(selfName);
 
         if (!addressed)
         {
@@ -397,7 +410,8 @@ public sealed class ChatOrchestrator
             SystemPrompt: EffectiveSystemPrompt(
                 guildId,
                 admin.IsAdmin,
-                ambientContext: trimmed.Turns.Any(t => t.Ambient)),
+                ambientContext: trimmed.Turns.Any(t => t.Ambient),
+                selfName: selfName),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,
@@ -523,6 +537,31 @@ public sealed class ChatOrchestrator
                 _options.EavesdropSeconds, _options.EavesdropMaxMessages);
         }
     }
+
+    /// <summary>
+    /// 「你在這個伺服器叫什麼」那一段（只有在名字跟帳號不一樣時才加，省 token）。
+    /// 沒開（<see cref="LlmOptions.TellSelfName"/>）、名字等於帳號、或**根本還不知道自己是誰**時回傳 null。
+    /// </summary>
+    private string? SelfNameNote(string name)
+    {
+        // ⚠️ 不知道帳號名時（還沒連上 Discord／測試環境）不加：
+        //    那會變成「你的帳號名是（不知道）」這種沒有資訊又花 token 的句子。
+        if (_client is not { Length: > 0 }) return null;
+
+        if (name.Length == 0 || string.Equals(name, _client, StringComparison.Ordinal)) return null;
+
+        return $"""
+
+
+            【你在這個伺服器的名字】
+            （這個伺服器的人叫你「{name}」。有人喊這個名字、或提到這個名字，就是在說你。
+            你的帳號名是「{_client}」，那是另一種叫法。）
+            """;
+    }
+
+    /// <summary>判斷器與提示詞要用的「我的名字」：伺服器暱稱優先，其次帳號名。</summary>
+    private string ResolveSelfName(string? selfName)
+        => string.IsNullOrWhiteSpace(selfName) ? _client ?? "Bot" : selfName!.Trim();
 
     /// <summary>被忽略的一則（偷聽時判斷不是對它說話）—— 呼叫端什麼都不要送。</summary>
     private static ChatAnswer Ignored(DateTimeOffset startedAt, string reason)

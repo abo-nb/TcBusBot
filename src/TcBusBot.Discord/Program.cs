@@ -122,22 +122,38 @@ public static class Program
         var intents = GatewayIntents.Guilds;
         var wantsMessageContent = cfg.EnableMessageContentIntent;
 
-        // ★ 先問 Discord「這個應用程式有沒有被允許 Message Content 意圖」再做決定。
+        // ★ 想讓模型看到「伺服器暱稱」就需要 **Server Members 意圖**（也是特權意圖）。
+        //   沒開的話暱稱讀不到、會默默退回帳號名，所以一樣要先問過再決定要不要。
+        var wantsNicknames = cfg.Llm.IsConfigured && cfg.Llm.ShowNicknames;
+
+        // ★ 先問 Discord「這個應用程式有沒有被允許這些特權意圖」再做決定。
         //
         //   為什麼要問：沒被允許卻硬要，閘道會用 4014 把連線踢掉，
         //   而 Discord.Net 只會印一行看不出原因的 WebSocketException，
         //   加上先前的流程會直接結束行程 → Render 變成 502 + 不斷重啟。
-        //   問得到的答案（application flags 的 bit 18／19）是可靠的；
-        //   問不到就照使用者的設定走（不偷偷降級）。
-        if (wantsMessageContent && !dryRun)
-        {
-            var granted = await MessageContentIntentProbe.CheckAsync(cfg.Token, log: Console.WriteLine);
+        //   問得到的答案（application flags 的 bit 14／15、18／19）是可靠的。
+        //
+        //   ⚠️ 兩個意圖的「問不到」處理不一樣，而且是刻意的：
+        //      * Message Content：問不到就照設定要它（這個意圖在原本的部署就一直是開的，
+        //        沒開的 Bot 連不上會立刻發現）。
+        //      * Server Members：**問不到就不要**。讀不到暱稱只是認人差一點，
+        //        要了沒被允許卻是 Bot 完全連不上 —— 兩者代價差太多（fail closed）。
+        var membersGranted = false;
 
-            if (granted == false)
+        if ((wantsMessageContent || wantsNicknames) && !dryRun)
+        {
+            var check = await MessageContentIntentProbe.CheckAllAsync(cfg.Token, log: Console.WriteLine);
+
+            if (check.MessageContent == false && wantsMessageContent)
             {
                 MessageContentIntentProbe.PrintHowToEnable(Console.WriteLine);
                 wantsMessageContent = false;
             }
+
+            membersGranted = check.GuildMembers == true;
+
+            if (wantsNicknames && !membersGranted)
+                MessageContentIntentProbe.PrintHowToEnableMembers(Console.WriteLine);
         }
 
         if (wantsMessageContent)
@@ -149,6 +165,8 @@ public static class Program
             // 沒有特權意圖也要收訊息事件：Discord 對「@ 提及 Bot」的訊息會例外附上內容
             intents |= GatewayIntents.GuildMessages;
         }
+
+        if (wantsNicknames && membersGranted) intents |= GatewayIntents.GuildMembers;
 
         if (cfg.Llm.AllowDm) intents |= GatewayIntents.DirectMessages;
 
@@ -587,6 +605,7 @@ public static class Program
               (cfg.Llm.EavesdropContext ? "；聽到的閒聊會留下來當上下文" : "")
             : "關閉")}");
         Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
+        Console.WriteLine($"  模型看到的名字：{(cfg.Llm.ShowNicknames ? "Discord 暱稱（需要 Server Members 意圖，開機時會先確認）" : "@帳號（LLM_SHOW_NICKNAMES=false）")}");
         Console.WriteLine($"  對話記憶　　 ：{cfg.Llm.DescribeMemory()}");
         Console.WriteLine($"  學到的規矩　 ：{cfg.Llm.BuildPersonaLimits().Describe()}");
         Console.WriteLine();

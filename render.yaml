@@ -93,6 +93,10 @@ services:
         value: "true"
       - key: LLM_ALLOW_MENTIONS
         value: "true"
+      # 讓模型看到 Discord 暱稱（伺服器顯示名稱）而不是 @帳號；
+      # 也會讓它知道自己在這個伺服器被叫什麼（把 Bot 改暱稱時很重要）
+      - key: LLM_SHOW_NICKNAMES
+        value: "true"
       # 「主人」授權：名單 ＋ 訊息裡必須帶的特殊 key（兩個都設才會生效）
       - key: LLM_ADMIN_IDS
         sync: false

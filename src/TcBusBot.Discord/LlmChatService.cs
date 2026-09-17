@@ -161,7 +161,7 @@ public sealed class LlmChatService : IDisposable
         var mentions = userMessage.MentionedUsers
             .Where(u => u.Id != botId)
             .GroupBy(u => u.Id)
-            .ToDictionary(g => g.Key, g => DisplayNameOf(g.First()));
+            .ToDictionary(g => g.Key, g => NameOf(g.First()));
 
         text = MentionFormatter.Expand(text, mentions, _options.ExposeUserIds);
 
@@ -246,20 +246,55 @@ public sealed class LlmChatService : IDisposable
     public static bool ShouldHandle(bool mentioned, bool replyAddressed, bool listening)
         => mentioned || replyAddressed || listening;
 
-    /// <summary>把 Discord 的訊息轉成對話裡的一則（含「暱稱(@帳號, ID)」標籤）。</summary>
+    /// <summary>
+    /// 把 Discord 的訊息轉成對話裡的一則。
+    ///
+    /// 名字有兩份，而且**兩份都有用**：
+    ///   * <c>AuthorName</c>：模型平常讀到的名字（預設是**暱稱**，見 <see cref="NameOf"/>）。
+    ///     判斷器、話題判斷、工具訊息都用這一個 —— 用暱稱它才認得出「小明」是誰。
+    ///   * <c>PromptLabel</c>：主對話的標籤，一定同時帶帳號與 ID（`LLM_EXPOSE_IDS`），
+    ///     所以就算兩個人剛好取同一個暱稱也分得出來。
+    /// </summary>
     private ChatTurn BuildTurn(SocketUserMessage message, string text)
         => new(
             ChatRole.User,
-            message.Author.Username,
+            NameOf(message.Author),
             message.Author.Id,
             message.Id,
             text,
             message.Timestamp.ToUniversalTime(),
             PromptLabel: MentionFormatter.Label(
-                DisplayNameOf(message.Author),
+                _options.ShowNicknames ? HostNameOf(message.Author) : message.Author.Username,
                 message.Author.Username,
                 message.Author.Id,
                 _options.ExposeUserIds));
+
+    /// <summary>模型平常看到的名字：暱稱（預設）或帳號。</summary>
+    private string NameOf(IUser user)
+        => MentionFormatter.SpeakerName(
+            HostNameOf(user), user.Username, user.Id, _options.ShowNicknames);
+
+    /// <summary>Discord 上的顯示名稱（伺服器暱稱 → 全域顯示名稱 → 帳號名）。</summary>
+    private static string HostNameOf(IUser user)
+        => user is SocketGuildUser guildUser && !string.IsNullOrWhiteSpace(guildUser.DisplayName)
+            ? guildUser.DisplayName
+            : user.Username;
+
+    /// <summary>
+    /// **它在這個伺服器被叫什麼**（Discord 暱稱）。
+    ///
+    /// 為什麼要傳給 Core：伺服器把 Bot 改叫「貓貓」之後，有人喊「貓貓」它要知道那是在叫它 ——
+    /// 判斷「這句話是不是在對我說話」時尤其重要（判斷器問的是「你是『誰』」）。
+    /// </summary>
+    private string SelfNameIn(ulong guildId, SocketMessage message)
+    {
+        if (!_options.ShowNicknames || !_options.TellSelfName) return _client.CurrentUser?.Username ?? "Bot";
+
+        var guild = (message.Channel as SocketGuildChannel)?.Guild
+                    ?? (guildId != 0 ? _client.GetGuild(guildId) : null);
+
+        return HostNameOf(guild?.CurrentUser ?? (IUser?)_client.CurrentUser!);
+    }
 
     private async Task AnswerAsync(
         SocketUserMessage message,
@@ -295,7 +330,8 @@ public sealed class LlmChatService : IDisposable
             answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget,
                                           cancellationToken: default, addressed: addressed,
                                           mentionsOtherHuman: mentionsOtherHuman,
-                                          onReplying: StartTypingOnce);
+                                          onReplying: StartTypingOnce,
+                                          selfName: SelfNameIn(guildId, message));
         }
         finally
         {
@@ -488,22 +524,17 @@ public sealed class LlmChatService : IDisposable
             .Build();
     }
 
-    private static ChatTurn ToTurn(IMessage message, ulong botId)
+    private ChatTurn ToTurn(IMessage message, ulong botId)
         => new(
             message.Author.Id == botId ? ChatRole.Assistant : ChatRole.User,
-            message.Author.Username,
+            NameOf(message.Author),
             message.Author.Id,
             message.Id,
             message.Content ?? "",
             message.Timestamp.ToUniversalTime(),
             PromptLabel: MentionFormatter.Label(
-                DisplayNameOf(message.Author), message.Author.Username, message.Author.Id, includeId: true));
-
-    /// <summary>伺服器暱稱優先，沒有就用帳號名（DM 沒有暱稱）。</summary>
-    private static string DisplayNameOf(IUser user)
-        => user is SocketGuildUser guildUser && !string.IsNullOrWhiteSpace(guildUser.DisplayName)
-            ? guildUser.DisplayName
-            : user.Username;
+                _options.ShowNicknames ? HostNameOf(message.Author) : message.Author.Username,
+                message.Author.Username, message.Author.Id, includeId: true));
 
     /// <summary>
     /// 回覆時允許的 mention。

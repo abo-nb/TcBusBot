@@ -304,6 +304,19 @@ public sealed class BotConfig
         var mentions = SettingResolver.Resolve(args, "--llm-mentions", file, ["LLM_ALLOW_MENTIONS"]).Value;
         if (!string.IsNullOrWhiteSpace(mentions)) cfg.Llm.AllowMentions = !IsFalsy(mentions!);
 
+        // ── 讓模型看到 Discord 暱稱（預設開；關掉就一律用 @帳號）────
+        var nicknames = SettingResolver.Resolve(args, "--llm-nicknames", file, ["LLM_SHOW_NICKNAMES"]).Value;
+        if (!string.IsNullOrWhiteSpace(nicknames))
+        {
+            cfg.Llm.ShowNicknames = !IsFalsy(nicknames!);
+            cfg.Llm.TellSelfName = cfg.Llm.ShowNicknames;
+        }
+        if (args.Contains("--no-llm-nicknames"))
+        {
+            cfg.Llm.ShowNicknames = false;
+            cfg.Llm.TellSelfName = false;
+        }
+
         // ── 面板動作與偷聽 ────────────────────────────────
         var uiActions = SettingResolver.Resolve(args, "--llm-ui", file, ["LLM_UI_ACTIONS"]).Value;
         if (!string.IsNullOrWhiteSpace(uiActions)) cfg.Llm.UiActions = !IsFalsy(uiActions!);

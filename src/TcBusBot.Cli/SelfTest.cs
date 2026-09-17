@@ -2270,6 +2270,58 @@ public static class SelfTest
         Check("沒有 mention 的訊息一個字都不動",
             MentionFormatter.Expand("300 幾點來？", users, includeIds: true) == "300 幾點來？");
 
+        // ── 3b) 模型看到的名字：暱稱（預設）或 @帳號（LLM_SHOW_NICKNAMES）──
+        //     這是「模型認不認得大家在講誰」的唯一來源：判斷器、話題判斷、
+        //     工具訊息全都經過這裡。
+        Check("★ 開著時用暱稱（模型才聽得懂「小明剛剛說的」）",
+            MentionFormatter.SpeakerName("小明", "wuxiaohan0922", 123UL, showNicknames: true) == "小明");
+        Check("★ 關掉時用 @帳號（同一個人在不同伺服器身分一致）",
+            MentionFormatter.SpeakerName("小明", "wuxiaohan0922", 123UL, showNicknames: false) == "wuxiaohan0922");
+        Check("★ 沒有暱稱時退回帳號（DM 沒有暱稱）",
+            MentionFormatter.SpeakerName(null, "wuxiaohan0922", 123UL, showNicknames: true) == "wuxiaohan0922");
+        Check("★ 暱稱是空白時也退回帳號（不是給出空白名字）",
+            MentionFormatter.SpeakerName("   ", "wuxiaohan0922", 123UL, showNicknames: true) == "wuxiaohan0922");
+        Check("★ 兩個都沒有時至少給得出 ID 讓模型分辨",
+            MentionFormatter.SpeakerName("", null, 123UL, showNicknames: true) == "使用者123");
+        Check("暱稱前後的空白會被清掉（Discord 上的暱稱常有人加空格）",
+            MentionFormatter.SpeakerName("  小明  ", "wuxiaohan0922", 123UL, showNicknames: true) == "小明");
+
+        // 「它自己在這個伺服器叫什麼」——伺服器把 Bot 改暱稱時，
+        // 有人喊那個名字它才知道是在叫它。
+        var selfChat = new ChatOrchestrator(
+            new CountingLlmClient("REPLY"),
+            new LlmOptions { SystemPrompt = "人格", ShowNicknames = true, TellSelfName = true },
+            new ConversationStore(new LlmOptions()), new WeeklyTokenBudget(new LlmOptions()),
+            NoChatTools.Instance, new GuildPersonaStore())
+        {
+            BotName = "tcbusbot"
+        };
+
+        Check("★ 會告訴模型「你在這個伺服器被叫什麼」（改暱稱後喊那個名字它才知道）",
+            selfChat.EffectiveSystemPrompt(1UL, selfName: "笨蛋猫猫")
+                .Contains("這個伺服器的人叫你「笨蛋猫猫」", StringComparison.Ordinal));
+        Check("★ 同時告訴它帳號名是另一種叫法",
+            selfChat.EffectiveSystemPrompt(1UL, selfName: "笨蛋猫猫")
+                .Contains("你的帳號名是「tcbusbot」", StringComparison.Ordinal));
+        Check("名字跟帳號一樣時不會多送那一段（省 token）",
+            !selfChat.EffectiveSystemPrompt(1UL, selfName: "tcbusbot")
+                .Contains("你在這個伺服器的名字", StringComparison.Ordinal));
+        Check("沒給伺服器暱稱時也不會多送那一段",
+            !selfChat.EffectiveSystemPrompt(1UL).Contains("你在這個伺服器的名字", StringComparison.Ordinal));
+
+        var muteSelf = new ChatOrchestrator(
+            new CountingLlmClient("REPLY"),
+            new LlmOptions { SystemPrompt = "人格", TellSelfName = false },
+            new ConversationStore(new LlmOptions()), new WeeklyTokenBudget(new LlmOptions()),
+            NoChatTools.Instance, new GuildPersonaStore())
+        {
+            BotName = "tcbusbot"
+        };
+
+        Check("LLM_SHOW_NICKNAMES=false 時不會多送「你在這裡叫什麼」",
+            !muteSelf.EffectiveSystemPrompt(1UL, selfName: "笨蛋猫猫")
+                .Contains("你在這個伺服器的名字", StringComparison.Ordinal));
+
         // ── 4) 主人授權：fail closed ─────────────────────
         var noKey = new LlmOptions { AdminUserIds = [42UL], AdminKey = null };
         Check("★ 沒設 key → 整個主人機制關閉（不會「忘了設 key 就誰都能下令」）",

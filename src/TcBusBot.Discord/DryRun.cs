@@ -1503,6 +1503,21 @@ public static class DryRun
         Expect("其他 bit 不會被誤判（例如 Presence 的 bit12）",
             !MessageContentIntentProbe.MessageContentEnabled(1L << 12));
 
+        // Server Members（讀得到伺服器暱稱的那個意圖）——一樣是特權意圖，位元判斷錯了
+        // 就會出現「要了沒被允許的意圖 → 4014 → 連不上」，或「默默讀不到暱稱」。
+        Expect("Server Members：flags bit14（未驗證 Bot）→ 判定為已開啟",
+            MessageContentIntentProbe.GuildMembersEnabled(1L << 14));
+        Expect("Server Members：flags bit15（已驗證 Bot）→ 判定為已開啟",
+            MessageContentIntentProbe.GuildMembersEnabled(1L << 15));
+        Expect("★ Server Members：flags=0 → 判定為沒有開啟（這時就不該要它）",
+            !MessageContentIntentProbe.GuildMembersEnabled(0));
+        Expect("★ 兩個意圖的位元不會互相誤判（18/19 不等於成員意圖）",
+            !MessageContentIntentProbe.GuildMembersEnabled(1L << 18)
+            && !MessageContentIntentProbe.MessageContentEnabled(1L << 14));
+        Expect("★ 實測值 2621440（本專案的 Bot：Message Content 開、Server Members 關）判得對",
+            MessageContentIntentProbe.MessageContentEnabled(2621440)
+            && !MessageContentIntentProbe.GuildMembersEnabled(2621440));
+
         using (var doc = System.Text.Json.JsonDocument.Parse("""{"flags":262144}"""))
             Expect("解析數字型 flags", MessageContentIntentProbe.ParseFlags(doc.RootElement) == 262144);
 
@@ -1514,8 +1529,71 @@ public static class DryRun
             Expect("沒有 flags 欄位 → 0（保守判斷成沒開）",
                 MessageContentIntentProbe.ParseFlags(doc.RootElement) == 0);
 
-        // ── 偷聽設定本身合不合理 ─────────────────────────
-        //    這裡的錯誤都要等「真的有人在頻道上聊天」才會出現，
+        // ── 名字（暱稱 vs @帳號）────────────────────────────
+        //    這決定了「模型認不認得大家在講誰」，也決定判斷器準不準。
+        Console.WriteLine($"  ℹ 模型看到的名字：{(llm.ShowNicknames ? "Discord 暱稱（伺服器顯示名稱）" : "@帳號（username）")}" +
+                          (llm.ExposeUserIds
+                              ? (llm.ShowNicknames ? "＋@帳號＋ID" : "＋ID")
+                              : "（不帶 ID）"));
+
+        // 純函式：暱稱優先、關掉時退回帳號、兩個都沒有時給「使用者<ID>」
+        Expect("★ 開著時用暱稱（模型才聽得懂「小明剛剛說的」）",
+            MentionFormatter.SpeakerName("小明", "wuxiaohan0922", 123UL, showNicknames: true) == "小明");
+        Expect("★ 關掉時用 @帳號（同一個人在不同伺服器身分一致）",
+            MentionFormatter.SpeakerName("小明", "wuxiaohan0922", 123UL, showNicknames: false) == "wuxiaohan0922");
+        Expect("★ 沒有暱稱時退回帳號（DM 沒有暱稱）",
+            MentionFormatter.SpeakerName(null, "wuxiaohan0922", 123UL, showNicknames: true) == "wuxiaohan0922");
+        Expect("★ 兩個都沒有時不會給出空名字（模型至少看得到 ID）",
+            MentionFormatter.SpeakerName("", null, 123UL, showNicknames: true) == "使用者123");
+        Expect("主對話的標籤一定同時帶帳號與 ID（同名的人也分得出來）",
+            MentionFormatter.Label("小明", "wuxiaohan0922", 123UL, includeId: true)
+                == "小明(@wuxiaohan0922, 123)");
+
+        if (!llm.ShowNicknames)
+            Console.WriteLine("  ℹ 提示：關掉暱稱之後，模型在判斷「這句是不是在對我說話」時" +
+                              "只看得到帳號，認人會變差（除非大家習慣用帳號互稱）");
+
+        // ★ 光有設定不夠 —— 訊息進來的路徑真的要**用**它（跟偷聽那次一樣的教訓）：
+        //   設定寫了、程式碼沒接，選項就只是個裝飾。
+        var buildTurn = typeof(LlmChatService).GetMethod("BuildTurn",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        var nameOf = typeof(LlmChatService).GetMethod("NameOf",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        var buildCalls = buildTurn is null ? [] : CollectCalls(buildTurn, resolveAll: true);
+        var nameCalls = nameOf is null ? [] : CollectCalls(nameOf, resolveAll: true);
+
+        if (buildTurn is null || nameOf is null)
+        {
+            Problem("找不到 LlmChatService.BuildTurn／NameOf —— 無法驗證暱稱有沒有真的接上");
+        }
+        else if (!buildCalls.Contains("LlmChatService.NameOf"))
+        {
+            Problem("BuildTurn 沒有用 NameOf —— 訊息進來的名字不會跟著暱稱設定走");
+        }
+        else if (!nameCalls.Contains("MentionFormatter.SpeakerName"))
+        {
+            Problem("NameOf 沒有用 SpeakerName —— 模型看到的名字不會跟著 LLM_SHOW_NICKNAMES 走");
+        }
+        else if (!nameCalls.Contains("LlmOptions.get_ShowNicknames"))
+        {
+            Problem("NameOf 沒有讀 LLM_SHOW_NICKNAMES —— 這個選項不會生效");
+        }
+
+        var answerAsync = typeof(LlmChatService).GetMethod("AnswerAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        var answerCalls = answerAsync is null ? [] : CollectCalls(answerAsync, resolveAll: true);
+
+        if (answerAsync is null)
+            Problem("找不到 LlmChatService.AnswerAsync —— 無法驗證「自己在這裡叫什麼」有沒有傳進去");
+        else if (!answerCalls.Contains("LlmChatService.SelfNameIn"))
+            Problem("AnswerAsync 沒有傳「它在這個伺服器叫什麼」給 Core —— 改暱稱之後它不會認得那個名字");
+        else
+            Console.WriteLine("  ✔ 暱稱真的接得上：訊息 → SpeakerName（模型看到的名字）＋ SelfNameIn（它自己的名字）");
+
+        // ── 偷聽設定本身合不合理 ─────────────────────────        //    這裡的錯誤都要等「真的有人在頻道上聊天」才會出現，
         //    所以離線就要先問一次。
         var ev = llm.Eavesdrop;
         var evMsgs = llm.EavesdropMaxMessages;

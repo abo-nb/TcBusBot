@@ -161,4 +161,28 @@ public static class MentionFormatter
 
         return handle is null ? $"{name}({id})" : $"{name}({handle}, {id})";
     }
+
+    /// <summary>
+    /// 這個人在「給模型看的文字」裡要叫什麼名字。
+    ///
+    /// Discord 上有兩種名字，而且常常不一樣：
+    ///   * **暱稱**（伺服器暱稱／顯示名稱）：大家在頻道上看到、彼此稱呼的那個（「小明」）
+    ///   * **帳號**（username / handle）：`@wuxiaohan0922`，全 Discord 唯一但沒人這樣叫對方
+    ///
+    /// 為什麼預設用暱稱：模型要能聽懂「小明剛剛說的…」「叫小明來」這種話 ——
+    /// 使用者講的是暱稱，不是帳號。要關掉（`LLM_SHOW_NICKNAMES=false`）就用帳號，
+    /// 好處是**同一個人在不同伺服器有一致的身分**（暱稱每個伺服器都不一樣）。
+    ///
+    /// 抽成純函式（放 Core）是為了可以離線測試：這是「模型看到誰叫什麼」的唯一來源，
+    /// 判斷器、話題判斷、工具訊息全都經過它。
+    /// </summary>
+    public static string SpeakerName(string? nickname, string? username, ulong userId, bool showNicknames)
+    {
+        var nick = (nickname ?? "").Trim();
+        var handle = (username ?? "").Trim();
+
+        if (showNicknames && nick.Length > 0) return nick;
+
+        return handle.Length > 0 ? handle : $"使用者{userId}";
+    }
 }

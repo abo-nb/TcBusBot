@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 535 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 546 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 535 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 546 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3464,7 +3464,67 @@ AskAsync(addressed: false)
 | 設 2 筆 → 稽核紀錄只留最近 2 筆 | `LLM_MAX_AUDIT_ENTRIES` |
 | `PersonaLimits.Describe()` 含實際數字 | 摘要跟著設定走（啟動 log／`--dryrun`／`/ai status` 都印同一份） |
 
+### 20.19 「讓模型看到 DC 暱稱」（`LLM_SHOW_NICKNAMES`）
 
+Discord 上有兩種名字，而且常常不一樣：
+
+| | 例子 | 誰在用 |
+| --- | --- | --- |
+| **暱稱**（伺服器暱稱／顯示名稱） | `小明` | 頻道上大家互相稱呼的那個 |
+| **帳號**（username / handle） | `@wuxiaohan0922` | 全 Discord 唯一，但沒人這樣叫對方 |
+
+原本只有**主對話的標籤**帶暱稱（`暱稱(@帳號, ID)`），而
+**判斷器**（「這句話是在跟我說話嗎」）、**話題判斷**、**工具訊息**看到的都是 `AuthorName`
+——那時候存的是**帳號**。結果就是：模型在最重要的那兩個判斷裡根本認不出誰是誰
+（一群人聊天時，「小明你覺得呢」對它來說是 `@wuxiaohan0922 你覺得呢`）。
+
+修法：把「模型看到的名字」抽成 Core 的純函式 **`MentionFormatter.SpeakerName`**，
+兩份名字各有用途：
+
+| 欄位 | 內容 | 用在哪 |
+| --- | --- | --- |
+| `ChatTurn.AuthorName` | `SpeakerName(暱稱, 帳號, id, showNicknames)` → 預設**暱稱** | 判斷器、話題判斷、工具訊息、log |
+| `ChatTurn.PromptLabel` | `暱稱(@帳號, ID)`（`LLM_EXPOSE_IDS`） | 主對話的歷史（同名的人也分得出來） |
+
+同時加上「**它自己在這個伺服器叫什麼**」：伺服器把 Bot 改暱稱（「貓貓」）之後，
+有人喊那個名字它才會覺得是在叫它。作法是把伺服器的 Bot 暱稱傳進 `AskAsync`
+（`selfName`），提示詞會多一段（**只在名字與帳號不同時才加**，平常不花 token）：
+
+```
+【你在這個伺服器的名字】
+（這個伺服器的人叫你「貓貓」。有人喊這個名字、或提到這個名字，就是在說你。
+你的帳號名是「tcbusbot」，那是另一種叫法。）
+```
+
+#### 20.19.1 一個很容易漏掉的坑：Server Members 意圖
+
+**讀得到別人的暱稱是 `Server Members` 特權意圖的功勞**。沒開的話
+`SocketGuildUser.DisplayName` 拿不到成員資料、會**默默退回帳號名** ——
+功能看起來有開，實際上完全沒生效（沒有任何錯誤訊息）。
+
+所以開機時先用 `GET /applications/@me` 的 `flags` 確認意圖有沒有被允許
+（bit 14／15，跟 Message Content 的 18／19 對稱），並且：
+
+| 意圖 | 問不到時怎麼辦 | 為什麼 |
+| --- | --- | --- |
+| Message Content | 照設定要它（沿用原行為） | 這個意圖在原本的部署就一直是開的，沒開會立刻發現 |
+| **Server Members** | **不要它**（fail closed） | 讀不到暱稱只是認人差一點；要了沒被允許卻是閘道 **4014 → Bot 完全連不上** |
+
+> ⚠️ 順手修掉一個一直在說謊的探測：這個 `HttpClient` 原本**沒有送 User-Agent**，
+> 而 Discord 對沒有 UA 的請求回 **403** → 探測永遠「問不到」→ 退回「照設定要求」。
+> 也就是說**這段探測從來沒有真的生效過**（實測：補上 UA 之後才拿得到 `flags=2621440`）。
+> 這種「防護看起來在、其實沒接上」的東西比沒有更危險，所以 DryRun 現在也驗
+> 真實觀測值的位元判斷。
+
+驗收：
+
+| 檢查 | 在哪 |
+| --- | --- |
+| `SpeakerName`：開著用暱稱、關掉用帳號、沒暱稱退回帳號、空白暱稱也退回、都沒有時給「使用者&lt;ID&gt;」、前後空白會清掉 | `tcbus selftest` 第 26 節（**6 項**） |
+| 「你在這個伺服器的名字」：名字不同才加、一樣時不加、沒給暱稱時不加、關掉設定時不加 | `tcbus selftest` 第 26 節（**5 項**） |
+| 意圖位元（bit 14／15、18／19、實測值 2621440）、純函式真值表 | `--dryrun` 的「AI 聊天設定檢查」 |
+| **接線**：`BuildTurn → NameOf → SpeakerName ＋ ShowNicknames`、`AnswerAsync → SelfNameIn`（IL 掃描） | `--dryrun`（「設定寫了但程式碼沒接」是這個專案最常犯的錯，見 §20.16.1） |
+| 真實 API 的 `flags`：本專案的 Bot `flags=2621440` → Message Content **開**、Server Members **關** | 實測 `GET /applications/@me` |
 
 ---
 
