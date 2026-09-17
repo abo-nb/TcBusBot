@@ -607,6 +607,10 @@ public static class Program
             : "關閉")}");
         Console.WriteLine($"  訊息意圖　　 ：{(cfg.EnableMessageContentIntent ? "Message Content（需要在 Developer Portal 開啟）" : "只收指令（--no-message-intent）")}");
         Console.WriteLine($"  模型看到的名字：{(cfg.Llm.ShowNicknames ? "Discord 暱稱（需要 Server Members 意圖，開機時會先確認）" : "@帳號（LLM_SHOW_NICKNAMES=false）")}");
+        Console.WriteLine($"  多人同時說話 ：每人排隊等回覆（每頻道最多 {cfg.Llm.ChannelQueueDepth} 則，" +
+                          (cfg.Llm.MergeWindowSeconds > 0
+                              ? $"同一人 {cfg.Llm.MergeWindowSeconds} 秒內連打會合併成一題）"
+                              : "不合併同一人的連續訊息）"));
         Console.WriteLine($"  對話記憶　　 ：{cfg.Llm.DescribeMemory()}");
         Console.WriteLine($"  學到的規矩　 ：{cfg.Llm.BuildPersonaLimits().Describe()}");
         Console.WriteLine();

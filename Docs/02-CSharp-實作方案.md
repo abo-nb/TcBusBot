@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 586 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 601 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 586 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 601 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3707,6 +3707,69 @@ RoutingLlmClient
 > 順帶得到一個有用的資訊：這個端點可用的模型名稱就是 **`deepseek-flash`** 與
 > **`deepseek-v4-pro`**。想省錢可以 `LLM_MODEL=deepseek-v4-pro` ＋
 > `LLM_JUDGE_MODEL=deepseek-flash`；反過來（主模型用便宜的）也可以，只是回答品質會差一點。
+
+---
+
+### 20.22 多人同時說話：排隊而不是「忙就丟掉」（`LLM_CHANNEL_QUEUE`）
+
+使用者回報：「多個人說話會被吃掉（打斷、忽略），盡量每個人都回」。
+
+#### 20.22.1 原因
+
+```csharp
+// LlmChatService.HandleCoreAsync（舊版）
+var gate = _channelGates.GetOrAdd(message.Channel.Id, _ => new SemaphoreSlim(1, 1));
+if (!await gate.WaitAsync(TimeSpan.Zero))
+{
+    if (addressed) Console.WriteLine("略過一則（還在想上一題）");   // ← 使用者什麼都看不到
+    return;
+}
+```
+
+「同一頻道一次只處理一則」本身是對的（兩題同時問會互相污染上下文），
+但**忙的時候直接丟掉**在多人頻道就是災難：兩個人幾乎同時 @ 它，第二個人永遠等不到回答，
+而唯一的痕跡只有 console 裡一行 log。
+
+#### 20.22.2 改成排隊
+
+```
+訊息進來 → ChatQueue（每頻道一條）
+   ├─ 同一個人、4 秒內、而且「有沒有在對它說話」一致 → 合併成一題
+   ├─ 佇列未滿 → 排隊（工人依序處理，一則處理完才下一則）
+   └─ 佇列滿了 → 先丟「不是在對它說話」的閒聊；都滿了才丟最早的 @ 它
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 佇列放在 **Core**（`ChatQueue<T>`）而不是 Discord 那一層 | 這裡每一個判斷都直接影響「使用者有沒有被回答」，必須能離線測試（FIFO／合併／上限／丟誰） |
+| **同一個人短時間連打 → 合併** | 「在嗎」「300 幾點」「我要去靜宜」其實是一題。不合併會被當成三題、回三次（慢又貴），而且中間兩句常常只是補充 |
+| 合併條件包含「Addressed 一致」 | 把「@ 它的問題」跟「旁邊的閒聊」混成一題，會讓回答的對象錯亂 |
+| 佇列滿了**先丟閒聊** | 順序反過來的話，被犧牲的永遠是最想被回答的那個人（跟使用者的要求相反） |
+| 被丟掉的那一則**仍然寫進上下文**（只限閒聊） | 「沒有回話」跟「完全不知道發生過什麼事」是兩件事 |
+| 每個頻道一個工人，閒置 20 秒收工 | 不需要全域的輪詢迴圈；收工前**在鎖裡**再確認一次「真的一則都沒有」，否則剛好排進來的那一則會被放到天荒地老 |
+| 一則處理失敗不會讓整個佇列停掉 | 例外只記 log，工人繼續處理下一則 |
+
+另外把 `LLM_EAVESDROP_MESSAGES` 的預設從 12 調到 **20**：一群人聊天時，
+12 則判斷很快就用完，用完之後後面的訊息又會被忽略（同一個症狀的另一個來源）。
+
+#### 20.22.3 驗收
+
+`tcbus selftest` 第 23 節新增 **15 項**（`ChatQueue` 是純 Core，全部離線可測）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| 第一則排隊、**第二個人也排得進去** | 這就是以前被吃掉的那個人 |
+| 同一人 4 秒內連打 → `Merged`（佇列長度不變） | 合併 |
+| 不同人不會被合併 | 每個人都要有自己的回答 |
+| 超過合併窗 → 變成一則新的 | 合併窗邊界 |
+| 滿了先丟閒聊、`@ 它的一個都沒少`（實際列出留下的三則） | 丟棄順序 |
+| 全部都是 @ 它的人時丟最早的 | 兜底 |
+| 順序＝講話順序（先問的先被回答） | FIFO |
+| `WaitForWork` 沒東西回 false、有東西回 true；拿完就沒有 | 工人叫醒／收工 |
+| `maxDepth = 0` 仍至少留 1、合併窗 `0` = 不合併 | 邊界 |
+
+`--dryrun` 用 **IL 掃描**確認：訊息入口呼叫 `Enqueue`、`Enqueue` 用 `ChatQueue.Enqueue`、
+工人真的呼叫 `AnswerAsync`，而且入口**再也沒有** `SemaphoreSlim.WaitAsync`（舊的丟棄路徑）。
 
 ---
 

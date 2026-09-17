@@ -339,6 +339,15 @@ public sealed class BotConfig
                 ["LLM_EAVESDROP_SECONDS"]).Value, out var evSec) && evSec is >= 0 and <= 3600)
             cfg.Llm.EavesdropSeconds = evSec;
 
+        // ── 排隊（多人頻道不要「忙就丟掉」）──────────────────
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-channel-queue", file,
+                ["LLM_CHANNEL_QUEUE"]).Value, out var queueDepth) && queueDepth is >= 1 and <= 50)
+            cfg.Llm.ChannelQueueDepth = queueDepth;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-merge-seconds", file,
+                ["LLM_MERGE_SECONDS"]).Value, out var mergeSeconds) && mergeSeconds is >= 0 and <= 60)
+            cfg.Llm.MergeWindowSeconds = mergeSeconds;
+
         var eavesContext = SettingResolver.Resolve(args, "--llm-eavesdrop-context", file,
             ["LLM_EAVESDROP_CONTEXT"]).Value;
         if (!string.IsNullOrWhiteSpace(eavesContext)) cfg.Llm.EavesdropContext = !IsFalsy(eavesContext!);

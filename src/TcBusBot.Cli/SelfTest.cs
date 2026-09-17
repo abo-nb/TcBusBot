@@ -2103,6 +2103,105 @@ public static class SelfTest
             judgeOptions.Describe().Contains("判斷用：cheap-model", StringComparison.Ordinal),
             judgeOptions.Describe());
 
+        // ── 4f) 多人同時說話：排隊而不是「忙就丟掉」───────────────
+        //     使用者反映「多個人說話會被吃掉（打斷 忽略）」——
+        //     原因是舊版「同一頻道一次只處理一則，忙的時候直接丟掉」，
+        //     所以第二個 @ 它的人什麼都收不到。
+        var qnow = new DateTimeOffset(2026, 7, 5, 12, 0, 0, TimeSpan.Zero);
+
+        var queue = new ChatQueue<string>(
+            maxDepth: 3, mergeWindow: TimeSpan.FromSeconds(4),
+            merge: (a, b) => $"{a}\n{b}");
+
+        ChatQueueItem<string> Item(ulong author, int seconds, bool addressed, string text)
+            => new(author, qnow.AddSeconds(seconds), addressed, text);
+
+        Check("★ 進來的訊息會排隊（不是被丟掉）",
+            queue.Enqueue(Item(1UL, 0, true, "300 幾點")) == ChatQueueOutcome.Added
+            && queue.Count == 1);
+
+        Check("★ 第二個人 @ 它 → 也排得進去（這就是以前被吃掉的那個人）",
+            queue.Enqueue(Item(2UL, 0, true, "那 304 呢")) == ChatQueueOutcome.Added
+            && queue.Count == 2);
+
+        Check("★ 同一個人 4 秒內連打 → 合併成一題（不然會被當成兩題、回兩次）",
+            queue.Enqueue(Item(2UL, 2, true, "我要去靜宜大學")) == ChatQueueOutcome.Merged
+            && queue.Count == 2);
+
+        Check("★ 不同人不會被合併（每個人都要各自的回答）",
+            queue.Enqueue(Item(3UL, 2, true, "我要去逢甲")) == ChatQueueOutcome.Added);
+
+        // 合併窗的邊界：同一人但隔太久 → 不合併
+        // （另外開一條佇列，才不會撞到上面那條的 maxDepth）
+        var windowQueue = new ChatQueue<string>(maxDepth: 5, mergeWindow: TimeSpan.FromSeconds(4),
+            merge: (a, b) => $"{a}\n{b}");
+
+        windowQueue.Enqueue(Item(1UL, 0, true, "一"));
+
+        Check("合併窗內 → 合併",
+            windowQueue.Enqueue(Item(1UL, 2, true, "二")) == ChatQueueOutcome.Merged);
+
+        Check("超過合併窗（4 秒）就不再合併，變成一則新的問題",
+            windowQueue.Enqueue(Item(1UL, 30, true, "三")) == ChatQueueOutcome.Added
+            && windowQueue.Count == 2,
+            $"剩下 {windowQueue.Count} 則");
+
+        // 先丟「不是在對它說話」的那一則
+        var overflowQueue = new ChatQueue<string>(maxDepth: 3, mergeWindow: TimeSpan.FromSeconds(4),
+            merge: (a, b) => a + b);
+
+        overflowQueue.Enqueue(Item(1UL, 0, true, "@它的一"));
+        overflowQueue.Enqueue(Item(2UL, 0, false, "閒聊一"));
+        overflowQueue.Enqueue(Item(3UL, 0, true, "@它的二"));
+
+        var dropped = overflowQueue.Enqueue(Item(4UL, 0, true, "@它的三"));
+
+        Check("★ 佇列滿了先丟閒聊（不是在對它說話的那些），不會犧牲 @ 它的人",
+            dropped == ChatQueueOutcome.Dropped && overflowQueue.Count == 3);
+
+        var kept = new List<string>();
+
+        while (overflowQueue.TryDequeue(out var item)) kept.Add(item.Payload);
+
+        Check("★ 被丟掉的是閒聊，@ 它的人一個都沒少",
+            !kept.Contains("閒聊一") && kept.Contains("@它的一")
+            && kept.Contains("@它的二") && kept.Contains("@它的三"),
+            string.Join("、", kept));
+
+        Check("★ 順序照講話的先後（先問的人先被回答）",
+            kept[0] == "@它的一" && kept[^1] == "@它的三");
+
+        // 全部都是 @ 它的人 → 只能丟最早的（並記錄起來）
+        var allAddressed = new ChatQueue<string>(maxDepth: 2, mergeWindow: TimeSpan.Zero);
+        allAddressed.Enqueue(Item(1UL, 0, true, "A"));
+        allAddressed.Enqueue(Item(2UL, 0, true, "B"));
+
+        var droppedOldest = allAddressed.Enqueue(Item(3UL, 0, true, "C"));
+
+        allAddressed.TryDequeue(out var firstOfThree);
+        Check("★ 全部都是 @ 它的人時，丟掉最早的（並在 log 講清楚丟了什麼）",
+            droppedOldest == ChatQueueOutcome.Dropped && firstOfThree.Payload == "B");
+
+        // 工人收工／叫醒的行為
+        var idle = new ChatQueue<string>(maxDepth: 2, mergeWindow: TimeSpan.Zero);
+        Check("沒東西時工人等不到工作（可以收工）", !idle.HasWork && !idle.WaitForWork(TimeSpan.Zero));
+
+        idle.Enqueue(Item(1UL, 0, true, "X"));
+        Check("有東西時工人馬上被叫醒", idle.HasWork && idle.WaitForWork(TimeSpan.Zero));
+
+        idle.TryDequeue(out _);
+        Check("拿完之後就沒有工作了", !idle.HasWork);
+
+        // 上限與合併窗的邊界
+        var oneSlot = new ChatQueue<string>(maxDepth: 0, mergeWindow: TimeSpan.Zero);
+        oneSlot.Enqueue(Item(1UL, 0, true, "只有一則"));
+        Check("maxDepth 給 0 也會至少留 1（不會變成什麼都排不進去）", oneSlot.Count == 1);
+
+        var noMerge = new ChatQueue<string>(maxDepth: 5, mergeWindow: TimeSpan.Zero);
+        noMerge.Enqueue(Item(1UL, 0, true, "一"));
+        Check("合併窗設 0 → 完全不合併（每則都各自回答）",
+            noMerge.Enqueue(Item(1UL, 0, true, "二")) == ChatQueueOutcome.Added && noMerge.Count == 2);
+
         // ⑤ 建立流程本身：真的會建出「兩個模型」的那一層
         //    ⚠️ 這裡驗的是「判斷的依據」：要用**主設定**決定要不要建第二個客戶端。
         //       （複本自己的 Model 已經被換成判斷模型，拿它來判斷會永遠只有一個 ——

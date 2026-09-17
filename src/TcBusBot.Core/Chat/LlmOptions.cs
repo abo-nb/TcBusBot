@@ -170,7 +170,25 @@ public sealed class LlmOptions
     /// 一群人在聊天的時候，Bot 在中間被 @ 一次就會重新開窗，
     /// 太小（例如 3）會讓它講兩句就退出，使用者看到的是「後面的訊息全被忽略」。
     /// </summary>
-    public int EavesdropMaxMessages { get; set; } = 12;
+    public int EavesdropMaxMessages { get; set; } = 20;
+
+    /// <summary>
+    /// 每個頻道最多排幾則等回覆（超過就丟）。
+    ///
+    /// 為什麼要有這個佇列：以前是「同一頻道一次只處理一則，忙的時候直接丟掉」——
+    /// 多人頻道裡第二個 @ 它的人會被**默默吃掉**。改成排隊之後，
+    /// 每個人都有機會被回答，但**不能無上限**（一次進來 20 則會讓它忙一分鐘以上、
+    /// 也讓 token 用量失控）。
+    /// </summary>
+    public int ChannelQueueDepth { get; set; } = 5;
+
+    /// <summary>
+    /// 同一個人在幾秒內連打的訊息會**合併成一題**；`0` = 不合併。
+    ///
+    /// 例：「在嗎」「300 幾點」「我要去靜宜」→ 一題。
+    /// 不合併的話會被當成三題、回三次（慢又貴），而且中間那兩句常常只是補充。
+    /// </summary>
+    public int MergeWindowSeconds { get; set; } = 4;
 
     /// <summary>
     /// 偷聽的**閒置**時間窗：最後一則訊息之後幾秒沒人講話就停止偷聽、回到等 @。

@@ -38,7 +38,6 @@ public sealed class LlmChatService : IDisposable
     private readonly LlmOptions _options;
     private readonly BusSessionStore _sessions;
 
-    private readonly ConcurrentDictionary<ulong, SemaphoreSlim> _channelGates = new();
     private readonly ConcurrentDictionary<ulong, DateTimeOffset> _lastAskedAt = new();
 
     /// <summary>「訊息內容是空的」只提醒一次（那幾乎一定是沒開 Message Content 意圖）。</summary>
@@ -86,7 +85,8 @@ public sealed class LlmChatService : IDisposable
     }
 
     public string Describe()
-        => $"{_options.Describe()}｜已回 {_handled} 則／失敗 {_failed}／額度擋下 {_refused}｜" +
+        => $"{_options.Describe()}｜已回 {_handled} 則／失敗 {_failed}／額度擋下 {_refused}" +
+           $"／排隊 {_queued} 則（合併 {_merged}、丟棄 {_queueDropped}）｜" +
            $"{_chat.Budget.Describe()}";
 
     // ─────────────────────────────────────────────────────
@@ -207,31 +207,157 @@ public sealed class LlmChatService : IDisposable
 
         if (addressed) _lastAskedAt[userMessage.Author.Id] = now;
 
-        // 同一頻道一次只回一則
-        var gate = _channelGates.GetOrAdd(message.Channel.Id, _ => new SemaphoreSlim(1, 1));
-        if (!await gate.WaitAsync(TimeSpan.Zero))
-        {
-            // 偷聽到的訊息搶不到就**直接放棄**（不要回「我還在想」去打斷別人聊天），
-            // 但**內容要留下來當上下文** —— 不然 Bot 在想上一題的時候，
-            // 群組裡發生的事它就完全不知道了。
-            if (addressed)
-                Console.WriteLine($"[llm] 略過一則（{DescribeWhere(guildId, message)} 還在想上一題）");
-            else
-                _chat.RecordAmbient(guildId, message.Channel.Id,
-                                    BuildTurn(userMessage, text), "Bot 還在回上一題時聽到的");
+        // ── 排隊（不是「忙就丟掉」）─────────────────────────
+        //   以前是「同一頻道一次只處理一則，忙的時候直接丟掉」——
+        //   多人頻道裡第二個 @ 它的人會被**默默吃掉**（console 只有一行 log，
+        //   使用者什麼都看不到）。使用者要的是「盡量每個人都回」，
+        //   所以改成排隊，只有佇列真的滿了才丟（而且先丟閒聊、不丟 @ 它的）。
+        Enqueue(new QueuedMessage(userMessage, text, addressed, mentionsOtherHuman), now);
+    }
 
-            return;
-        }
+    /// <summary>排隊中的一則（保留原訊息，回覆時要用它的頻道／訊息 ID）。</summary>
+    private sealed record QueuedMessage(
+        SocketUserMessage Message,
+        string Text,
+        bool Addressed,
+        bool MentionsOtherHuman);
 
-        try
+    /// <summary>每個頻道的待處理佇列 ＋ 它的工人。</summary>
+    private sealed class ChannelQueue
+    {
+        public required ChatQueue<QueuedMessage> Queue { get; init; }
+
+        /// <summary>正在跑的那個工人（null = 沒有人在處理這個頻道）。</summary>
+        public Task? Worker { get; set; }
+    }
+
+    private readonly ConcurrentDictionary<ulong, ChannelQueue> _queues = new();
+    private readonly object _workerGate = new();
+
+    private int _queued;
+    private int _merged;
+    private int _queueDropped;
+
+    /// <summary>目前幾個頻道有人在等回覆（`/ai status` 與 log 用）。</summary>
+    public int BusyChannels
+    {
+        get
         {
-            await AnswerAsync(userMessage, guildId, text, referenced, addressed, mentionsOtherHuman);
-        }
-        finally
-        {
-            gate.Release();
+            lock (_workerGate)
+                return _queues.Count(kv => kv.Value.Worker is { IsCompleted: false });
         }
     }
+
+    public int QueuedCount => Volatile.Read(ref _queued);
+
+    /// <summary>排進這個頻道的佇列，並確保有一個工人在處理。</summary>
+    private void Enqueue(QueuedMessage message, DateTimeOffset now)
+    {
+        var channelId = message.Message.Channel.Id;
+        var where = DescribeWhere(GuildOf(message.Message), message.Message);
+
+        ChatQueueOutcome outcome;
+
+        lock (_workerGate)
+        {
+            var state = _queues.GetOrAdd(channelId, _ => new ChannelQueue
+            {
+                Queue = new ChatQueue<QueuedMessage>(
+                    _options.ChannelQueueDepth,
+                    TimeSpan.FromSeconds(_options.MergeWindowSeconds),
+                    merge: (a, b) => a with { Text = $"{a.Text}\n{b.Text}" })
+            });
+
+            outcome = state.Queue.Enqueue(new ChatQueueItem<QueuedMessage>(
+                AuthorId: message.Message.Author.Id,
+                At: now,
+                Addressed: message.Addressed,
+                Payload: message));
+
+            // 沒有人在做這個頻道 → 開一個工人
+            if (state.Worker is not { IsCompleted: false })
+                state.Worker = Task.Run(() => ProcessChannelAsync(channelId, state));
+        }
+
+        switch (outcome)
+        {
+            case ChatQueueOutcome.Added:
+                Interlocked.Increment(ref _queued);
+                Console.WriteLine($"[llm] ⏳ 排隊中（{where}）：{Preview(message.Text)}");
+                break;
+
+            case ChatQueueOutcome.Merged:
+                Interlocked.Increment(ref _merged);
+                Console.WriteLine($"[llm] ➕ 合併到上一題（{where}）：{Preview(message.Text)}");
+                break;
+
+            case ChatQueueOutcome.Dropped:
+                Interlocked.Increment(ref _queueDropped);
+
+                // 被丟掉的那一則**內容還是要留下來當上下文**（只記閒聊）——
+                // 「沒有回話」跟「完全不知道發生什麼事」是兩件事。
+                if (!message.Addressed)
+                    _chat.RecordAmbient(GuildOf(message.Message), channelId,
+                                        BuildTurn(message.Message, message.Text),
+                                        "排隊滿了所以沒回，只留下上下文");
+
+                Console.WriteLine($"[llm] ⚠️ 佇列滿了（{_options.ChannelQueueDepth} 則）→ 丟掉" +
+                                  $"{(message.Addressed ? "一則 @ 它的訊息" : "一則閒聊")}（{where}）：" +
+                                  Preview(message.Text));
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 一個頻道的工人：**一次處理一則**（順序＝使用者講話的順序），
+    /// 閒下來 20 秒就收工（下次有訊息會再開一個）。
+    /// </summary>
+    private async Task ProcessChannelAsync(ulong channelId, ChannelQueue state)
+    {
+        while (true)
+        {
+            if (!state.Queue.WaitForWork(TimeSpan.FromSeconds(20)))
+            {
+                // 沒東西了 → 收工。⚠️ 一定要在鎖裡確認「真的一則都沒有」：
+                //    不然剛好有人在這瞬間排進來，工人卻已經收工 → 那則訊息會被放到天荒地老。
+                lock (_workerGate)
+                {
+                    if (state.Queue.HasWork) continue;
+
+                    state.Worker = null;
+                    _queues.TryRemove(channelId, out _);
+                    return;
+                }
+            }
+
+            while (state.Queue.TryDequeue(out var item))
+            {
+                var payload = item.Payload;
+                var merged = item.Merged > 1 ? $"，合併了 {item.Merged} 則" : "";
+
+                try
+                {
+                    await AnswerAsync(
+                        payload.Message, GuildOf(payload.Message), payload.Text,
+                        payload.Message.ReferencedMessage, payload.Addressed, payload.MentionsOtherHuman);
+
+                    if (merged.Length > 0)
+                        Console.WriteLine($"[llm] ✔ 回覆完成{merged}（{DescribeWhere(GuildOf(payload.Message), payload.Message)}）");
+                }
+                catch (Exception ex)
+                {
+                    // 一則失敗不可以讓整個頻道的佇列停掉
+                    _failed++;
+                    Console.WriteLine($"[llm] 處理一則時發生非預期錯誤（繼續處理下一則）：");
+                    Console.WriteLine(ex.ToString());
+                }
+            }
+        }
+    }
+
+    /// <summary>從訊息推回伺服器 ID（私訊是 0）。</summary>
+    private static ulong GuildOf(SocketMessage message)
+        => (message.Channel as SocketGuildChannel)?.Guild.Id ?? 0;
 
     /// <summary>
     /// 這則訊息要不要進到 AI 流程？三個入口：**@ 它**、**回覆它**（含回覆記憶裡的訊息）、
@@ -638,7 +764,8 @@ public sealed class LlmChatService : IDisposable
 
     public void Dispose()
     {
-        foreach (var gate in _channelGates.Values) gate.Dispose();
-        _channelGates.Clear();
+        // 佇列不算資源，但裡面的 SemaphoreSlim 要放掉（工人會在下次等不到東西時自己收工）
+        foreach (var state in _queues.Values) state.Queue.Dispose();
+        _queues.Clear();
     }
 }

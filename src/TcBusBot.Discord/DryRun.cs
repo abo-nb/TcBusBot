@@ -1608,6 +1608,55 @@ public static class DryRun
             Expect("沒有 flags 欄位 → 0（保守判斷成沒開）",
                 MessageContentIntentProbe.ParseFlags(doc.RootElement) == 0);
 
+        // ── 多人同時說話：排隊而不是丟掉 ────────────────────
+        Console.WriteLine($"  ℹ 多人同時說話：每頻道排隊 {llm.ChannelQueueDepth} 則；" +
+                          (llm.MergeWindowSeconds > 0
+                              ? $"同一人 {llm.MergeWindowSeconds} 秒內連打會合併成一題"
+                              : "不合併"));
+
+        if (llm.ChannelQueueDepth < 2)
+            Problem($"LLM_CHANNEL_QUEUE={llm.ChannelQueueDepth} —— 佇列只有 1 則時，" +
+                    "第二個 @ 它的人還是會被丟掉（多人頻道的原症狀）");
+
+        // ★ 接線：真的走佇列，而不是「忙就丟掉」（舊版就是這樣吃掉訊息的）
+        var handle = typeof(LlmChatService).GetMethod("HandleCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var handleCalls = handle is null ? [] : CollectCalls(handle, resolveAll: true);
+
+        var enqueue = typeof(LlmChatService).GetMethod("Enqueue",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var enqueueCalls = enqueue is null ? [] : CollectCalls(enqueue, resolveAll: true);
+
+        var worker = typeof(LlmChatService).GetMethod("ProcessChannelAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var workerCalls = worker is null ? [] : CollectCalls(worker, resolveAll: true);
+
+        if (handle is null || enqueue is null || worker is null)
+        {
+            Problem("找不到 LlmChatService 的訊息入口／排隊／工人函式 —— 無法驗證多人同時說話的行為");
+        }
+        else if (!handleCalls.Contains("LlmChatService.Enqueue"))
+        {
+            Problem("訊息入口沒有排隊 —— 多人同時 @ 它時，後面的人會被吃掉");
+        }
+        else if (!enqueueCalls.Contains("ChatQueue`1.Enqueue"))
+        {
+            Problem("排隊入口沒有用 ChatQueue —— 「上限／合併／先丟閒聊」的規則不會生效");
+        }
+        else if (!workerCalls.Contains("LlmChatService.AnswerAsync"))
+        {
+            Problem("工人沒有真的去回答 —— 排了隊卻不會回");
+        }
+        else if (handleCalls.Contains("SemaphoreSlim.WaitAsync"))
+        {
+            Problem("訊息入口還留著「忙就丟掉」的舊寫法（SemaphoreSlim.WaitAsync）");
+        }
+        else
+        {
+            Console.WriteLine("  ✔ 多人同時說話：進來的訊息一律排隊（上限＋同人合併），" +
+                              "再也沒有「忙就默默丟掉」那條路");
+        }
+
         // ── 兩個模型（主模型 vs 判斷用的小模型）──────────────
         //    判斷用的模型只要回一個單字，而且次數多 —— 打錯名字時不會有錯誤訊息，
         //    只會在偷聽那一瞬間變成「判斷失敗 → 先不出聲」，所以要印出來核對。

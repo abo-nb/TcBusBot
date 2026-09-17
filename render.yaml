@@ -114,13 +114,20 @@ services:
         value: "true"
       # 判斷上限（成本上限；一群人聊天很容易超過，設太小會讓它聊兩句就退出）
       - key: LLM_EAVESDROP_MESSAGES
-        value: "12"
+        value: "20"
       # 閒置窗：最後一則訊息之後這麼久沒人講話才停止偷聽（每則訊息都會往後延）
       - key: LLM_EAVESDROP_SECONDS
         value: "120"
       # 偷聽到的閒聊留下來當上下文（之後被 @ 時才接得上大家在聊什麼）
       - key: LLM_EAVESDROP_CONTEXT
         value: "true"
+      # ── 多人同時說話：排隊等回覆（不是「忙就丟掉」）──────────
+      # 每頻道最多排幾則（超過先丟閒聊、不丟 @ 它的）
+      - key: LLM_CHANNEL_QUEUE
+        value: "5"
+      # 同一個人在幾秒內連打的訊息合併成一題（0 = 不合併）
+      - key: LLM_MERGE_SECONDS
+        value: "4"
       # ── 對話記憶的容量（記憶體用量；Render 免費層記憶體有限）──
       - key: LLM_MAX_TURNS_PER_SEGMENT
         value: "24"
