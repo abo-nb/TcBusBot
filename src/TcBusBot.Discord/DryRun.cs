@@ -1543,6 +1543,23 @@ public static class DryRun
         if (ev && evMsgs > 0)
             Console.WriteLine($"  ℹ 最壞情況：一輪偷聽會多花約 {evMsgs} 次短判斷" +
                               $"（每次約 250 tokens，合計約 {evMsgs * 250:N0} tokens）");
+
+        // ── 對話記憶的容量（全部都是環境變數可調）────────────
+        //    這幾個數字決定記憶體用量；改壞了不會有錯誤訊息，只會「東西莫名其妙不見」
+        //    或「記憶體慢慢長大」，所以離線就把摘要與矛盾印出來。
+        Console.WriteLine($"  ℹ 對話記憶：{llm.DescribeMemory()}");
+
+        if (llm.MaxTurnsPerSegment < llm.MaxContextTurns)
+            Console.WriteLine($"  ℹ 提示：一段只留 {llm.MaxTurnsPerSegment} 則，" +
+                              $"但每次最多想送 {llm.MaxContextTurns} 則 —— 實際送出的上限是一段的量" +
+                              "（LLM_MAX_TURNS_PER_SEGMENT 要 ≥ LLM_MAX_CONTEXT_TURNS 才有意義）");
+
+        if (llm.MaxSegmentsPerChannel < 2)
+            Console.WriteLine("  ℹ 提示：每頻道只留 1 段時，「回覆很舊的訊息」會拉不回那一段的上下文");
+
+        if (llm.MaxChannels * (long)llm.MaxSegmentsPerChannel * llm.MaxTurnsPerSegment > 2_000_000)
+            Problem($"對話記憶的最壞情況超過 200 萬則訊息（{llm.DescribeMemory()}）—— " +
+                    "記憶體會爆掉，請調整 LLM_MAX_CHANNELS／LLM_MAX_SEGMENTS_PER_CHANNEL／LLM_MAX_TURNS_PER_SEGMENT");
     }
 
     /// <summary>

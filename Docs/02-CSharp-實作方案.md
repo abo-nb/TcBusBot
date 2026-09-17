@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 513 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 519 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 513 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 519 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3392,6 +3392,41 @@ AskAsync(addressed: false)
 | **入口真的接得到**：`ShouldHandle` 真值表、入口 IL 掃描（有呼叫 `ShouldHandle`／`PeekListening`／`AskAsync`，且**沒有**直接 `StopListening`）、Core 的 IL 掃描（`TouchListen`／`ConsumeListen`／`RecordAmbient`＋`LLM_EAVESDROP_CONTEXT` 判斷） | `--dryrun` 的「偷聽入口檢查」（與 Bot 同一份程式碼；**這種「功能寫好但接不到」的 bug，元件檢查與單元測試都抓不到**） |
 | 三段判斷在真實模型上的表現：6 個多人聊天情境（延續話題→REPLY／私人邀約→STOP／離題閒聊→SKIP／追問公車→REPLY／互相道別→STOP／晚餐閒聊→SKIP）**6/6 正確**，每次約 305~313 in／2~3 out tokens | 真實 API（`deepseek-flash`） |
 | 閒聊真的進得了上下文：Bot 被 @ 一次 → 群組閒聊 3 句（不插話）→ 再被 @ 問「我們剛剛在聊什麼？」→ 正確回答「你們剛剛在聊晚餐要吃什麼」 | 真實 API ＋ 真的 `ChatOrchestrator` |
+
+### 20.17 對話記憶的容量（全部都是環境變數可調）
+
+對話記憶**只在記憶體**（重啟就沒了；這是隱私與成本的取捨，見 §20.2），
+但「記多少」不能寫死 —— 不同部署的記憶體差很多（Render 免費層只有 512 MB，
+掛在舊手機上的 Android 版反而寬裕）。所以四個容量上限都拉成環境變數：
+
+| 環境變數 | 預設 | 這是什麼 | 改小的後果 |
+| --- | --- | --- | --- |
+| `LLM_MAX_TURNS_PER_SEGMENT` | `24` | 一個段落最多留幾則（超過丟最舊的） | 「剛剛才講過」會被忘掉 |
+| `LLM_MAX_SEGMENTS_PER_CHANNEL` | `4` | 每個頻道最多留幾段 | 只剩 1 段時，「回覆很舊的訊息」拉不回那一段 |
+| `LLM_MAX_CHANNELS` | `500` | 同時追蹤幾個頻道（超過淘汰最久沒動的） | Bot 被加到很多伺服器時，冷門頻道更快被忘掉 |
+| `LLM_CHANNEL_TTL_HOURS` | `12` | 頻道閒置多久就整個忘掉（可給小數） | 隔天回來接不上昨天的話題 |
+
+三個刻意的設計：
+
+| 決定 | 為什麼 |
+| --- | --- |
+| **「記得多少」（上面四個）與「送多少」（`LLM_MAX_CONTEXT_*`）分開** | 前者是記憶體、後者是每次的錢。混在一起就沒辦法「多留一點給回覆舊訊息，但不要每次都送出去」 |
+| 容量摘要做成 `LlmOptions.DescribeMemory()`，啟動 log 與 `--dryrun` 都印 | 這些數字改壞**不會有錯誤訊息**，只會「東西莫名其妙不見」或「記憶體慢慢長大」；印出來才看得出有沒有生效 |
+| `--dryrun` 檢查矛盾組合（`MaxTurnsPerSegment < MaxContextTurns`、最壞情況 > 200 萬則） | 兩者都是「不會壞，但等於白設／會爆記憶體」的設定錯誤 |
+
+記憶體最壞情況 ＝ `MaxChannels × MaxSegmentsPerChannel × MaxTurnsPerSegment`
+（預設 = 500 × 4 × 24 = **48,000 則**訊息，每則幾十字，實務上遠低於此）。
+
+驗收（`tcbus selftest` 第 20 節新增 **6 項**，全部用真實的 `ConversationStore` 跑）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| 連續 6 則 → 只留最後 4 則，而且**丟掉的是最舊的那幾則** | `LLM_MAX_TURNS_PER_SEGMENT` 真的生效（不是只寫在文件裡） |
+| 硬開 4 段 → 只剩 2 段 | `LLM_MAX_SEGMENTS_PER_CHANNEL` |
+| 用 3 個頻道 → 只剩 2 個，且**留下的正好是最近有動靜的** | `LLM_MAX_CHANNELS`（淘汰策略是「最久沒動」，不是隨機） |
+| 超過 TTL 後 `Purge` 清掉、清掉後查不到 | `LLM_CHANNEL_TTL_HOURS` |
+| `DescribeMemory()` 含實際數字 | 摘要真的跟著設定走（改環境變數後看得出有沒有效） |
+
 
 ---
 

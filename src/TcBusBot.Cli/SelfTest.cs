@@ -1375,6 +1375,60 @@ public static class SelfTest
         Check("★ 超過 TTL 的頻道會被清掉", ttlStore.Purge(t0.AddHours(3)) == 1);
         Check("清掉之後查不到", ttlStore.Snapshot(1UL, 1UL, t0.AddHours(3)) is null);
 
+        // ── 9b) 「每個頻道記多少」是環境變數可調的 ──────────
+        //     這幾個數字就是記憶體用量（LLM_MAX_TURNS_PER_SEGMENT／…_SEGMENTS_PER_CHANNEL／
+        //     LLM_MAX_CHANNELS／LLM_CHANNEL_TTL_HOURS），所以行為一定要真的跟著設定走。
+        var smallStore = new ConversationStore(new LlmOptions
+        {
+            MaxTurnsPerSegment = 4,
+            MaxSegmentsPerChannel = 2,
+            MaxChannels = 2,
+            TopicDetect = false
+        });
+
+        // 同一段連續 6 則 → 只留最後 4 則
+        for (var i = 1; i <= 6; i++)
+        {
+            var turn = Turn((ulong)i, "小明", $"第 {i} 句", t0.AddSeconds(i));
+            smallStore.Commit(smallStore.Draft(1UL, 7UL, turn, null), turn, i == 1, "測試");
+        }
+
+        var capped = smallStore.Snapshot(1UL, 7UL, t0.AddSeconds(6));
+        Check("★ LLM_MAX_TURNS_PER_SEGMENT：一段最多留幾則（超過丟最舊的）",
+            capped?.CurrentTurnCount == 4, $"{capped?.CurrentTurnCount} 則（上限 4）");
+        Check("★ 丟掉的是最舊的（最近的才重要）",
+            smallStore.FindTurn(1UL, 7UL, 1UL) is null && smallStore.FindTurn(1UL, 7UL, 6UL) is not null);
+
+        // 每個頻道最多 2 段（硬開新段 4 次）
+        for (var i = 10; i <= 13; i++)
+        {
+            var turn = Turn((ulong)i, "小明", $"換話題 {i}", t0.AddMinutes(i * 10));
+            smallStore.Commit(smallStore.Draft(1UL, 7UL, turn, null), turn, true, "新的一段");
+        }
+
+        Check("★ LLM_MAX_SEGMENTS_PER_CHANNEL：每頻道最多幾段（超過丟最舊的）",
+            smallStore.Snapshot(1UL, 7UL, t0.AddMinutes(200))?.SegmentCount == 2,
+            $"{smallStore.Snapshot(1UL, 7UL, t0.AddMinutes(200))?.SegmentCount} 段（上限 2）");
+
+        // 最多 2 個頻道（第 3 個進來就把最久沒動的擠掉）
+        foreach (var ch in new ulong[] { 20UL, 21UL, 22UL })
+        {
+            var turn = Turn(100UL + ch, "小華", $"頻道 {ch}", t0.AddMinutes(300 + ch));
+            smallStore.Commit(smallStore.Draft(1UL, ch, turn, null), turn, true, "測試");
+        }
+
+        Check("★ LLM_MAX_CHANNELS：最多同時記幾個頻道（超過淘汰最久沒動的）",
+            smallStore.ChannelCount == 2, $"{smallStore.ChannelCount} 個頻道（上限 2）");
+        Check("★ 留下的是最近有動靜的頻道（最舊的 7 與 20 被淘汰）",
+            smallStore.Snapshot(1UL, 22UL, t0.AddMinutes(400)) is not null
+            && smallStore.Snapshot(1UL, 21UL, t0.AddMinutes(400)) is not null
+            && smallStore.Snapshot(1UL, 7UL, t0.AddMinutes(400)) is null
+            && smallStore.Snapshot(1UL, 20UL, t0.AddMinutes(400)) is null);
+
+        Check("★ 設定摘要印得出容量（改環境變數後看得出有沒有生效）",
+            new LlmOptions().DescribeMemory().Contains("24 則", StringComparison.Ordinal),
+            new LlmOptions().DescribeMemory());
+
         // ── 10) 長回覆要分段（Discord 單則 2000 字）─────────
         var longText = string.Join("\n", Enumerable.Range(1, 300).Select(i => $"第 {i} 行：公車資訊"));
         var chunks = SplitForTest(longText, 1900);

@@ -113,6 +113,15 @@ services:
       # 偷聽到的閒聊留下來當上下文（之後被 @ 時才接得上大家在聊什麼）
       - key: LLM_EAVESDROP_CONTEXT
         value: "true"
+      # ── 對話記憶的容量（記憶體用量；Render 免費層記憶體有限）──
+      - key: LLM_MAX_TURNS_PER_SEGMENT
+        value: "24"
+      - key: LLM_MAX_SEGMENTS_PER_CHANNEL
+        value: "4"
+      - key: LLM_MAX_CHANNELS
+        value: "500"
+      - key: LLM_CHANNEL_TTL_HOURS
+        value: "12"
 
       - key: DOTNET_ENVIRONMENT
         value: Production

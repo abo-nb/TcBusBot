@@ -180,16 +180,29 @@ public sealed class LlmOptions
 
     public double Temperature { get; set; } = 0.7;
 
-    /// <summary>一個段落最多留幾則訊息（超過就丟掉最舊的）。</summary>
+    /// <summary>
+    /// 一個段落最多留幾則訊息（超過就丟掉最舊的）。環境變數：`LLM_MAX_TURNS_PER_SEGMENT`（預設 24）。
+    ///
+    /// 這是**儲存**上限（記憶體），跟「送幾則給模型」（<see cref="MaxContextTurns"/>）是兩件事：
+    /// 存得比送得多沒關係，多的那一些留著給「回覆舊訊息」用。
+    /// </summary>
     public int MaxTurnsPerSegment { get; set; } = 24;
 
-    /// <summary>每個頻道最多留幾個段落（給「回覆舊訊息」用）。</summary>
+    /// <summary>
+    /// 每個頻道最多留幾個段落（給「回覆舊訊息」用）。環境變數：`LLM_MAX_SEGMENTS_PER_CHANNEL`（預設 4）。
+    /// </summary>
     public int MaxSegmentsPerChannel { get; set; } = 4;
 
-    /// <summary>同時追蹤幾個頻道（超過就淘汰最久沒動的）。</summary>
+    /// <summary>
+    /// 同時追蹤幾個頻道（超過就淘汰最久沒動的）。環境變數：`LLM_MAX_CHANNELS`（預設 500）。
+    ///
+    /// 這是整台 Bot 的記憶體上限：總量 ≈ MaxChannels × MaxSegmentsPerChannel × MaxTurnsPerSegment 則。
+    /// </summary>
     public int MaxChannels { get; set; } = 500;
 
-    /// <summary>頻道多久沒動就整個忘掉。</summary>
+    /// <summary>
+    /// 頻道多久沒動就整個忘掉。環境變數：`LLM_CHANNEL_TTL_HOURS`（預設 12 小時，可給小數）。
+    /// </summary>
     public TimeSpan ChannelTtl { get; set; } = TimeSpan.FromHours(12);
 
     /// <summary>私訊要不要回（預設不要：私訊沒有「@ 機器人」這個動作，容易被誤觸）。</summary>
@@ -246,6 +259,17 @@ public sealed class LlmOptions
               (WeeklyTokenLimit > 0 ? $"{WeeklyTokenLimit:N0} tokens" : "不限") +
               $"，思考：{ReasoningDescription}）"
             : "未啟用（沒有 LLM_API_KEY）";
+
+    /// <summary>
+    /// 對話記憶的容量摘要（啟動 log、`--dryrun`、`/ai status` 用）。
+    ///
+    /// 為什麼要印出來：這幾個數字決定「這台 Bot 會吃掉多少記憶體」，
+    /// 而且全部都是環境變數可調 —— 沒有印出來的話，改了也不知道有沒有生效。
+    /// </summary>
+    public string DescribeMemory()
+        => $"每頻道最多 {MaxSegmentsPerChannel} 段 × {MaxTurnsPerSegment} 則、" +
+           $"最多追蹤 {MaxChannels} 個頻道、閒置 {ChannelTtl.TotalHours:0.##} 小時忘記" +
+           $"（全部加起來最壞約 {MaxChannels * (long)MaxSegmentsPerChannel * MaxTurnsPerSegment:N0} 則訊息）";
 
     public LlmOptions Clone() => (LlmOptions)MemberwiseClone();
 }

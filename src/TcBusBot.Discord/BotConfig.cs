@@ -208,6 +208,25 @@ public sealed class BotConfig
                 ["LLM_MAX_CONTEXT_TOKENS"]).Value, out var ctxTokens) && ctxTokens >= 256)
             cfg.Llm.MaxContextTokens = ctxTokens;
 
+        // ── 每個頻道「記多少」（記憶體用量 ↔ 上下文品質的取捨）──────
+        //    ⚠️ 這幾個是**儲存**的上限，跟上面「送多少」（LLM_MAX_CONTEXT_*）不一樣：
+        //       存得比送得多沒關係（多的只是留著給「回覆舊訊息」用）。
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-turns-per-segment", file,
+                ["LLM_MAX_TURNS_PER_SEGMENT"]).Value, out var perSegment) && perSegment is >= 4 and <= 500)
+            cfg.Llm.MaxTurnsPerSegment = perSegment;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-segments-per-channel", file,
+                ["LLM_MAX_SEGMENTS_PER_CHANNEL"]).Value, out var perChannel) && perChannel is >= 1 and <= 50)
+            cfg.Llm.MaxSegmentsPerChannel = perChannel;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-max-channels", file,
+                ["LLM_MAX_CHANNELS"]).Value, out var maxChannels) && maxChannels is >= 1 and <= 100_000)
+            cfg.Llm.MaxChannels = maxChannels;
+
+        if (double.TryParse(SettingResolver.Resolve(args, "--llm-channel-ttl-hours", file,
+                ["LLM_CHANNEL_TTL_HOURS"]).Value, out var ttlHours) && ttlHours is >= 0.25 and <= 8760)
+            cfg.Llm.ChannelTtl = TimeSpan.FromHours(ttlHours);
+
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-max-output", file,
                 ["LLM_MAX_OUTPUT_TOKENS"]).Value, out var maxOut) && maxOut is > 0 and <= 8192)
             cfg.Llm.MaxOutputTokens = maxOut;
