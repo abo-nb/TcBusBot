@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 546 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 553 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 546 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 553 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3525,6 +3525,39 @@ Discord 上有兩種名字，而且常常不一樣：
 | 意圖位元（bit 14／15、18／19、實測值 2621440）、純函式真值表 | `--dryrun` 的「AI 聊天設定檢查」 |
 | **接線**：`BuildTurn → NameOf → SpeakerName ＋ ShowNicknames`、`AnswerAsync → SelfNameIn`（IL 掃描） | `--dryrun`（「設定寫了但程式碼沒接」是這個專案最常犯的錯，見 §20.16.1） |
 | 真實 API 的 `flags`：本專案的 Bot `flags=2621440` → Message Content **開**、Server Members **關** | 實測 `GET /applications/@me` |
+
+### 20.20 `/ai pset`：管理員直接設定伺服器的提示詞
+
+背景：模型自己學（`remember_rule`）適合「使用者隨口教一句」，但管理員要的常常是
+**一開始就寫好、而且是精確的一整段**（「一律用繁體中文、不要用條列、回答前先確認站名」）。
+用嘴巴講給模型聽有兩個問題：**不確定**（模型可能摘要錯）與**要花額度**（一次工具呼叫）。
+
+`/ai pset` 就是「直接寫進去」：
+
+```
+/ai pset text:一律用繁體中文、回答前先確認站名              → 追加（mode 預設 Append）
+/ai pset text:只幫大家查台中公車，其他一律婉拒 mode:Replace  → 覆蓋掉這個伺服器現有的全部
+/ai pset clear:True                                       → 清空（會列出被清掉的原文）
+/ai pset                                                  → 顯示目前的設定
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 寫的是**跟模型自己學的同一份** `GuildPersonaStore` | 單一來源：`/ai learned` 看得到、`/rest` 清得掉。做第二套一定會出現「兩邊都寫了，不知道哪個生效」 |
+| 授權＝`LLM_ADMIN_IDS` 名單，**不需要** `LLM_ADMIN_KEY` | 那把 key 是為了擋「模型被騙去打主人的指令」（訊息是模型讀得到的東西）；斜線指令是 Discord 直接送給 Bot 的互動，**模型碰不到**，而 key 反而會留在對話紀錄裡。真正被騙的風險在 `OwnerTools`（全域設定） |
+| 名單沒設定時**沒有人能用**（fail closed） | 跟主人機制同一個原則：忘了設定不等於開放給所有人 |
+| 覆蓋模式「先備份 → 清 → 寫 → 失敗就還原」 | 反過來寫的話，內容太長時會變成「舊的被清掉、新的沒進去」——使用者用一個失敗的指令把自己的設定弄丟 |
+| 每次寫入都進**同一份稽核**（`/ai audit`）＋ console 一行 | 使用者要的是「誰、什麼時候、改了什麼」查得到；是打字下令還是打指令不是重點 |
+| 規則邏輯放 store（`SetRules`）、授權留指令模組 | 前者「一定會動到使用者的東西」必須能離線測試；後者只有互動層拿得到 Discord 使用者 ID |
+
+驗收：
+
+| 檢查 | 在哪 |
+| --- | --- |
+| 追加／覆蓋（清掉幾條、剩幾條）／覆蓋失敗要還原（`TooLong` 時舊的還在）／空白內容什麼都不做／稽核紀錄／與模型學到的共用同一份 | `tcbus selftest` 第 23 節（**7 項**） |
+| 指令樹：`/ai` 有 5 個子指令、`/ai pset` 有三個選填參數、**IL 掃描**確認它真的檢查 `AdminUserIds` 而且走 `SetRules` | `--dryrun` 的命令樹與接線檢查 |
+| 實機：非名單成員 → 被擋（ephemeral）；名單成員 → 設定成功、`/ai learned` 看到、`/ai audit` 有紀錄 | 真實 Discord |
+
 
 ---
 

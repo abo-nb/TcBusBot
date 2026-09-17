@@ -314,6 +314,66 @@ public sealed class GuildPersonaStore
         return removed;
     }
 
+    /// <summary>
+    /// **管理員用指令設定這個伺服器的自訂提示詞**（`/ai pset`）的結果。
+    /// <see cref="Lines"/> 是設定完之後的完整內容（給指令直接顯示，不用再查一次）。
+    /// </summary>
+    public sealed record PersonaSetResult(
+        LearnResult Result, int Removed, IReadOnlyList<string> Lines)
+    {
+        public bool Ok => Result == LearnResult.Added;
+    }
+
+    /// <summary>
+    /// 管理員用指令設定這個伺服器的自訂提示詞：<paramref name="replace"/> 為 true 時
+    /// 先清掉現有的全部再寫入，否則只是追加一條。
+    ///
+    /// 為什麼放在 store（而不是寫在指令模組裡）：這條路徑**一定會動到使用者的東西**，
+    /// 所以「覆蓋時先清掉什麼、上限怎麼算、稽核要記什麼」都必須能離線測試。
+    /// 授權（誰是管理員）留在呼叫端 —— 那是互動層的事（只有那裡拿得到 Discord 使用者 ID）。
+    /// </summary>
+    public PersonaSetResult SetRules(ulong guildId, ulong userId, string? text, bool replace)
+    {
+        var clean = Clean(text);
+        if (clean.Length == 0) return new PersonaSetResult(LearnResult.Empty, 0, Lines(guildId));
+
+        if (!replace)
+        {
+            var appended = Learn(guildId, clean);
+
+            if (appended == LearnResult.Added)
+                AuditAdmin(userId, "追加這個伺服器的提示詞", clean);
+
+            return new PersonaSetResult(appended, 0, Lines(guildId));
+        }
+
+        // ⚠️ 覆蓋模式的順序很重要：清掉舊的 → 寫新的 → **寫不進去就把舊的還原**。
+        //    如果只顧著清，一個失敗的指令（內容太長）就會讓使用者的設定憑空消失。
+        var backup = Reset(guildId);
+        var result = Learn(guildId, clean);
+
+        if (result != LearnResult.Added)
+        {
+            PutBack(guildId, backup);
+            return new PersonaSetResult(result, 0, Lines(guildId));
+        }
+
+        AuditAdmin(userId, "設定這個伺服器的提示詞（覆蓋全部）", clean);
+
+        return new PersonaSetResult(result, backup.Count, Lines(guildId));
+    }
+
+    /// <summary>把剛才備份起來的內容原封不動放回去（還原用；不做清理與去重）。</summary>
+    private void PutBack(ulong guildId, IReadOnlyList<string> lines)
+    {
+        if (lines.Count == 0) return;
+
+        lock (_gate)
+            _lines[Key(guildId)] = lines.Take(Limits.MaxLinesPerGuild).ToList();
+
+        Save();
+    }
+
     /// <summary>給 `/ai status`／log 看的一行說明。</summary>
     public string Describe(ulong guildId)
     {
@@ -359,10 +419,20 @@ public sealed class GuildPersonaStore
         lock (_gate) return _audit.TakeLast(Math.Max(1, limit)).Reverse().ToList();
     }
 
+    /// <summary>
+    /// 記一筆「有人用指令改了設定」的紀錄。
+    ///
+    /// 跟主人操作記在**同一份稽核**裡（`/ai audit` 看得到）：使用者要的是
+    /// 「誰、什麼時候、改了什麼」查得到，至於是打字下令還是打指令，不是重點。
+    /// </summary>
+    public void AuditAdmin(ulong userId, string action, string text) => Audit(userId, action, text);
+
     /// <summary>記一筆主人操作（同時寫進 console，讓主機端也看得到）。</summary>
-    private void Audit(OwnerGrant grant, string action, string text)
+    private void Audit(OwnerGrant grant, string action, string text) => Audit(grant.UserId, action, text);
+
+    private void Audit(ulong userId, string action, string text)
     {
-        var entry = new AuditEntry(DateTimeOffset.UtcNow, grant.UserId, action, Truncate(text, 200));
+        var entry = new AuditEntry(DateTimeOffset.UtcNow, userId, action, Truncate(text, 200));
 
         lock (_gate)
         {
@@ -371,7 +441,7 @@ public sealed class GuildPersonaStore
             SaveLocked();
         }
 
-        BotLog.Warn($"[主人] {entry.Describe()}");
+        BotLog.Warn($"[設定] {entry.Describe()}");
     }
 
     private static string Truncate(string text, int max)

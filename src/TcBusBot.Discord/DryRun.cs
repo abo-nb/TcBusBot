@@ -1164,13 +1164,44 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget", "learned", "audit" };
+            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)
                 Problem($"/ai 缺少子指令：{string.Join("、", missingAi)}");
             else
                 Console.WriteLine($"  ✔ /ai 的 {expectedAi.Length} 個子指令都在（{string.Join("、", expectedAi)}）");
+
+            // ── /ai pset：管理員直接設定這個伺服器的提示詞 ──────
+            var pset = commands.FirstOrDefault(c => CommandPath(c) == "ai pset");
+
+            if (pset is null)
+            {
+                Problem("找不到 /ai pset —— 管理員沒辦法直接設定伺服器的提示詞");
+            }
+            else
+            {
+                var opts = pset.Parameters.Select(p => p.Name).ToList();
+                Console.WriteLine($"  ℹ /ai pset 參數：{string.Join("、", opts)}");
+
+                if (!opts.Contains("text") || !opts.Contains("mode") || !opts.Contains("clear"))
+                    Problem("/ai pset 少了參數（需要 text／mode／clear）");
+                else if (pset.Parameters.Any(p => p.IsRequired))
+                    Problem("/ai pset 不該有必填參數 —— 不給參數時應該顯示目前的設定");
+            }
+
+            // ★ 授權一定要真的擋在指令裡（不是只寫在文件上）
+            var psetAsync = typeof(ChatModule).GetMethod(nameof(ChatModule.PersonaSetAsync));
+            var psetCalls = psetAsync is null ? [] : CollectCalls(psetAsync, resolveAll: true);
+
+            if (psetAsync is null)
+                Problem("找不到 ChatModule.PersonaSetAsync");
+            else if (!psetCalls.Contains("LlmOptions.get_AdminUserIds"))
+                Problem("/ai pset 沒有檢查 LLM_ADMIN_IDS —— 任何人都能改伺服器的提示詞");
+            else if (!psetCalls.Contains("GuildPersonaStore.SetRules"))
+                Problem("/ai pset 沒有走 GuildPersonaStore.SetRules（覆蓋模式的安全順序會失效）");
+            else
+                Console.WriteLine("  ✔ /ai pset 真的會擋人（檢查 LLM_ADMIN_IDS）而且走的是可測試的 SetRules");
         }
 
         // ── /rest（重設這個伺服器學到的規矩）────────────────

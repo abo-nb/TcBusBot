@@ -148,6 +148,130 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private static string Truncate(string text, int max)
         => text.Length <= max ? text : text[..max] + "…";
 
+    /// <summary>`/ai pset` 的兩種模式。</summary>
+    public enum PersonaMode
+    {
+        /// <summary>追加一條（跟模型自己學到的規則放在一起）。</summary>
+        Append,
+
+        /// <summary>覆蓋掉這個伺服器現有的全部自訂提示詞。</summary>
+        Replace
+    }
+
+    /// <summary>
+    /// `/ai pset`：**後台指定的管理員**（`LLM_ADMIN_IDS`）直接設定這個伺服器的自訂提示詞。
+    ///
+    /// 為什麼需要這個指令：模型自己學（`remember_rule`）很適合「使用者隨口教一句」，
+    /// 但管理員想要的常常是**一開始就寫好、而且是精確的一整段**（例如「一律用繁體中文、
+    /// 不要用條列、每次回答前先確認站名」）。用嘴巴講給模型聽會有不確定性，
+    /// 也會佔用對話額度；這個指令就是「直接寫進去」。
+    ///
+    /// 寫的東西跟學到的是**同一份 overlay**（`GuildPersonaStore`）：
+    ///   * `/ai learned` 看得到、`/rest` 清得掉（單一來源，不做第二套）
+    ///   * 一樣受 `LLM_MAX_GUILD_RULES`／`LLM_MAX_RULE_CHARS` 的上限約束
+    ///   * 每次都會記進稽核紀錄（`/ai audit`），因為這是「有人改了設定」
+    ///
+    /// ⚠️ 為什麼只認 `LLM_ADMIN_IDS` 而**不需要** `LLM_ADMIN_KEY`：
+    ///    那把 key 是為了擋「模型被騙去打主人的指令」（訊息是模型讀得到的東西）。
+    ///    斜線指令是 Discord 直接送到 Bot 的互動，**模型碰不到**，
+    ///    而且少了 key 就不會出現在對話紀錄裡。真的被騙的風險在 `OwnerTools`（全域設定）那邊。
+    /// </summary>
+    [SlashCommand("pset", "設定這個伺服器的自訂提示詞（只有後台指定的管理員能用）")]
+    public async Task PersonaSetAsync(
+        [Summary("text", "要設定的內容（一句重點；留空＝只顯示目前的設定）")] string? text = null,
+        [Summary("mode", "Append＝追加一條；Replace＝覆蓋掉這個伺服器現有的全部")] PersonaMode mode = PersonaMode.Append,
+        [Summary("clear", "清空這個伺服器的自訂提示詞")] bool clear = false)
+    {
+        // ── 授權：後台指定的管理員（fail closed：沒設定名單＝沒人能用）──
+        if (!_options.AdminUserIds.Contains(Context.User.Id))
+        {
+            await RespondAsync(
+                "這個指令只有後台指定的管理員能用（`LLM_ADMIN_IDS` 名單上的人）。\n" +
+                (Context.Guild is null ? "" : "你可以用 `@我 記住：…` 教它這個伺服器專屬的規矩。"),
+                ephemeral: true);
+            return;
+        }
+
+        var guildId = Context.Guild?.Id ?? 0;
+
+        if (guildId == 0)
+        {
+            await RespondAsync("這個指令要在伺服器裡使用（自訂提示詞是「每個伺服器一份」的）。", ephemeral: true);
+            return;
+        }
+
+        // ── 清空 ─────────────────────────────────────────
+        if (clear)
+        {
+            var removed = _personas.Reset(guildId);
+
+            if (removed.Count == 0)
+            {
+                await RespondAsync("這個伺服器本來就沒有自訂提示詞（不用清）。", ephemeral: true);
+                return;
+            }
+
+            _personas.AuditAdmin(Context.User.Id, "清空這個伺服器的提示詞", $"{removed.Count} 條");
+
+            await RespondAsync(
+                $"🧹 已清空 {removed.Count} 條自訂提示詞（回到預設的樣子）。\n" +
+                "下面是清掉的原文（想留就複製走）：\n" +
+                Truncate(string.Join("\n", removed.Select(l => $"• {l}")), 3500),
+                ephemeral: true);
+            return;
+        }
+
+        // ── 沒給內容 → 顯示目前設定 ────────────────────────
+        var current = _personas.Lines(guildId);
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            var body = current.Count == 0
+                ? "（目前沒有自訂提示詞）"
+                : string.Join("\n", current.Select((l, i) => $"`{i + 1}.` {Truncate(l, 300)}"));
+
+            await RespondAsync(
+                embed: new EmbedBuilder()
+                    .WithColor(new Color(0x2B, 0x6C, 0xB0))
+                    .WithTitle("🛠 這個伺服器的自訂提示詞")
+                    .WithDescription(Truncate(body, 4000))
+                    .WithFooter($"共 {current.Count}/{_personas.Limits.MaxLinesPerGuild} 條｜" +
+                                $"用法：/ai pset text:<內容> mode:Append｜/ai pset clear:True")
+                    .Build(),
+                ephemeral: true);
+            return;
+        }
+
+        // ── 設定（追加或覆蓋）─────────────────────────────
+        var outcome = _personas.SetRules(guildId, Context.User.Id, text, replace: mode == PersonaMode.Replace);
+
+        var message = outcome.Result switch
+        {
+            GuildPersonaStore.LearnResult.Added =>
+                (mode == PersonaMode.Replace
+                    ? $"✅ 已**覆蓋**這個伺服器的自訂提示詞（清掉 {outcome.Removed} 條舊的）。"
+                    : "✅ 已**追加**一條自訂提示詞。") +
+                $"\n目前共 {outcome.Lines.Count}/{_personas.Limits.MaxLinesPerGuild} 條：" +
+                Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000),
+
+            GuildPersonaStore.LearnResult.Duplicate =>
+                "ℹ️ 這條已經在裡面了（沒有重複加）。目前內容：\n" +
+                Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000),
+
+            GuildPersonaStore.LearnResult.TooLong =>
+                $"❌ 太長了（上限 {_personas.Limits.MaxLineLength} 字）。" +
+                (mode == PersonaMode.Replace ? "舊的設定**沒有**被動到。" : "請縮短成一句重點。"),
+
+            GuildPersonaStore.LearnResult.TooMany =>
+                $"❌ 這個伺服器已經有 {_personas.Limits.MaxLinesPerGuild} 條（上限）了。" +
+                (mode == PersonaMode.Replace ? "舊的設定**沒有**被動到。" : "可以先 `mode:Replace` 覆蓋，或清理一些。"),
+
+            _ => "❌ 沒有內容可以設定。"
+        };
+
+        await RespondAsync(message, ephemeral: true);
+    }
+
     [SlashCommand("audit", "看最近的主人操作紀錄（誰改了全域設定；只有主人看得到）")]
     public async Task AuditAsync()
     {

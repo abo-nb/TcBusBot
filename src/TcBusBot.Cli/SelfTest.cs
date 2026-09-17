@@ -1962,6 +1962,51 @@ public static class SelfTest
             new PersonaLimits().Describe().Contains("40 條", StringComparison.Ordinal),
             new PersonaLimits().Describe());
 
+        // ── 4c) `/ai pset`：管理員用指令直接設定這個伺服器的提示詞 ──────
+        //     跟「模型自己學」共用同一份 overlay（單一來源），但有兩個關鍵差異：
+        //       * 覆蓋模式不可以把舊的吃掉（寫不進去時要還原）
+        //       * 每一次都要留下稽核紀錄
+        var admin = new GuildPersonaStore(limits: new PersonaLimits { MaxLineLength = 50 });
+        const ulong psetGuild = 888UL;
+
+        var first = admin.SetRules(psetGuild, 7UL, "一律用繁體中文回答", replace: false);
+        Check("★ /ai pset 追加：設得進去，而且看得到結果",
+            first.Ok && first.Lines.Count == 1 && first.Lines[0] == "一律用繁體中文回答");
+
+        var second = admin.SetRules(psetGuild, 7UL, "回答前先確認站名", replace: false);
+        Check("追加第二條", second.Ok && second.Lines.Count == 2);
+
+        var replaced = admin.SetRules(psetGuild, 7UL, "只講公車的事", replace: true);
+        Check("★ /ai pset 覆蓋（Replace）：清掉舊的、只留新的",
+            replaced.Ok && replaced.Removed == 2 && replaced.Lines.Count == 1
+            && replaced.Lines[0] == "只講公車的事",
+            $"清掉 {replaced.Removed} 條，剩 {replaced.Lines.Count} 條");
+
+        // ★ 覆蓋時寫不進去（太長）→ 舊的**不可以**被吃掉
+        admin.SetRules(psetGuild, 7UL, "第二條設定", replace: false);
+        var beforeCount = admin.Lines(psetGuild).Count;
+
+        var failed = admin.SetRules(psetGuild, 7UL, new string('長', 51), replace: true);
+
+        Check("★ 覆蓋失敗（內容太長）時舊的會被還原（不會用一個失敗的指令把自己的設定弄丟）",
+            failed.Result == GuildPersonaStore.LearnResult.TooLong
+            && admin.Lines(psetGuild).Count == beforeCount
+            && admin.Lines(psetGuild).Contains("只講公車的事", StringComparer.Ordinal),
+            $"{failed.Result}，目前 {admin.Lines(psetGuild).Count} 條");
+
+        var emptySet = admin.SetRules(psetGuild, 7UL, "   ", replace: true);
+        Check("空白內容什麼都不做（連舊的都不動）",
+            emptySet.Result == GuildPersonaStore.LearnResult.Empty
+            && admin.Lines(psetGuild).Count == beforeCount);
+
+        Check("★ 用指令設定的內容會記進稽核紀錄（/ai audit 看得到誰改了什麼）",
+            admin.AuditLog(20).Any(e => e.UserId == 7UL
+                                        && e.Action.Contains("提示詞", StringComparison.Ordinal)),
+            string.Join("｜", admin.AuditLog(20).Select(e => e.Action)));
+
+        Check("★ 指令設定與模型學到的是同一份（/ai learned 看得到、/rest 清得掉）",
+            admin.Lines(psetGuild).Count > 0 && admin.Reset(psetGuild).Count > 0);
+
         // ── 5) 忘記與重設 ────────────────────────────────
         var before = store.Lines(guildA).Count;
         Check("★ 用關鍵字刪掉符合的規則", store.Forget(guildA, "條列") == 1 && store.Lines(guildA).Count == before - 1);
