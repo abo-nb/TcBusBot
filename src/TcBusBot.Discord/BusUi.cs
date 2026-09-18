@@ -69,7 +69,7 @@ public static class BusUi
     public static Embed Panel(BusSession s, int subscriptionCount)
     {
         var b = new EmbedBuilder()
-            .WithTitle("🚌 台中公車訂閱")
+            .WithTitle($"🚌 {BotStatus.CityDisplay}公車訂閱")
             .WithColor(s.Ready ? Success : Info)
             .AddField("起點", s.Origin?.DisplayName ?? "尚未設定", inline: false)
             .AddField("目的地", s.Destination?.DisplayName ?? "尚未設定", inline: false);
@@ -81,7 +81,7 @@ public static class BusUi
         else
         {
             b.AddField("怎麼用",
-                "1. 按「設定起點」→ 輸入站名關鍵字（例如 `台中車站`）\n" +
+                $"1. 按「設定起點」→ 輸入站名關鍵字（例如 `火車站`，服務城市：{BotStatus.CityDisplay}）\n" +
                 "2. 從搜尋結果勾選一個或多個站牌\n" +
                 "3. 同樣設定目的地\n" +
                 "4. 按「搜尋路線」選要訂閱的路線",
@@ -122,7 +122,7 @@ public static class BusUi
             b.WithColor(Alert)
              .WithTitle($"🔍 找不到「{keyword}」")
              .WithDescription(
-                 "試試站名的不同寫法（`台中`／`臺中`、`火车`／`火車`、`火車站`／`車站`），" +
+                 "試試站名的不同寫法（`台中`／`臺中`、`火车`／`火車`、`火車站`／`車站`；兩岸用字都通），" +
                  "或只打一部分（例：`靜宜`）。");
 
             // 只有在小資料集時才提示「資料集很小」——用完整 TDX 資料時這句話會誤導
@@ -131,7 +131,7 @@ public static class BusUi
                 b.AddField("⚠️ 目前是內建最小資料集",
                     $"只有 **{data.StopCount} 個站牌**（臺中車站～靜宜大學走廊），" +
                     "所以查不到其他站牌是正常的。\n" +
-                    "設定 TDX 金鑰即可取得全台中約 5,000+ 個站牌（含跨區路線約 14,000 筆）。",
+                    $"設定 TDX 金鑰即可取得全{BotStatus.CityDisplay}約 5,000+ 個站牌（含跨區路線約 14,000 筆）。",
                     inline: false);
             }
             else

@@ -114,7 +114,7 @@ public sealed class BotRuntime
                                  "• 現在沒有營運中的班次（深夜／清晨常見）\n" +
                                  "• TDX 的 N1 資料還沒更新\n" +
                                  "• 你的候選站牌不在這條路線的行駛範圍\n\n" +
-                                 "（台中 N1 資料在「有車輛離站」時才會重算）")
+                                 $"（{BotStatus.CityDisplay} N1 資料在「有車輛離站」時才會重算）")
                 .Build();
         }
 

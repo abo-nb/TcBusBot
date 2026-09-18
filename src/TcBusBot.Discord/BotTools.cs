@@ -52,11 +52,11 @@ public sealed class BusTools
     // ─────────────────────────────────────────────────────
 
     [KernelFunction("search_stops")]
-    [Description("用關鍵字查台中公車站牌的正確名稱，並回報有哪幾條路線經過" +
-                 "（支援模糊比對：打「台中」也會找到「臺中」、打「台中科大」也會找到「國立臺中科技大學」）。" +
+    [Description("用關鍵字查公車站牌的正確名稱，並回報有哪幾條路線經過" +
+                 "（支援模糊比對：打「台中」也會找到「臺中」、「火車站」也會找到「車站」、縮寫也通）。" +
                  "站名不確定時先用這個查，不要用猜的。")]
     public string SearchStops(
-        [Description("站名關鍵字，例如 台中車站、靜宜、台中科大")] string keyword)
+        [Description("站名關鍵字，站名關鍵字，例如「火車站」「靜宜」「科大」")] string keyword)
     {
         var result = _actions.SearchStops(keyword);
         _log.Record("search_stops", keyword);
@@ -78,7 +78,7 @@ public sealed class BusTools
     [Description("查「從某一站到某一站」可以搭哪些公車（只查詢，不會建立訂閱）。" +
                  "沒有直達時會回報「轉一次」的走法。使用者只是想知道怎麼去時用這個。")]
     public string FindRoutes(
-        [Description("起點站名，例如 台中車站")] string origin,
+        [Description("起點站名，例如「火車站」「靜宜」")] string origin,
         [Description("終點站名，例如 靜宜大學")] string destination)
     {
         var result = _actions.FindRoutes(origin, destination);
@@ -121,7 +121,7 @@ public sealed class BusTools
     [Description("幫使用者訂閱「從某一站到某一站」的公車，公車快到時會通知他。" +
                  "使用者明確說「幫我訂」「我要收到通知」時才呼叫。站名不確定請先用 search_stops 查或直接問使用者。")]
     public string SubscribeBus(
-        [Description("起點站名，例如 台中車站")] string origin,
+        [Description("起點站名，例如「火車站」「靜宜」")] string origin,
         [Description("終點站名，例如 靜宜大學")] string destination,
         [Description("提前幾分鐘通知，1~60，預設 10")] int notifyMinutes = 10)
     {

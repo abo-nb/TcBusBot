@@ -14,7 +14,7 @@ public sealed class OriginKeywordModal : IModal
 
     [InputLabel("站名關鍵字")]
     [ModalTextInput("keyword", TextInputStyle.Short,
-        "例如：台中車站（打「台」也會找到「臺」；也可以只打「靜宜」）", maxLength: 50)]
+        "例如：火車站（打「台」也會找到「臺」；也可以只打「靜宜」）", maxLength: 50)]
     [RequiredInput(true)]
     public string Keyword { get; set; } = "";
 }
@@ -84,7 +84,7 @@ public sealed class MergeGroupsModal : IModal
 /// 為什麼用「群組 + 子指令」而不是單一 <c>/bus</c>：
 ///   同名的指令與群組在 Discord 是不允許的，而我們需要 /bus list、/bus status 等子指令。
 /// </summary>
-[Group("bus", "台中公車訂閱")]
+[Group("bus", "公車訂閱（到站通知）")]
 public sealed class BusModule : BusModuleBase
 {
     private readonly BusDataService _data;

@@ -17,7 +17,7 @@ public sealed record UiRequest(string Kind, string Note)
 /// <summary>
 /// **讓模型「幫使用者按按鈕」**（`LLM_UI_ACTIONS`）。
 ///
-/// 使用者要的是「不用自己點那一串」：直接說「幫我把起點設成台中車站」、
+/// 使用者要的是「不用自己點那一串」：直接說「幫我把起點設成火車站」、
 /// 「找一下路線」、「訂 300 跟 304」、「復原剛剛那個」。
 ///
 /// 這些動作**完全對應面板上的按鈕**，而且是動同一份 session
@@ -82,14 +82,14 @@ public sealed class UiTools
                     (session.Destination is null ? "目的地：還沒設定" : $"目的地：{session.Destination.DisplayName}");
 
         return $"✅ 面板已打開（{state}）。使用者可以直接用下面的按鈕繼續，" +
-               "也可以叫我幫他設定（例如「起點設成台中車站」）。";
+               "也可以叫我幫他設定（例如「起點設成火車站」）。";
     }
 
     [KernelFunction("set_origin")]
     [Description("幫使用者設定面板的「起點」（等於他按了設定起點 → 搜尋 → 確認）。" +
                  "站名關鍵字支援模糊比對；不確定站名時先用 search_stops 查。")]
     public string SetOrigin(
-        [Description("起點站名關鍵字，例如 台中車站、靜宜")] string keyword)
+        [Description("起點站名關鍵字，例如「火車站」「靜宜」「科大」")] string keyword)
         => SetStop(keyword, isOrigin: true);
 
     [KernelFunction("set_destination")]

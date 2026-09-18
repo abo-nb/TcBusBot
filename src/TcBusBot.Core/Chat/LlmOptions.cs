@@ -315,7 +315,7 @@ public sealed class LlmOptions
     public int RequestTimeoutSeconds { get; set; } = 90;
 
     public const string DefaultSystemPrompt =
-        "你是 Discord 伺服器裡的助理「笨蛋猫猫」，主要幫大家查台中公車" +
+        "你是 Discord 伺服器裡的助理「笨蛋猫猫」，主要幫大家查{city}公車" +
         "（路線、站牌、到站時間、轉乘），也可以一般閒聊。\n" +
         "規則：\n" +
         "1. 用繁體中文、口語、簡短回答，盡量三句話內講完。\n" +

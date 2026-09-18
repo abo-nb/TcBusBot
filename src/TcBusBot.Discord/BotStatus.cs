@@ -30,6 +30,16 @@ internal static class BotStatus
     public static string DataSource { get; set; } = "（尚未載入）";
     public static string Poller { get; set; } = "（尚未啟動）";
 
+    /// <summary>
+    /// 服務城市的顯示名（預設臺中）。
+    ///
+    /// 為什麼放在這裡：畫面上的字（面板標題、說明）散在很多地方，
+    /// 而城市是**啟動時決定**的設定 —— 傳進每一個函式會讓簽章全部膨脹，
+    /// 所以在 Program 啟動時填一次，UI 直接讀（跟 <see cref="DataSource"/> 同一個作法）。
+    /// </summary>
+    public static string CityDisplay { get; set; } = "臺中";
+
+
     /// <summary>由 Program 在建立快取後填入（回傳目前快取筆數）。</summary>
     public static Func<int>? CachedEtas { get; set; }
 
@@ -60,6 +70,7 @@ internal static class BotStatus
                 discordReady = DiscordReady,
                 discordError = DiscordError,
                 storage = StorageMode,
+                city = CityDisplay,
                 dataSource = DataSource,
                 poller = Poller,
                 subscriptionGroups = groups,

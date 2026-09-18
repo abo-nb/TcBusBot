@@ -67,6 +67,15 @@ public static class Program
         TdxApiClient? api = null;
         string sourceDesc;
 
+        var cityDisplay = BusCity.DisplayOf(cfg.Tdx.City);
+
+        if (!BusCity.IsKnown(cfg.Tdx.City))
+        {
+            Console.WriteLine($"⚠️  不認識的城市「{cfg.Tdx.City}」—— 我會照原樣去 TDX 問一次，");
+            Console.WriteLine($"    如果資料是空的，請改用：{BusCity.SupportedList()}");
+            Console.WriteLine();
+        }
+
         try
         {
             if (cfg.EffectiveDataSource == "tdx")
@@ -78,15 +87,24 @@ public static class Program
                 data = new BusDataService();
                 data.Load(set.Stops, set.StopOfRoutes, set.Routes);
                 sourceDesc = api.IsVisitorMode
-                    ? "TDX 台中公車（訪客模式：沒有 API 金鑰，每日 20 次上限）"
-                    : "TDX 台中公車（會員模式）";
+                    ? $"TDX {cityDisplay}公車（訪客模式：沒有 API 金鑰，每日 20 次上限）"
+                    : $"TDX {cityDisplay}公車（會員模式）";
                 Console.WriteLine(sourceDesc);
             }
-            else
+            else if (BusCity.Normalize(cfg.Tdx.City) == BusCity.Default)
             {
                 var root = MiniFixtureSource.ResolveRoot(cfg.FixturesPath);
                 data = MiniFixtureSource.Load(root);
                 sourceDesc = $"內建最小資料集（{root}）";
+            }
+            else
+            {
+                // 內建最小資料集只有臺中走廊 —— 拿它去服務臺南會出現「查得到臺中站牌」
+                // 這種更難懂的錯誤，所以這裡直接講清楚。
+                throw new InvalidOperationException(
+                    $"內建最小資料集只有臺中的資料，沒辦法用來跑{BusCity.DisplayOf(cfg.Tdx.City)}。" +
+                    "請設定 TDX_CLIENT_ID／TDX_CLIENT_SECRET（或用 --data tdx），" +
+                    "或把 BUS_CITY 改回 Taichung。");
             }
         }
         catch (Exception ex)
@@ -96,6 +114,16 @@ public static class Program
             if (ex.InnerException is not null)
                 Console.WriteLine($"   內部錯誤：{ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
             Console.WriteLine();
+
+            if (BusCity.Normalize(cfg.Tdx.City) != BusCity.Default)
+            {
+                Console.WriteLine($"   ⚠️  現在設定的是{BusCity.DisplayOf(cfg.Tdx.City)}，");
+                Console.WriteLine("       內建最小資料集只有臺中的走廊，所以**不**拿它當備援（會查到錯的站牌）。");
+                Console.WriteLine("       請先修好 TDX 連線或金鑰，再把服務啟動起來。");
+                Console.WriteLine();
+                return 1;
+            }
+
             Console.WriteLine("   改用內建最小資料集繼續執行（搜尋範圍僅限臺中車站～靜宜大學走廊）。");
             Console.WriteLine("   修正後可用 --refresh 重新抓取。");
             Console.WriteLine();
@@ -107,6 +135,7 @@ public static class Program
         Console.WriteLine();
 
         BotStatus.DataSource = sourceDesc;
+        BotStatus.CityDisplay = cityDisplay;
 
         // ── 離線 UI 驗證（不需要 Token）────────────────────
         if (dryRun) return DryRun.Run(data, cfg);
@@ -573,9 +602,20 @@ public static class Program
 
     private static void PrintBanner(BotConfig cfg)
     {
+        var city = BusCity.DisplayOf(cfg.Tdx.City);
+        var title = $"TcBusBot — {city}公車到站通知 Discord Bot";
+
+        // 方框要對齊（中文算 2 格寬），所以用顯示寬度補空白而不是 Length
+        static int Width(string s) => s.Sum(c => c > 0x2E7F ? 2 : 1);
+
+        var pad = Math.Max(0, 58 - Width(title));
+        var lead = "║   ";
+
         Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
-        Console.WriteLine("║   TcBusBot — 台中公車到站通知 Discord Bot                 ║");
+        Console.WriteLine($"{lead}{title}{new string(' ', Math.Max(0, pad - 3))}║");
         Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
+        Console.WriteLine($"  服務城市　　　：{city}（{cfg.Tdx.City}）" +
+                          (BusCity.IsKnown(cfg.Tdx.City) ? "" : "　⚠️ 不認識這個城市，請確認 BUS_CITY"));
         Console.WriteLine($"  .env 檔　　　：{cfg.EnvFile}{cfg.EnvFileSource}");
         if (cfg.EnvExportedKeys > 0)
             Console.WriteLine($"　　　　　　　　（已把 {cfg.EnvExportedKeys} 個鍵匯出到環境變數，" +

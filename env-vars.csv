@@ -3,7 +3,7 @@
 "TDX_CLIENT_ID","TDX_ID","選填","（無）","TDX API ClientId；沒填就用內建離線資料集","原有","靜態資料／即時到站"
 "TDX_CLIENT_SECRET","TDX_SECRET","選填","（無）","TDX API ClientSecret","原有","靜態資料／即時到站"
 "TDX_BASE_URL","（無）","選填","https://tdx.transportdata.tw","TDX API 端點","原有","靜態資料"
-"TDX_CITY","（無）","選填","Taichung","TDX 縣市代碼","原有","靜態資料"
+"BUS_CITY","TCBUS_CITY / TDX_CITY","選填","Taichung（臺中）","服務哪個城市的公車。接受英文代碼（Taichung／Tainan…）或中文（臺中／台中／臺南／台南）。**預設臺中**；換城市時快取檔名也會跟著分開（Stop.城市.json），不會讀到上一個城市的資料","新增","公車資料"
 "DISCORD_GUILD_ID","（無）","選填","（無）","只把斜線指令註冊到這個伺服器","原有","啟動"
 "TCBUS_DATA","（無）","選填","auto","auto / fixture / tdx","原有","資料來源"
 "TCBUS_FIXTURES","（無）","選填","tests/fixtures","內建最小資料集路徑","原有","離線開發"

@@ -46,6 +46,9 @@ services:
         sync: false
 
       # ── 選填但強烈建議：訂閱組存到 MongoDB（容器沒有持久化磁碟）──
+      # 服務哪個城市的公車（預設臺中）。接受英文代碼或中文；換城市時快取檔名也會分開。
+      - key: BUS_CITY
+        value: Taichung
       - key: TCBUS_MONGO
         sync: false
       - key: TCBUS_MONGO_DB

@@ -34,6 +34,77 @@ public static class DryRun
 
     private static string[]? _handlers;
 
+    /// <summary>
+    /// 「服務城市」設定本身的離線檢查（換城市時跑）。
+    ///
+    /// 換城市最怕的不是「抓不到資料」（那會有錯誤訊息），而是**讀到上一個城市的快取** ——
+    /// 檔案是新的、筆數也正常，只有站名是錯的。所以這裡確認：
+    ///   * 城市代碼認得（不然 TDX 只會回空清單）
+    ///   * 快取檔名帶城市，而且跟實際載入的資料一致
+    ///   * 載進來的資料「像不像」那個城市（用該城市的行政區／地標關鍵字抽查）
+    /// </summary>
+    private static void AuditCitySetting(BotConfig cfg, BusDataService data)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 服務城市檢查");
+
+        var city = BusCity.Normalize(cfg.Tdx.City);
+        var display = BusCity.DisplayOf(city);
+
+        Console.WriteLine($"  城市：{display}（{city}）｜載入 {data.StopCount} 個站牌、{data.TripCount} 筆路線站序");
+
+        if (!BusCity.IsKnown(city))
+            Problem($"BUS_CITY「{cfg.Tdx.City}」不在已知清單（{BusCity.SupportedList()}）；" +
+                    "如果 TDX 回空資料，就是這裡打錯了");
+        else
+            Console.WriteLine("  ✔ 城市代碼認得");
+
+        var paths = StaticDataLoader.Paths(cfg.Tdx.CacheDirectory, city);
+
+        if (!paths.Stops.EndsWith($"Stop.{city}.json", StringComparison.Ordinal))
+            Problem($"快取檔名沒有帶城市：{paths.Stops} —— 換城市時會讀到上一個城市的資料");
+        else
+            Console.WriteLine($"  ✔ 快取檔名帶城市：{Path.GetFileName(paths.Stops)}（不會讀到別的城市）");
+
+        if (city != BusCity.Default)
+        {
+            var legacy = Path.Combine(cfg.Tdx.CacheDirectory, "StopOfRoute.json");
+
+            if (File.Exists(legacy))
+                Console.WriteLine($"  ℹ 舊的臺中快取還在（{Path.GetFileName(legacy)}）—— " +
+                                  "只有臺中會用到它，不會影響這個城市");
+        }
+
+        // 抽查：資料裡真的有這個城市的地名嗎
+        var probes = CityProbes.TryGetValue(city, out var list) ? list : Array.Empty<string>();
+
+        if (probes.Length > 0)
+        {
+            var hits = probes.Count(p => data.Search.Search(p, 5).Count > 0);
+
+            if (hits == 0)
+                Problem($"資料裡找不到任何{display}的地名（試過：{string.Join("、", probes)}）—— " +
+                        "很可能載到別的城市或空資料集");
+            else
+                Console.WriteLine($"  ✔ 資料裡找得到{display}的地名（{hits}/{probes.Length}：{string.Join("、", probes)}）");
+        }
+    }
+
+    /// <summary>各城市用來抽查「這份資料真的是那個城市」的地名。</summary>
+    private static readonly Dictionary<string, string[]> CityProbes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Taichung"] = ["臺中車站", "靜宜大學", "逢甲大學"],
+        ["Tainan"] = ["臺南車站", "安平", "成大"],
+        ["Kaohsiung"] = ["高雄車站", "左營", "鼓山"],
+        ["Taipei"] = ["臺北車站", "信義", "公館"],
+        ["NewTaipei"] = ["板橋", "淡水", "新莊"],
+        ["Taoyuan"] = ["桃園車站", "中壢", "龜山"],
+        ["Keelung"] = ["基隆車站", "廟口", "暖暖"],
+        ["Hsinchu"] = ["新竹車站", "科學園區", "香山"],
+        ["ChanghuaCounty"] = ["彰化車站", "員林", "鹿港"],
+        ["Chiayi"] = ["嘉義車站", "文化路", "蘭潭"]
+    };
+
     public static int Run(BusDataService data, BotConfig cfg)
     {
         _problems = 0;
@@ -46,6 +117,28 @@ public static class DryRun
         Console.WriteLine("══════════════════════════════════════════════════════════════");
         Console.WriteLine("  Discord UI 離線驗證（不會連線、不需要 Token）");
         Console.WriteLine("══════════════════════════════════════════════════════════════");
+
+        // ── 換城市時改用內建資料集跑劇本 ────────────────────
+        //    這一整套劇本（站名、路線、站區、通知內容）是以**臺中走廊**寫的：
+        //    「臺中車站 → 靜宜大學」、300／304、干城站…
+        //    服務城市不是臺中時，真實資料裡不會有那些站名，整段驗證會在最前面就失敗
+        //    （而且失敗得毫無意義：不是程式錯了，只是劇本不適用那個城市）。
+        //    所以換城市時**明確改用內建資料集**跑劇本，並把「城市設定本身」的檢查另外做。
+        var auditedCity = BusCity.Normalize(cfg.Tdx.City);
+
+        if (auditedCity != BusCity.Default)
+        {
+            var fixture = MiniFixtureSource.Load(MiniFixtureSource.ResolveRoot(cfg.FixturesPath));
+
+            Console.WriteLine();
+            Console.WriteLine($"ℹ️  服務城市是{BusCity.DisplayOf(cfg.Tdx.City)}（{cfg.Tdx.City}）：");
+            Console.WriteLine("    這份離線驗證的劇本是以臺中走廊（內建最小資料集）寫的，");
+            Console.WriteLine("    所以下面用**內建資料集**跑 UI 與流程驗證；");
+            Console.WriteLine($"    真實資料（{data.StopCount} 個站牌）只用來確認城市設定與快取檔名。");
+
+            AuditCitySetting(cfg, data);
+            data = fixture;
+        }
 
         // ── Step 1：/bus panel ─────────────────────────────
         Console.WriteLine();

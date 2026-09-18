@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 601 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 616 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 601 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 616 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3770,6 +3770,64 @@ if (!await gate.WaitAsync(TimeSpan.Zero))
 
 `--dryrun` 用 **IL 掃描**確認：訊息入口呼叫 `Enqueue`、`Enqueue` 用 `ChatQueue.Enqueue`、
 工人真的呼叫 `AnswerAsync`，而且入口**再也沒有** `SemaphoreSlim.WaitAsync`（舊的丟棄路徑）。
+
+---
+
+### 20.23 服務城市：預設臺中，也可以跑臺南（`BUS_CITY`）
+
+需求：「加上臺南，但預設臺中」。
+
+#### 20.23.1 其實城市一直是參數，只是**到處都寫死台中**
+
+`TdxApiClient` 的網址本來就是 `…/City/{City}`，`TdxOptions.City` 也一直存在
+（環境變數 `TDX_CITY`）。真正會出事的是這幾個地方：
+
+| 問題 | 後果 |
+| --- | --- |
+| 快取檔名固定 `Stop.json`／`StopOfRoute.json`／`Route.json` | 換城市時會**讀到上一個城市的快取**，而且檔案很新（12 小時內），連重新抓都不會 —— 站名全部變成別的城市，卻沒有任何錯誤訊息 |
+| 畫面上的字寫死「台中公車」（面板標題、資料來源、說明） | 跑臺南的實例會自稱在服務台中 |
+| AI 的預設人格寫死「主要幫大家查台中公車」 | 它會跟使用者說自己在查台中 |
+| 沒有 TDX 金鑰時會退回**內建最小資料集（臺中走廊）** | 跑臺南時會拿到臺中的 63 個站牌，看起來「有資料」但整組是錯的 |
+| 離線驗證（`--dryrun`）的劇本是臺中走廊 | 用真實的臺南資料跑，會在最前面就失敗，而且失敗得毫無意義 |
+
+#### 20.23.2 現在的樣子
+
+```
+BUS_CITY=Taichung      # 預設（不打就是這個）
+BUS_CITY=Tainan        # 或 臺南 / 台南 / tainan
+BUS_CITY=高雄          # 中文也通
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 新增 `BusCity`（Core）：代碼 ↔ 中文顯示名 ↔ 使用者可能打的寫法 | TDX 要英文代碼、使用者與 log 想看中文；而且**打錯要在啟動時就發現**（打錯時 TDX 只回空清單，使用者看到「這個城市沒有公車」，比什麼都不說更難查） |
+| 城市代碼**正規化**（`臺中`／`台中`／`台中市`／`TAICHUNG` 都對到 `Taichung`） | 使用者不會記得代碼怎麼拼；這個 Bot 本來就對「台/臺、簡繁」很寬容（跟站名搜尋同一個原則） |
+| 快取檔名帶城市：`Stop.Tainan.json` | 這是**唯一會靜默出錯**的地方（讀到別的城市卻不報錯）。舊檔名保留相容，但**只有臺中**會讀它 |
+| 不認識的城市：**照原樣**送去 TDX ＋ 啟動時警告（不偷偷變臺中） | 偷偷 fallback 會讓「打錯字」變成「怎麼都是臺中的站牌」 |
+| 非臺中 ＋ 沒有 TDX 金鑰 → **直接失敗並說明**，不退回內建資料集 | 內建資料集只有臺中走廊；拿它服務臺南會產生「查得到臺中站牌」這種更難懂的錯誤 |
+| 顯示名放在 `BotStatus.CityDisplay`（啟動時填一次） | 畫面上的字散在很多地方，把 city 傳進每一個函式會讓簽章全部膨脹（跟 `DataSource` 同一個作法） |
+| AI 預設人格改用 `{city}` 佔位 | 自訂 `LLM_SYSTEM_PROMPT` 的人有自己的字，不該被改；沒自訂的才代入實際城市 |
+| `--dryrun` 在非臺中時**改用內建資料集跑劇本**，並另外檢查城市設定 | 那整套劇本（臺中車站 → 靜宜大學、300／304、干城站）是以臺中走廊寫的 |
+| 順手把 `TaichungBusDataService` 改名 `BusDataService` | 服務多個城市之後，類別名稱不該綁一個城市 |
+
+#### 20.23.3 驗收
+
+`tcbus selftest` 新增第 29 節（**15 項**）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| `Taichung`／`tainan`／`New_Taipei` 的英文寫法；`臺南`／`台南`／`台南市` 的中文寫法 | 正規化 |
+| 顯示名是「臺中」「臺南」而不是英文代碼 | 顯示 |
+| 亂打的城市**原樣回傳**（不是偷偷變臺中） | 不亂猜 |
+| `Stop.Taichung.json` ≠ `Stop.Tainan.json`（三個檔都不一樣） | 換城市不會讀到舊資料 |
+| 沒給城市＝臺中檔名、給中文也對到同一個路徑 | 相容與正規化 |
+| 預設人格含 `{city}`，代入臺南後**不再出現**「查台中公車」、也不會留下沒被取代的 `{...}` | 人格跟著城市走 |
+
+`--dryrun` 新增「服務城市檢查」：城市代碼認得、快取檔名帶城市、**抽查資料裡真的有該城市的地名**
+（例：臺南 → 臺南車站／安平／成大，實測 3/3）。
+
+真實 API 驗證：`BUS_CITY=Tainan` 從 TDX 抓到 **11,329 個站牌、323 筆路線站序**，
+`--dryrun` exit 0（臺中為 14,036／755）。
 
 ---
 

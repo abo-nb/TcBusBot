@@ -121,6 +121,9 @@ public static class SelfTest
         Section("28. 偷聽模式（回完話後繼續聽：接話／先不出聲／退出，閒聊要留下來）");
         TestEavesdrop();
 
+        Section("29. 服務城市（BUS_CITY）：預設臺中，可換臺南等其他縣市");
+        TestBusCity();
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -3394,6 +3397,86 @@ public static class SelfTest
                 Reply, InputTokens: 10, OutputTokens: 2, UsageReported: true,
                 Model: "fake", Elapsed: TimeSpan.FromMilliseconds(1)));
         }
+    }
+
+    /// <summary>
+    /// 服務城市（`BUS_CITY`）：預設臺中，可以換成臺南等其他縣市。
+    ///
+    /// 這裡驗三件在真實使用上一定會出錯的事：
+    ///   1. 使用者打的各種寫法（`Taichung`／`台中`／`臺中市`）要對到同一個代碼
+    ///   2. **快取檔名要帶城市** —— 不然換城市會讀到上一個城市的資料，而且不會報錯
+    ///   3. 提示詞裡的 `{city}` 要換成實際城市（否則跑臺南的實例會自稱在查台中公車）
+    /// </summary>
+    private static void TestBusCity()
+    {
+        // ── 1) 城市代碼的各種寫法 ────────────────────────
+        Check("★ 預設是臺中（沒設定時的城市）",
+            BusCity.Normalize(null) == "Taichung" && BusCity.Normalize("  ") == "Taichung"
+            && BusCity.DisplayOf(null) == "臺中");
+
+        Check("★ 英文代碼：大小寫、底線都通",
+            BusCity.Normalize("Tainan") == "Tainan"
+            && BusCity.Normalize("tainan") == "Tainan"
+            && BusCity.Normalize("New_Taipei") == "NewTaipei");
+
+        Check("★ 中文：臺南／台南／台南市 都對到同一個城市",
+            BusCity.Normalize("臺南") == "Tainan"
+            && BusCity.Normalize("台南") == "Tainan"
+            && BusCity.Normalize("台南市") == "Tainan");
+
+        Check("★ 中文：臺中／台中／台中市 都對到 Taichung",
+            BusCity.Normalize("臺中") == "Taichung"
+            && BusCity.Normalize("台中") == "Taichung"
+            && BusCity.Normalize("台中市") == "Taichung");
+
+        Check("顯示名：臺中／臺南（不是英文代碼）",
+            BusCity.DisplayOf("Taichung") == "臺中" && BusCity.DisplayOf("Tainan") == "臺南"
+            && BusCity.DisplayOf("tainan") == "臺南");
+
+        Check("認識的城市：臺中／臺南是，亂打不是",
+            BusCity.IsKnown("Tainan") && BusCity.IsKnown("臺南") && !BusCity.IsKnown("火星"));
+
+        Check("★ 認不出來的城市原樣回傳（讓它去 TDX 撞一次，而不是偷偷變臺中）",
+            BusCity.Normalize("火星") == "火星" && BusCity.DisplayOf("火星") == "火星");
+
+        Check("支援清單裡同時有臺中與臺南",
+            BusCity.Displays.Contains("臺中") && BusCity.Displays.Contains("臺南"),
+            string.Join("、", BusCity.Displays.Take(6)));
+
+        // ── 2) 快取檔名要帶城市（換城市不可以讀到上一個城市的資料）──
+        var taichung = StaticDataLoader.Paths("cache", "Taichung");
+        var tainan = StaticDataLoader.Paths("cache", "Tainan");
+
+        Check("★ 快取檔名帶城市：Stop.Taichung.json／Stop.Tainan.json",
+            taichung.Stops.EndsWith("Stop.Taichung.json", StringComparison.Ordinal)
+            && tainan.Stops.EndsWith("Stop.Tainan.json", StringComparison.Ordinal),
+            $"{Path.GetFileName(taichung.Stops)} vs {Path.GetFileName(tainan.Stops)}");
+
+        Check("★ 臺中與臺南的快取檔完全不一樣（這是「換城市讀到舊資料」的防線）",
+            taichung.Stops != tainan.Stops
+            && taichung.StopOfRoutes != tainan.StopOfRoutes
+            && taichung.Routes != tainan.Routes);
+
+        Check("沒給城市時＝臺中的檔名（相容舊設定）",
+            StaticDataLoader.Paths("cache", null).Stops == taichung.Stops);
+
+        Check("城市代碼寫中文也對（路徑會用正規化後的代碼）",
+            StaticDataLoader.Paths("cache", "臺南").Stops == tainan.Stops);
+
+        // ── 3) 提示詞的 {city} 會換成實際城市 ─────────────
+        Check("★ 預設人格用 {city} 佔位（跑哪個城市就講哪個城市）",
+            LlmOptions.DefaultSystemPrompt.Contains("{city}", StringComparison.Ordinal));
+
+        var taichungPrompt = LlmOptions.DefaultSystemPrompt.Replace("{city}", BusCity.DisplayOf("Taichung"));
+        var tainanPrompt = LlmOptions.DefaultSystemPrompt.Replace("{city}", BusCity.DisplayOf("Tainan"));
+
+        Check("★ 換成臺南時，人格裡不會再自稱在查台中公車",
+            tainanPrompt.Contains("查臺南公車", StringComparison.Ordinal)
+            && !tainanPrompt.Contains("查台中公車", StringComparison.Ordinal)
+            && taichungPrompt.Contains("查臺中公車", StringComparison.Ordinal));
+
+        Check("不會留下沒被取代的 {city}",
+            !taichungPrompt.Contains('{') && !tainanPrompt.Contains('{'));
     }
 
     /// <summary>

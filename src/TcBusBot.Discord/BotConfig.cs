@@ -1,3 +1,4 @@
+using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
 using TcBusBot.Core.Configuration;
 using TcBusBot.Core.Storage;
@@ -166,7 +167,21 @@ public sealed class BotConfig
         cfg.Tdx.ClientId = SettingResolver.Resolve(args, "--tdx-id", file, ["TDX_CLIENT_ID", "TDX_ID"]).Value ?? "";
         cfg.Tdx.ClientSecret = SettingResolver.Resolve(args, "--tdx-secret", file, ["TDX_CLIENT_SECRET", "TDX_SECRET"]).Value ?? "";
         cfg.Tdx.BaseUrl = SettingResolver.Resolve(args, "--tdx-base", file, ["TDX_BASE_URL"]).Value ?? cfg.Tdx.BaseUrl;
-        cfg.Tdx.City = SettingResolver.Resolve(args, "--city", file, ["TDX_CITY"]).Value ?? cfg.Tdx.City;
+
+        // ── 服務哪個城市的公車（預設臺中）────────────────────
+        //    接受英文代碼（Taichung／Tainan）與中文（臺中／台中／臺南／台南），
+        //    見 BusCity.Normalize。預設**臺中**（舊的設定、快取、文件都以台中為主）。
+        var city = SettingResolver.Resolve(args, "--city", file,
+            ["BUS_CITY", "TCBUS_CITY", "TDX_CITY"]).Value;
+
+        if (!string.IsNullOrWhiteSpace(city)) cfg.Tdx.City = BusCity.Normalize(city);
+
+        if (!BusCity.IsKnown(cfg.Tdx.City))
+        {
+            Console.WriteLine($"⚠️  BUS_CITY「{city}」不在已知清單裡（{BusCity.SupportedList()}）——");
+            Console.WriteLine("   會照原樣拿去問 TDX；如果抓到空資料再回來改這個值。");
+        }
+
         cfg.Tdx.CacheDirectory = SettingResolver.Resolve(args, "--cache", file, ["TCBUS_CACHE"]).Value ?? "cache";
 
         if (int.TryParse(SettingResolver.Resolve(args, "--poll", file, ["TCBUS_POLL_INTERVAL"]).Value, out var poll))
@@ -196,7 +211,12 @@ public sealed class BotConfig
         if (!string.IsNullOrWhiteSpace(judgeModel)) cfg.Llm.JudgeModel = judgeModel!.Trim();
 
         var systemPrompt = SettingResolver.Resolve(args, "--llm-prompt", file, ["LLM_SYSTEM_PROMPT"]).Value;
-        if (!string.IsNullOrWhiteSpace(systemPrompt)) cfg.Llm.SystemPrompt = systemPrompt!;
+
+        // 沒自己寫提示詞時，把預設人格裡的 {city} 換成實際服務的城市
+        // （不然跑臺南的實例會自稱「我主要幫大家查台中公車」）。
+        cfg.Llm.SystemPrompt = string.IsNullOrWhiteSpace(systemPrompt)
+            ? LlmOptions.DefaultSystemPrompt.Replace("{city}", BusCity.DisplayOf(cfg.Tdx.City))
+            : systemPrompt!;
 
         if (long.TryParse(SettingResolver.Resolve(args, "--llm-weekly-tokens", file,
                 ["LLM_WEEKLY_TOKENS", "LLM_WEEKLY_LIMIT"]).Value, out var weekly) && weekly >= 0)
