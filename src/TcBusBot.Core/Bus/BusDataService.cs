@@ -52,6 +52,16 @@ public sealed class BusDataService
     private readonly Dictionary<string, StopAreaGroup> _groupByShortKey = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _groupKeyByStopUid = new(StringComparer.Ordinal);
     private readonly Dictionary<string, BusRoute> _routeMeta = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 站牌 UID → 城市（例：`TXG12251` → `Taichung`）。
+    ///
+    /// 為什麼要記這個：**即時到站的網址裡有城市**
+    /// （`/Bus/EstimatedTimeOfArrival/City/{City}`），所以多城市同時跑的時候，
+    /// 查 ETA 一定要按城市分批（不然臺南的站牌會拿去問臺中端點，回一堆空的）。
+    /// </summary>
+    private readonly Dictionary<string, string> _cityByStopUid = new(StringComparer.Ordinal);
+
     private readonly List<StopAreaGroup> _stopGroups = new();
     private StopSearchEntry[] _searchEntries = Array.Empty<StopSearchEntry>();
 
@@ -59,6 +69,36 @@ public sealed class BusDataService
     public IReadOnlyList<StopAreaGroup> StopGroups => _stopGroups;
     public int TripCount => _trips.Count;
     public int StopCount => _displayNameByStopUid.Count;
+
+    /// <summary>這份資料集裡出現過的城市（去重、保留出現順序）。</summary>
+    public IReadOnlyList<string> Cities
+        => _cityByStopUid.Values.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+    /// <summary>這個站牌屬於哪個城市（不知道就回 null）。</summary>
+    public string? CityOf(string? stopUid)
+        => stopUid is not null && _cityByStopUid.TryGetValue(stopUid, out var city) ? city : null;
+
+    /// <summary>
+    /// 把一批站牌依城市分組（查 ETA 用）。
+    ///
+    /// 找不到城市對應的站牌會歸到 <paramref name="fallbackCity"/>（通常是主城市）——
+    /// 例如舊快取沒有 `City` 欄位時，至少還能查得到。
+    /// </summary>
+    public IReadOnlyList<(string City, List<string> StopUids)> GroupByCity(
+        IEnumerable<string> stopUids, string fallbackCity)
+    {
+        var grouped = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var uid in stopUids)
+        {
+            var city = CityOf(uid) ?? fallbackCity;
+
+            if (!grouped.TryGetValue(city, out var list)) grouped[city] = list = [];
+            list.Add(uid);
+        }
+
+        return grouped.Select(kv => (kv.Key, kv.Value)).ToList();
+    }
 
     /// <summary>
     /// 資料集裡「最有名」的幾個站名（依經過路線數排序）。
@@ -80,7 +120,7 @@ public sealed class BusDataService
         double clusterMeters = StopAreaGrouping.DefaultClusterMeters)
     {
         _trips.Clear(); _byStopUid.Clear(); _routeCountByStopUid.Clear();
-        _displayNameByStopUid.Clear(); _groupByShortKey.Clear();
+        _displayNameByStopUid.Clear(); _groupByShortKey.Clear(); _cityByStopUid.Clear();
         _groupKeyByStopUid.Clear(); _routeMeta.Clear(); _stopGroups.Clear();
 
         foreach (var r in routes)
@@ -164,7 +204,12 @@ public sealed class BusDataService
 
         var allStops = merged.Values.ToList();
         foreach (var s in allStops)
+        {
             _displayNameByStopUid[s.StopUID] = s.ZhTwName;
+
+            // 城市對照（ETA 查詢要按城市分開打）
+            if (!string.IsNullOrWhiteSpace(s.City)) _cityByStopUid[s.StopUID] = s.City;
+        }
 
         // ── 2b) 站序裡的站名補齊 ──────────────────────────
         // ⚠️ 不是每份資料的 StopOfRoute 都帶站名（我們的離線 fixture 就只有 StopUID），

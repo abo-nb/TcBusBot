@@ -2,6 +2,7 @@ using Discord.Net;
 using Discord;
 using Discord.WebSocket;
 using TcBusBot.Core.Realtime;
+using TcBusBot.Core.Bus;
 using TcBusBot.Core.Subscriptions;
 using TcBusBot.Core.Tdx;
 
@@ -21,6 +22,7 @@ public sealed class EtaPoller
     private readonly SubscriptionService _subs;
     private readonly RealtimeBusCache _cache;
     private readonly SubscriptionMatcher _matcher;
+    private readonly BusDataService _data;
     private readonly int _intervalSeconds;
     private readonly int _batchSize;
 
@@ -30,12 +32,14 @@ public sealed class EtaPoller
         SubscriptionService subs,
         RealtimeBusCache cache,
         int intervalSeconds,
+        BusDataService data,
         int batchSize = 40)
     {
         _client = client;
         _api = api;
         _subs = subs;
         _cache = cache;
+        _data = data;
         _matcher = new SubscriptionMatcher(subs, cache, staleDataSeconds: 180);
         _intervalSeconds = intervalSeconds;
         _batchSize = batchSize;
@@ -74,9 +78,15 @@ public sealed class EtaPoller
         var now = DateTimeOffset.UtcNow;
         var fresh = new List<Core.Models.BusEta>();
 
-        foreach (var chunk in stops.Chunk(_batchSize))
+        // ⚠️ 即時到站的網址裡有城市（`/City/{City}`），所以**一定要按城市分批**：
+        //    多城市同時跑（臺中＋臺南）時，把臺南的站牌拿去問臺中端點只會回空資料，
+        //    使用者看到的是「明明訂閱了卻一直沒有到站時間」。
+        foreach (var (city, cityStops) in _data.GroupByCity(stops, _api.City))
         {
-            fresh.AddRange(await _api.GetEtasByStopsAsync(chunk, ct));
+            foreach (var chunk in cityStops.Chunk(_batchSize))
+            {
+                fresh.AddRange(await _api.GetEtasByStopsAsync(chunk, ct, city));
+            }
         }
 
         _cache.ReplaceAll(fresh, now);

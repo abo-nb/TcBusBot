@@ -403,8 +403,119 @@ public sealed class LlmChatService : IDisposable
     public static bool ShouldHandle(bool mentioned, bool replyAddressed, bool listening)
         => mentioned || replyAddressed || listening;
 
+    /// <summary>抓圖用的共用 HttpClient（帶 User-Agent，Discord CDN 對沒有 UA 的請求很兇）。</summary>
+    private static readonly HttpClient ImageHttp = new(new HttpClientHandler
+    {
+        AutomaticDecompression = System.Net.DecompressionMethods.All
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(15)
+    };
+
+    /// <summary>單張圖片最大幾 bytes（內嵌會變成 base64，約 1.37 倍；官方請求體上限 48 MiB）。</summary>
+    private const int MaxImageBytes = 6 * 1024 * 1024;
+
     /// <summary>
-    /// 這一則訊息（或它回覆的那一則）附的圖片。
+    /// 把選中的圖片抓下來、內嵌成 `data:` URI。
+    ///
+    /// ── 為什麼不直接把 Discord 的網址給模型 ────────────────────
+    /// 官方文件說可以傳外部 http(s) 連結（模型自己去抓），但**實測失敗**：
+    ///   `HTTP 400 … .messages[1].image[0]: Failed to download image from image.png…`
+    /// Discord 的 CDN 對「不是瀏覽器／沒有正常 UA」的請求會擋（而且附件網址帶簽章、會過期）。
+    /// 自己抓下來內嵌就沒有這些變數：我們送的是已經在手上的 bytes。
+    ///
+    /// 失敗的圖片**只跳過那一張**（不讓整則回覆失敗），並在 console 留一行原因。
+    /// </summary>
+    private static async Task<IReadOnlyList<ImageRef>> InlineImagesAsync(IReadOnlyList<ImageRef> images)
+    {
+        if (images.Count == 0) return images;
+
+        var inlined = new List<ImageRef>(images.Count);
+
+        foreach (var image in images)
+        {
+            try
+            {
+                if (image.Url.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase))
+                {
+                    inlined.Add(image);
+                    continue;
+                }
+
+                using var request = new HttpRequestMessage(HttpMethod.Get, image.Url);
+                request.Headers.TryAddWithoutValidation("User-Agent",
+                    "Mozilla/5.0 (compatible; TcBusBot/1.0; +https://github.com/abo-nb/TcBusBot)");
+
+                using var response = await ImageHttp.SendAsync(request);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"[llm] ⚠️ 圖片下載失敗（HTTP {(int)response.StatusCode}）：{image.Describe()}");
+                    continue;
+                }
+
+                if (response.Content.Headers.ContentLength is { } length && length > MaxImageBytes)
+                {
+                    Console.WriteLine($"[llm] ⚠️ 圖片太大（{length / 1024 / 1024} MB）：{image.Describe()}");
+                    continue;
+                }
+
+                var bytes = await response.Content.ReadAsByteArrayAsync();
+
+                if (bytes.Length == 0 || bytes.Length > MaxImageBytes)
+                {
+                    Console.WriteLine($"[llm] ⚠️ 圖片大小不合理（{bytes.Length} bytes）：{image.Describe()}");
+                    continue;
+                }
+
+                var mime = SniffMime(bytes, response.Content.Headers.ContentType?.MediaType);
+
+                if (mime is null)
+                {
+                    Console.WriteLine($"[llm] ⚠️ 這不是模型看得懂的圖片格式：{image.Describe()}");
+                    continue;
+                }
+
+                inlined.Add(image with
+                {
+                    Url = $"data:{mime};base64,{Convert.ToBase64String(bytes)}",
+                    Bytes = bytes.Length
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[llm] ⚠️ 圖片下載失敗（{ex.GetType().Name}）：{image.Describe()}");
+            }
+        }
+
+        return inlined;
+    }
+
+    /// <summary>
+    /// 從**檔案內容**判斷格式（官方文件：格式由實際內容判斷，不是檔名或 MIME 標頭）。
+    /// 認不出來就回 null（那張圖不送 —— 送了只會拿到 400）。
+    /// </summary>
+    private static string? SniffMime(byte[] bytes, string? declaredType)
+    {
+        if (bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+            return "image/jpeg";
+
+        if (bytes.Length >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47)
+            return "image/png";
+
+        if (bytes.Length >= 6 && bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46)
+            return "image/gif";
+
+        if (bytes.Length >= 12 && bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50)
+            return "image/webp";
+
+        var declared = (declaredType ?? "").ToLowerInvariant();
+
+        return declared is "image/jpeg" or "image/png" or "image/gif" or "image/webp" ? declared : null;
+    }
+
+    /// <summary>
+
     ///
     /// 為什麼要自己判斷格式：Discord 的附件型別是**宣稱**的（`ContentType`），
     /// 實際上傳什麼都可能；而模型的限制是 JPEG／PNG／GIF／WebP。
@@ -536,9 +647,14 @@ public sealed class LlmChatService : IDisposable
         var current = addressed ? ImagesOf(message) : [];
         var repliedImages = addressed && referenced is not null ? ImagesOf(referenced) : [];
 
-        var images = _options.Vision
+        var picked = _options.Vision
             ? VisionPolicy.Select(current, repliedImages, addressed, _options.VisionMaxImages)
             : [];
+
+        // ★ 自己把圖片抓下來內嵌成 data URI（見 InlineImagesAsync 的說明：
+        //   模型的抓圖服務抓不到 Discord CDN，實測會回
+        //   `Failed to download image from …` 的 400）
+        var images = await InlineImagesAsync(picked);
 
         var imageNote = VisionPolicy.Note(
             current.Count + repliedImages.Count, images.Count, _options.Vision);

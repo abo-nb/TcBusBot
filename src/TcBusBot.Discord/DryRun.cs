@@ -1808,6 +1808,23 @@ public static class DryRun
             Console.WriteLine("  ✔ 短判斷被標成 JudgeCall，而且建立流程真的會建出「兩個模型」那一層");
         }
 
+        // ── 多城市：即時到站要按城市分批（網址裡有城市）──────────
+        if (llm.CityDisplays.Count > 1)
+        {
+            Console.WriteLine($"  ℹ 多城市：{llm.CityDisplay}（資料合併成一份，ETA 按城市分批查）");
+
+            var poller = typeof(EtaPoller).GetMethod("PollOnceAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var pollerCalls = poller is null ? [] : CollectCalls(poller, resolveAll: true);
+
+            if (poller is null)
+                Problem("找不到 EtaPoller.PollOnceAsync —— 無法驗證多城市的 ETA 分批");
+            else if (!pollerCalls.Contains("BusDataService.GroupByCity"))
+                Problem("輪詢沒有按城市分批（GroupByCity）—— 臺南的站牌會被拿去問臺中端點，永遠沒有到站時間");
+            else
+                Console.WriteLine("  ✔ 輪詢真的會按城市分批查 ETA");
+        }
+
         // ── 服務城市有沒有真的告訴模型 ──────────────────────
         //    （使用者實際遇到的問題：主機自訂提示詞時，模型不知道自己服務哪個城市）
         Console.WriteLine($"  ℹ 服務範圍會寫進系統提示：{llm.CityDisplay}（不論有沒有自訂提示詞）");

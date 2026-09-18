@@ -3489,7 +3489,7 @@ public static class SelfTest
         var customPromptOptions = new LlmOptions
         {
             SystemPrompt = "你是笨蛋猫猫，講話簡短。",   // ← 主機自訂，沒有 {city}
-            CityDisplay = "臺南",
+            CityDisplays = ["臺南"],
             ToolsEnabled = false
         };
 
@@ -3518,7 +3518,78 @@ public static class SelfTest
             taichungChat.EffectiveSystemPrompt(1UL).Contains("你查到的公車資料都是**臺中**", StringComparison.Ordinal));
 
         Check("城市顯示名留空時不會多出那一段（省 token）",
-            !new LlmOptions { CityDisplay = "", SystemPrompt = "x" }.CityNote.Contains("服務範圍", StringComparison.Ordinal));
+            !new LlmOptions { CityDisplays = [], SystemPrompt = "x" }.CityNote.Contains("服務範圍", StringComparison.Ordinal));
+
+        // ── 3c) 同時服務多個城市（BUS_CITY=Taichung,Tainan）──────────
+        //     使用者的公車是「臺中 ＋ 臺南一起用」。合併的關鍵前提：
+        //     站牌 UID 有城市前綴（TXG…／TNN…），所以兩份清單接起來不會撞。
+        Check("★ 多城市：逗號分隔",
+            BusCity.ParseList("Taichung,Tainan").SequenceEqual(new[] { "Taichung", "Tainan" }));
+
+        Check("★ 多城市：頓號、空白、分號都當分隔（大家輸入習慣不一樣）",
+            BusCity.ParseList("臺中、臺南").SequenceEqual(new[] { "Taichung", "Tainan" })
+            && BusCity.ParseList("台中 台南").SequenceEqual(new[] { "Taichung", "Tainan" })
+            && BusCity.ParseList("Taichung;Tainan").SequenceEqual(new[] { "Taichung", "Tainan" }));
+
+        Check("★ 重複的城市會去掉、順序保留（第一個是主要城市）",
+            BusCity.ParseList("Tainan,Tainan,Taichung").SequenceEqual(new[] { "Tainan", "Taichung" }));
+
+        Check("多個城市的顯示名：臺中、臺南",
+            BusCity.DisplayOfMany(BusCity.ParseList("Taichung,Tainan")) == "臺中、臺南");
+
+        Check("沒設定時只有臺中（預設不變）",
+            BusCity.ParseList(null).SequenceEqual(new[] { "Taichung" })
+            && BusCity.ParseList("").SequenceEqual(new[] { "Taichung" }));
+
+        // 多城市時，模型要知道「同名站牌可能兩個城市都有」
+        var multiCityOptions = new LlmOptions { CityDisplays = ["臺中", "臺南"], SystemPrompt = "x" };
+
+        Check("★ 多城市時，提示詞會說明「同名站牌要問清楚哪個城市」",
+            multiCityOptions.MultiCity
+            && multiCityOptions.CityNote.Contains("同名站牌在兩個城市都有時", StringComparison.Ordinal),
+            multiCityOptions.CityNote.Replace("\n", " ｜ "));
+
+        Check("單一城市時不會多那句（省 token）",
+            !new LlmOptions { CityDisplays = ["臺中"] }.CityNote
+                .Contains("同名站牌在兩個城市都有時", StringComparison.Ordinal));
+
+        var multiOptions = new TdxOptions { City = "Taichung" };
+        multiOptions.Cities = ["Taichung", "Tainan"];
+
+        Check("★ TdxOptions：主要城市＝第一個，Cities 是全部",
+            multiOptions.City == "Taichung"
+            && multiOptions.EffectiveCities.Count == 2
+            && multiOptions.CityDisplays == "臺中、臺南");
+
+        Check("Cities 空的時候退回主要城市（舊設定仍然可用）",
+            new TdxOptions { City = "Tainan" }.EffectiveCities.SequenceEqual(new[] { "Tainan" }));
+
+        // ── 3d) 即時到站要「按城市分批」（ETA 網址裡有城市）────────
+        //     不這樣做的話，臺南的站牌會被拿去問臺中端點 → 回空資料
+        //     → 使用者看到「訂閱了卻一直沒有到站時間」。
+        var multiData = BuildCityFixture();
+
+        Check("★ 資料集認得出自己有哪幾個城市",
+            multiData.Cities.OrderBy(c => c).SequenceEqual(new[] { "Taichung", "Tainan" }),
+            string.Join("、", multiData.Cities));
+
+        Check("★ 站牌 → 城市對照正確（ETA 靠它分批）",
+            multiData.CityOf("TXG0001") == "Taichung" && multiData.CityOf("TNN0001") == "Tainan");
+
+        var groups = multiData.GroupByCity(["TXG0001", "TNN0001", "TXG0002"], "Taichung");
+
+        Check("★ 一批站牌會依城市分成兩組（兩個城市各一次呼叫）",
+            groups.Count == 2
+            && groups.Single(g => g.City == "Taichung").StopUids.Count == 2
+            && groups.Single(g => g.City == "Tainan").StopUids.Count == 1,
+            string.Join("｜", groups.Select(g => $"{g.City}={g.StopUids.Count}")));
+
+        Check("★ 查詢網址會帶正確的城市",
+            TdxApiClient.BuildEtasByStopsUrl("Tainan", ["TNN0001"]).Contains("/City/Tainan", StringComparison.Ordinal)
+            && TdxApiClient.BuildEtasByStopsUrl("Taichung", ["TXG0001"]).Contains("/City/Taichung", StringComparison.Ordinal));
+
+        Check("城市未知的站牌會歸到主要城市（舊快取沒有 City 欄位時至少查得到）",
+            multiData.GroupByCity(["UNKNOWN1"], "Taichung")[0].City == "Taichung");
 
         // ── 4) 「LLM 有沒有接上」的可觀測性（/ai status 要講得出來）──────
         //     使用者反應「LLM 似乎沒有接上」時，最難的是看不出是哪一種壞掉：
@@ -3637,8 +3708,42 @@ public static class SelfTest
             && new ImageRef("https://x", ImageSource.Embed).Describe().Contains("嵌入", StringComparison.Ordinal));
     }
 
+    /// <summary>兩個城市的最小資料集（臺中 TXG／臺南 TNN），用來驗「按城市分批」。</summary>
+    private static BusDataService BuildCityFixture()
+    {
+        var stops = new List<BusStop>
+        {
+            new() { StopUID = "TXG0001", StopID = "1", StopName = new("臺中車站", null),
+                    City = "Taichung", StopPosition = new(120.68, 24.13, null) },
+            new() { StopUID = "TXG0002", StopID = "2", StopName = new("臺中公園", null),
+                    City = "Taichung", StopPosition = new(120.68, 24.14, null) },
+            new() { StopUID = "TNN0001", StopID = "3", StopName = new("臺南車站", null),
+                    City = "Tainan", StopPosition = new(120.21, 22.99, null) }
+        };
+
+        var sors = new List<BusStopOfRoute>
+        {
+            new() { RouteUID = "TXG300", Direction = 1, RouteName = new("300", null),
+                    Stops = [
+                        new() { StopUID = "TXG0001", StopSequence = 1, StopName = new("臺中車站", null) },
+                        new() { StopUID = "TXG0002", StopSequence = 2, StopName = new("臺中公園", null) }] },
+            new() { RouteUID = "TNN5", Direction = 1, RouteName = new("5", null),
+                    Stops = [ new() { StopUID = "TNN0001", StopSequence = 1, StopName = new("臺南車站", null) }] }
+        };
+
+        var routes = new List<BusRoute>
+        {
+            new() { RouteUID = "TXG300", RouteName = new("300", null) },
+            new() { RouteUID = "TNN5", RouteName = new("5", null) }
+        };
+
+        var data = new BusDataService();
+        data.Load(stops, sors, routes);
+
+        return data;
+    }
+
     /// <summary>
-    /// 儲存後端的選擇與後備鏈：MongoDB → SQLite → 文字檔 → 記憶體。
     /// 這裡測「沒有伺服器也能測」的部分：
     ///   * document ↔ 物件的轉換（純函式）
     ///   * 連線字串遮罩（不能把帳密印出來）

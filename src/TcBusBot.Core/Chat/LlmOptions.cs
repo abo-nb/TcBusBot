@@ -281,7 +281,14 @@ public sealed class LlmOptions
     /// 一旦主機設了 `LLM_SYSTEM_PROMPT`，模型就完全不知道自己服務哪個城市，
     /// 於是跑臺南的實例還是會跟使用者聊台中公車。
     /// </summary>
-    public string CityDisplay { get; set; } = "臺中";
+    public List<string> CityDisplays { get; set; } = ["臺中"];
+
+    /// <summary>顯示用的城市名（例：「臺中」或「臺中、臺南」）。</summary>
+    public string CityDisplay
+        => CityDisplays.Count == 0 ? "" : string.Join("、", CityDisplays);
+
+    /// <summary>同時服務多個城市嗎（提示詞的寫法不一樣）。</summary>
+    public bool MultiCity => CityDisplays.Count > 1;
 
     /// <summary>「你服務的是哪個城市」那一段（<see cref="CityDisplay"/> 為空時回傳空字串）。</summary>
     public string CityNote
@@ -292,8 +299,11 @@ public sealed class LlmOptions
 
                 【服務範圍】
                 你查到的公車資料都是**{CityDisplay}**的（站牌、路線、到站時間都是）。
-                不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{CityDisplay}的資料，
-                並請他把 BUS_CITY 改過去（或改用那個縣市的 Bot）。
+                不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{CityDisplay}的資料。
+                {(MultiCity
+                    ? "使用者可能會問其中任何一個城市的路線。同名站牌在兩個城市都有時，" +
+                      "依使用者提到的城市或行政區判斷；不確定就問他是哪一個。"
+                    : "並請使用者把 BUS_CITY 改過去（或改用那個縣市的 Bot）。")}
                 """;
 
     /// <summary>

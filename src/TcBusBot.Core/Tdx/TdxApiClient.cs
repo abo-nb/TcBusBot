@@ -10,7 +10,44 @@ namespace TcBusBot.Core.Tdx;
 public sealed class TdxOptions
 {
     public string BaseUrl { get; set; } = "https://tdx.transportdata.tw";
+
+    /// <summary>
+    /// 主要的服務城市（例：`Taichung`）。**舊欄位**，等同 <see cref="Cities"/> 的第一個 ——
+    /// 有一些地方（快取檔名、顯示）只需要一個代表。
+    /// </summary>
     public string City { get; set; } = "Taichung";
+
+    /// <summary>
+    /// **同時**服務哪幾個城市（`BUS_CITY=Taichung,Tainan`）。
+    ///
+    /// 為什麼要能同時：使用者的公車是「臺中 ＋ 臺南一起用」——
+    /// 分開跑兩個實例本來也可以，但兩邊的訂閱、通知、AI 都要各自維護一份。
+    /// 合在一起跑的話，同一個 Bot 就能查兩個城市的站牌與路線
+    /// （站牌 UID 有城市前綴：`TXG…`／`TNN…`，所以不會撞）。
+    ///
+    /// 空的時候＝只有 <see cref="City"/> 一個。
+    /// </summary>
+    public List<string> Cities { get; set; } = [];
+
+    /// <summary>實際要抓的城市清單（至少一個、去重、順序保留）。</summary>
+    public IReadOnlyList<string> EffectiveCities
+    {
+        get
+        {
+            var list = Cities.Where(c => !string.IsNullOrWhiteSpace(c))
+                             .Select(c => c.Trim())
+                             .Distinct(StringComparer.OrdinalIgnoreCase)
+                             .ToList();
+
+            if (list.Count == 0) list.Add(string.IsNullOrWhiteSpace(City) ? "Taichung" : City);
+
+            return list;
+        }
+    }
+
+    /// <summary>顯示用的城市名（例：「臺中」、「臺中、臺南」）。</summary>
+    public string CityDisplays
+        => string.Join("、", EffectiveCities.Select(Bus.BusCity.DisplayOf));
 
     /// <summary>TDX 會員中心的 API 金鑰。留空則嘗試「訪客模式」（每 IP 每日 20 次）。</summary>
     public string ClientId { get; set; } = "";
@@ -215,16 +252,17 @@ public sealed class TdxApiClient
     }
 
     // ── 靜態資料 ───────────────────────────────────────────
+    //   城市可以指定（多城市時一個城市抓一輪）；沒指定就用主城市。
 
-    public Task<List<BusStop>> GetStopsAsync(CancellationToken ct)
-        => GetAsync<List<BusStop>>($"/api/basic/v2/Bus/Stop/City/{_opt.City}?$format=JSON", ct);
+    public Task<List<BusStop>> GetStopsAsync(CancellationToken ct, string? city = null)
+        => GetAsync<List<BusStop>>($"/api/basic/v2/Bus/Stop/City/{city ?? _opt.City}?$format=JSON", ct);
 
-    public Task<List<BusStopOfRoute>> GetStopOfRoutesAsync(CancellationToken ct)
+    public Task<List<BusStopOfRoute>> GetStopOfRoutesAsync(CancellationToken ct, string? city = null)
         => GetAsync<List<BusStopOfRoute>>(
-            $"/api/basic/v2/Bus/StopOfRoute/City/{_opt.City}?$format=JSON", ct);
+            $"/api/basic/v2/Bus/StopOfRoute/City/{city ?? _opt.City}?$format=JSON", ct);
 
-    public Task<List<BusRoute>> GetRoutesAsync(CancellationToken ct)
-        => GetAsync<List<BusRoute>>($"/api/basic/v2/Bus/Route/City/{_opt.City}?$format=JSON", ct);
+    public Task<List<BusRoute>> GetRoutesAsync(CancellationToken ct, string? city = null)
+        => GetAsync<List<BusRoute>>($"/api/basic/v2/Bus/Route/City/{city ?? _opt.City}?$format=JSON", ct);
 
     // ── 即時資料（N1 預估到站）──────────────────────────────
 
@@ -282,6 +320,13 @@ public sealed class TdxApiClient
     ///   2. 以站牌過濾時，同一個站的所有路線都會回來（本來就需要），
     ///      而且站牌 UID 是短 ASCII 字串，沒有中文編碼／大小寫的意外。
     /// </summary>
-    public Task<List<BusEta>> GetEtasByStopsAsync(IEnumerable<string> stopUids, CancellationToken ct)
-        => GetAsync<List<BusEta>>(BuildEtasByStopsUrl(_opt.City, stopUids), ct);
+    /// <summary>主要城市（多城市時的 fallback，例：站牌資料沒有 City 欄位時用它去查）。</summary>
+    public string City => _opt.City;
+
+    /// <summary>實際服務的城市清單。</summary>
+    public IReadOnlyList<string> Cities => _opt.EffectiveCities;
+
+    public Task<List<BusEta>> GetEtasByStopsAsync(
+        IEnumerable<string> stopUids, CancellationToken ct, string? city = null)
+        => GetAsync<List<BusEta>>(BuildEtasByStopsUrl(city ?? _opt.City, stopUids), ct);
 }

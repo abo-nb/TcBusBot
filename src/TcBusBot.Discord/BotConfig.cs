@@ -168,19 +168,27 @@ public sealed class BotConfig
         cfg.Tdx.ClientSecret = SettingResolver.Resolve(args, "--tdx-secret", file, ["TDX_CLIENT_SECRET", "TDX_SECRET"]).Value ?? "";
         cfg.Tdx.BaseUrl = SettingResolver.Resolve(args, "--tdx-base", file, ["TDX_BASE_URL"]).Value ?? cfg.Tdx.BaseUrl;
 
-        // ── 服務哪個城市的公車（預設臺中）────────────────────
+        // ── 服務哪個城市的公車（預設臺中；可以多個：Taichung,Tainan）────
         //    接受英文代碼（Taichung／Tainan）與中文（臺中／台中／臺南／台南），
-        //    見 BusCity.Normalize。預設**臺中**（舊的設定、快取、文件都以台中為主）。
+        //    逗號／頓號／空白分隔都可以，見 BusCity.ParseList。
         var city = SettingResolver.Resolve(args, "--city", file,
             ["BUS_CITY", "TCBUS_CITY", "TDX_CITY"]).Value;
 
-        if (!string.IsNullOrWhiteSpace(city)) cfg.Tdx.City = BusCity.Normalize(city);
+        var cities = BusCity.ParseList(city);
 
-        if (!BusCity.IsKnown(cfg.Tdx.City))
+        cfg.Tdx.Cities = cities.ToList();
+        cfg.Tdx.City = cities[0];      // 主要城市（舊欄位；快取與 fallback 用）
+
+        foreach (var unknown in cities.Where(c => !BusCity.IsKnown(c)))
         {
-            Console.WriteLine($"⚠️  BUS_CITY「{city}」不在已知清單裡（{BusCity.SupportedList()}）——");
+            Console.WriteLine($"⚠️  BUS_CITY「{unknown}」不在已知清單裡（{BusCity.SupportedList()}）——");
             Console.WriteLine("   會照原樣拿去問 TDX；如果抓到空資料再回來改這個值。");
         }
+
+        if (cities.Count > 1)
+            Console.WriteLine($"ℹ️  同時服務 {BusCity.DisplayOfMany(cities)}" +
+                              $"（{string.Join(" + ", cities)}）：站牌與路線合併成一份，" +
+                              "即時到站會按城市分批查。");
 
         cfg.Tdx.CacheDirectory = SettingResolver.Resolve(args, "--cache", file, ["TCBUS_CACHE"]).Value ?? "cache";
 
@@ -214,7 +222,7 @@ public sealed class BotConfig
 
         // 服務的城市（顯示名）——**不管有沒有自訂提示詞都要讓模型知道**
         // （見 LlmOptions.CityNote：這是這個行程的事實，不是使用者的偏好）。
-        cfg.Llm.CityDisplay = BusCity.DisplayOf(cfg.Tdx.City);
+        cfg.Llm.CityDisplays = cfg.Tdx.EffectiveCities.Select(BusCity.DisplayOf).ToList();
 
         // 沒自己寫提示詞時，順便把預設人格裡的 {city} 換成實際服務的城市
         // （不然跑臺南的實例會自稱「我主要幫大家查台中公車」）。

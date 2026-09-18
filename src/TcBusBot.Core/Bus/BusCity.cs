@@ -88,8 +88,38 @@ public static class BusCity
         => Cities.Any(c => string.Equals(c.Code, Normalize(city), StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// 錯誤訊息用的說明（例：「臺中（Taichung）、臺南（Tainan）…」）。
+    /// 解析**多個**城市（`BUS_CITY=Taichung,Tainan` 或 `臺中、臺南` 或 `台中 台南`）。
+    ///
+    /// 為什麼要一次支援多個：使用者的公車是「臺中 ＋ 臺南一起用」。
+    /// 逗號、頓號、空白都當分隔（大家輸入習慣不一樣），重複的會去掉、
+    /// 順序保留（第一個是「主要城市」）。
     /// </summary>
+    public static IReadOnlyList<string> ParseList(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return [Default];
+
+        var parts = raw.Split([',', '、', ';', ';', ' ', '\t', '/', '|'],
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var cities = new List<string>();
+
+        foreach (var part in parts)
+        {
+            var code = Normalize(part);
+            if (code.Length == 0) continue;
+            if (cities.Any(c => string.Equals(c, code, StringComparison.OrdinalIgnoreCase))) continue;
+
+            cities.Add(code);
+        }
+
+        return cities.Count == 0 ? [Default] : cities;
+    }
+
+    /// <summary>多個城市的顯示名（例：「臺中、臺南」）。</summary>
+    public static string DisplayOfMany(IEnumerable<string> cities)
+        => string.Join("、", cities.Select(DisplayOf));
+
+    /// <summary>錯誤訊息用的說明（例：「臺中（Taichung）、臺南（Tainan）…」）。</summary>
     public static string SupportedList(int take = 6)
         => string.Join("、", Cities.Take(take).Select(c => $"{c.Display}（{c.Code}）")) +
            (Cities.Length > take ? " …" : "");

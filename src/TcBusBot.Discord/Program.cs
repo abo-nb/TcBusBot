@@ -67,11 +67,11 @@ public static class Program
         TdxApiClient? api = null;
         string sourceDesc;
 
-        var cityDisplay = BusCity.DisplayOf(cfg.Tdx.City);
+        var cityDisplay = BusCity.DisplayOfMany(cfg.Tdx.EffectiveCities);
 
-        if (!BusCity.IsKnown(cfg.Tdx.City))
+        foreach (var unknownCity in cfg.Tdx.EffectiveCities.Where(c => !BusCity.IsKnown(c)))
         {
-            Console.WriteLine($"⚠️  不認識的城市「{cfg.Tdx.City}」—— 我會照原樣去 TDX 問一次，");
+            Console.WriteLine($"⚠️  不認識的城市「{unknownCity}」—— 我會照原樣去 TDX 問一次，");
             Console.WriteLine($"    如果資料是空的，請改用：{BusCity.SupportedList()}");
             Console.WriteLine();
         }
@@ -83,7 +83,7 @@ public static class Program
                 // 用 TdxApiClient.CreateHttpClient()：它會開啟 AutomaticDecompression，
                 // 否則 TDX 回傳的 gzip 內容會讓 JSON 解析失敗。
                 api = new TdxApiClient(TdxApiClient.CreateHttpClient(), cfg.Tdx);
-                var set = await StaticDataLoader.LoadAsync(api, cfg.Tdx, cfg.Refresh, Console.WriteLine);
+                var set = await StaticDataLoader.LoadManyAsync(api, cfg.Tdx, cfg.Refresh, Console.WriteLine);
                 data = new BusDataService();
                 data.Load(set.Stops, set.StopOfRoutes, set.Routes);
                 sourceDesc = api.IsVisitorMode
@@ -91,7 +91,7 @@ public static class Program
                     : $"TDX {cityDisplay}公車（會員模式）";
                 Console.WriteLine(sourceDesc);
             }
-            else if (BusCity.Normalize(cfg.Tdx.City) == BusCity.Default)
+            else if (cfg.Tdx.EffectiveCities.Count == 1 && BusCity.Normalize(cfg.Tdx.City) == BusCity.Default)
             {
                 var root = MiniFixtureSource.ResolveRoot(cfg.FixturesPath);
                 data = MiniFixtureSource.Load(root);
@@ -102,7 +102,7 @@ public static class Program
                 // 內建最小資料集只有臺中走廊 —— 拿它去服務臺南會出現「查得到臺中站牌」
                 // 這種更難懂的錯誤，所以這裡直接講清楚。
                 throw new InvalidOperationException(
-                    $"內建最小資料集只有臺中的資料，沒辦法用來跑{BusCity.DisplayOf(cfg.Tdx.City)}。" +
+                    $"內建最小資料集只有臺中的資料，沒辦法用來跑 {cityDisplay}。" +
                     "請設定 TDX_CLIENT_ID／TDX_CLIENT_SECRET（或用 --data tdx），" +
                     "或把 BUS_CITY 改回 Taichung。");
             }
@@ -115,7 +115,7 @@ public static class Program
                 Console.WriteLine($"   內部錯誤：{ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
             Console.WriteLine();
 
-            if (BusCity.Normalize(cfg.Tdx.City) != BusCity.Default)
+            if (cfg.Tdx.EffectiveCities.Count > 1 || BusCity.Normalize(cfg.Tdx.City) != BusCity.Default)
             {
                 Console.WriteLine($"   ⚠️  現在設定的是{BusCity.DisplayOf(cfg.Tdx.City)}，");
                 Console.WriteLine("       內建最小資料集只有臺中的走廊，所以**不**拿它當備援（會查到錯的站牌）。");
@@ -322,7 +322,7 @@ public static class Program
                 BotStatus.Poller = runtime.PollerDescription;
 
                 var token = _stop?.Token ?? CancellationToken.None;
-                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds);
+                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds, data);
                 _ = Task.Run(() => poller.RunAsync(token), token);
 
                 Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
@@ -467,7 +467,7 @@ public static class Program
             if (BotStatus.DiscordReady)
             {
                 runtime.PollerDescription = $"啟用中，每 {cfg.PollIntervalSeconds} 秒一次";
-                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds);
+                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds, data);
                 _ = Task.Run(() => poller.RunAsync(cts.Token), cts.Token);
                 pollerStarted = true;
                 Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
@@ -602,7 +602,7 @@ public static class Program
 
     private static void PrintBanner(BotConfig cfg)
     {
-        var city = BusCity.DisplayOf(cfg.Tdx.City);
+        var city = BusCity.DisplayOfMany(cfg.Tdx.EffectiveCities);
         var title = $"TcBusBot — {city}公車到站通知 Discord Bot";
 
         // 方框要對齊（中文算 2 格寬），所以用顯示寬度補空白而不是 Length
@@ -614,8 +614,8 @@ public static class Program
         Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
         Console.WriteLine($"{lead}{title}{new string(' ', Math.Max(0, pad - 3))}║");
         Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
-        Console.WriteLine($"  服務城市　　　：{city}（{cfg.Tdx.City}）" +
-                          (BusCity.IsKnown(cfg.Tdx.City) ? "" : "　⚠️ 不認識這個城市，請確認 BUS_CITY"));
+        Console.WriteLine($"  服務城市　　　：{city}（{string.Join(" + ", cfg.Tdx.EffectiveCities)}）" +
+                          (cfg.Tdx.EffectiveCities.All(BusCity.IsKnown) ? "" : "　⚠️ 有不認識的城市，請確認 BUS_CITY"));
         Console.WriteLine($"  .env 檔　　　：{cfg.EnvFile}{cfg.EnvFileSource}");
         if (cfg.EnvExportedKeys > 0)
             Console.WriteLine($"　　　　　　　　（已把 {cfg.EnvExportedKeys} 個鍵匯出到環境變數，" +

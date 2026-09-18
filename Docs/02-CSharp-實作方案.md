@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 641 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 655 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 641 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 655 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3858,6 +3858,28 @@ cfg.Llm.SystemPrompt = string.IsNullOrWhiteSpace(systemPrompt)
 | `Stop.Taichung.json` ≠ `Stop.Tainan.json`（三個檔都不一樣） | 換城市不會讀到舊資料 |
 | 沒給城市＝臺中檔名、給中文也對到同一個路徑 | 相容與正規化 |
 | 預設人格含 `{city}`，代入臺南後**不再出現**「查台中公車」、也不會留下沒被取代的 `{...}` | 人格跟著城市走 |
+
+#### 20.23.4 同時跑多個城市（`BUS_CITY=Taichung,Tainan`）
+
+使用者要的是「公車臺中＋臺南**同時**使用」。原本的設計是「一個行程一個城市」，
+分開跑兩個實例也可以，但訂閱、通知、AI 都要各自維護一份。
+
+| 決定 | 為什麼 |
+| --- | --- |
+| `BUS_CITY` 接受**多個**城市（逗號／頓號／空白分隔） | 大家的輸入習慣不一樣；`ParseList` 去重、保留順序（第一個＝主要城市） |
+| 靜態資料**合併成一份** | 站牌 UID 有城市前綴（`TXG…`／`TNN…`）、路線 UID 也一樣，接起來不會撞。於是一個 `BusDataService` 同時服務兩個城市 |
+| 每個城市各自一份快取（`Stop.{City}.json`） | 沿用 §20.23 的設計：換城市不會讀到別的城市 |
+| **即時到站按城市分批查** | ⚠️ 這是多城市唯一會靜默出錯的地方：ETA 網址是 `/Bus/EstimatedTimeOfArrival/City/{City}`，把臺南的站牌拿去問臺中端點只會回空資料 → 使用者看到「訂閱了卻一直沒有到站時間」。作法是 `BusDataService` 保留 StopUID → 城市對照，`GroupByCity` 分批，`EtaPoller` 逐城市呼叫 |
+| 找不到城市對應的站牌 → 歸到主要城市 | 舊快取沒有 `City` 欄位時，至少還查得到（不會整批靜默失效） |
+| 提示詞改成說明「同時服務兩個城市」 | 同名站牌可能在兩個城市都有，模型要依使用者提到的城市判斷，不確定就問 |
+| 內建最小資料集只在「剛好只有臺中」時使用 | 那份只有臺中走廊；跑兩個城市卻拿它當備援，會一半的站牌查不到 |
+
+驗收：`tcbus selftest` 新增 **12 項**（多城市解析與去重、顯示名、`TdxOptions.EffectiveCities`、
+資料集的 `Cities`／`CityOf`／`GroupByCity` 分組、查詢網址帶對城市、未知站牌的 fallback、
+多城市提示詞），`--dryrun` 另外用 IL 掃描確認 `EtaPoller` 真的呼叫 `GroupByCity`。
+
+真實資料實測：`BUS_CITY=Taichung,Tainan` → **25,365 個站牌、1,078 筆路線站序**
+（臺中 14,036 ＋ 臺南 11,329），`--dryrun` exit 0。
 
 `--dryrun` 新增「服務城市檢查」：城市代碼認得、快取檔名帶城市、**抽查資料裡真的有該城市的地名**
 （例：臺南 → 臺南車站／安平／成大，實測 3/3）。

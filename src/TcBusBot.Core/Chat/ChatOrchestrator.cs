@@ -476,30 +476,89 @@ public sealed class ChatOrchestrator
                 ToolChangedState = toolLog.ChangedState
             };
         }
+        catch (LlmException ex) when (incoming.ImageCount > 0)
+        {
+            // ★ 附圖的那一次失敗 → **拿掉圖片再試一次**。
+            //
+            // 為什麼要這一條：圖片是加分功能，但它的失敗模式很粗暴 ——
+            // 官方抓圖服務抓不到那個網址時，整個請求會回 400，
+            // 使用者看到的是「❌ 呼叫失敗」（明明是文字問題也一起死）。
+            // 實測踩到過：`Failed to download image from …`。
+            // 所以寧可少看一張圖，也要把答案生出來 —— 並且誠實說「這次沒看到圖」。
+            Console.WriteLine($"[llm] ⚠️ 附圖的呼叫失敗（{ex.Message}）→ 拿掉圖片重試一次");
+
+            var withoutImages = request with
+            {
+                Incoming = request.Incoming with
+                {
+                    Images = null,
+                    Content = $"{request.Incoming.Content}\n（這次的圖片讀取失敗，請只根據文字回答，" +
+                              "並告訴使用者圖片沒有成功傳過來）"
+                }
+            };
+
+            try
+            {
+                var retry = await _llm.CompleteAsync(withoutImages, cancellationToken);
+                _budget.Record(retry.InputTokens, retry.OutputTokens, guildId, DateTimeOffset.UtcNow);
+
+                return new ChatAnswer(
+                    Ok: true,
+                    Text: retry.Text,
+                    Error: null,
+                    Refused: false,
+                    Decision: decision,
+                    DecisionReason: reason + "（圖片失敗，改用純文字重試）",
+                    ContextTurns: trimmed.Turns.Count,
+                    DroppedTurns: trimmed.DroppedByCount,
+                    EstimatedContextTokens: trimmed.EstimatedTokens,
+                    InputTokens: retry.InputTokens,
+                    OutputTokens: retry.OutputTokens,
+                    TopicDetectTokens: detectTokens + listenTokens,
+                    UsageReported: retry.UsageReported,
+                    Model: retry.Model,
+                    Elapsed: DateTimeOffset.UtcNow - startedAt)
+                {
+                    ToolCalls = toolLog.Calls,
+                    ToolChangedState = toolLog.ChangedState
+                };
+            }
+            catch (LlmException retryEx)
+            {
+                // 兩次都失敗 → 照原本的方式回報（用第二次的訊息，那是真正的原因）
+                return Failed(retryEx, decision, reason, trimmed, detectTokens, toolLog, startedAt);
+            }
+        }
         catch (LlmException ex)
         {
-            return new ChatAnswer(
-                Ok: false,
-                Text: $"❌ {ex.Message}",
-                Error: ex.Message,
-                Refused: false,
-                Decision: decision,
-                DecisionReason: reason,
-                ContextTurns: trimmed.Turns.Count,
-                DroppedTurns: trimmed.DroppedByCount,
-                EstimatedContextTokens: trimmed.EstimatedTokens,
-                InputTokens: 0,
-                OutputTokens: 0,
-                TopicDetectTokens: detectTokens,
-                UsageReported: false,
-                Model: _options.Model,
-                Elapsed: DateTimeOffset.UtcNow - startedAt)
-            {
-                ToolCalls = toolLog.Calls,
-                ToolChangedState = toolLog.ChangedState
-            };
+            return Failed(ex, decision, reason, trimmed, detectTokens, toolLog, startedAt);
         }
     }
+
+    /// <summary>失敗時的回應（把「呼叫失敗」的原因原樣帶給使用者）。</summary>
+    private ChatAnswer Failed(
+        LlmException ex, ContextDecision decision, string reason, ContextBuilder.TrimResult trimmed,
+        int detectTokens, ToolCallLog toolLog, DateTimeOffset startedAt)
+        => new(
+            Ok: false,
+            Text: $"❌ {ex.Message}",
+            Error: ex.Message,
+            Refused: false,
+            Decision: decision,
+            DecisionReason: reason,
+            ContextTurns: trimmed.Turns.Count,
+            DroppedTurns: trimmed.DroppedByCount,
+            EstimatedContextTokens: trimmed.EstimatedTokens,
+            InputTokens: 0,
+            OutputTokens: 0,
+            TopicDetectTokens: detectTokens,
+            UsageReported: false,
+            Model: _options.Model,
+            Elapsed: DateTimeOffset.UtcNow - startedAt)
+        {
+            ToolCalls = toolLog.Calls,
+            ToolChangedState = toolLog.ChangedState
+        };
 
     /// <summary>
     /// 把「偷聽到的訊息」留下來當上下文（設定 `LLM_EAVESDROP_CONTEXT=false` 時什麼都不做）。
