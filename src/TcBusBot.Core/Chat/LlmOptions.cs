@@ -292,18 +292,27 @@ public sealed class LlmOptions
 
     /// <summary>「你服務的是哪個城市」那一段（<see cref="CityDisplay"/> 為空時回傳空字串）。</summary>
     public string CityNote
-        => string.IsNullOrWhiteSpace(CityDisplay)
+        => string.IsNullOrWhiteSpace(CityDisplay) ? "" : CityNoteFor(CityDisplay, MultiCity);
+
+    /// <summary>
+    /// 產生「服務範圍」那一段。
+    ///
+    /// ⚠️ 城市是**按使用者**選的（`/bus city`），所以實際內容是「問的人選的那個城市」——
+    /// 這裡只提供格式，實際的 city 由 <see cref="ChatOrchestrator"/> 依使用者決定。
+    /// </summary>
+    public static string CityNoteFor(string cityDisplay, bool multiCity)
+        => string.IsNullOrWhiteSpace(cityDisplay)
             ? ""
             : $"""
 
 
                 【服務範圍】
-                你查到的公車資料都是**{CityDisplay}**的（站牌、路線、到站時間都是）。
-                不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{CityDisplay}的資料。
-                {(MultiCity
-                    ? "使用者可能會問其中任何一個城市的路線。同名站牌在兩個城市都有時，" +
-                      "依使用者提到的城市或行政區判斷；不確定就問他是哪一個。"
-                    : "並請使用者把 BUS_CITY 改過去（或改用那個縣市的 Bot）。")}
+                你查到的公車資料都是**{cityDisplay}**的（站牌、路線、到站時間都是）。
+                不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{cityDisplay}的資料。
+                {(multiCity
+                    ? "使用者可以自己選城市（`/bus city`）—— 你看到的資料就是他選的那一個。" +
+                      "如果他要查別的縣市，請他先打 `/bus city` 換過去。"
+                    : "")}
                 """;
 
     /// <summary>

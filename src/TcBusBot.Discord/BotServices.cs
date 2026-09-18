@@ -45,7 +45,9 @@ internal static class BotServices
         DiscordSocketClient client,
         string sourceDesc,
         Action<string> log,
-        StorageSettings? storage = null)
+        StorageSettings? storage = null,
+        BusDataCatalog? catalog = null,
+        UserCityStore? userCities = null)
     {
         var services = new ServiceCollection();
 
@@ -85,6 +87,23 @@ internal static class BotServices
         services.AddSingleton<ILlmClient>(sp =>
             CreateLlmClient(cfg.Llm, log, sp.GetRequiredService<LlmDiagnostics>()));
 
+        // ── 公車資料目錄：**「哪個使用者要用哪一份資料」的唯一入口** ──
+        //     `/bus city` 讓訂公車的人自己選城市；沒選過的人用預設（BUS_CITY 的第一個）。
+        // ⚠️ 這兩個**永遠要註冊**（呼叫端沒傳時就用「只有一個城市」的預設組合）：
+        //    少註冊一個，`ValidateOnBuild` 會在啟動時直接炸掉整個 Bot
+        //    （`--dryrun` 也走同一份註冊程式碼，所以它會先抓到）。
+        //    公車資料目錄＝「哪個使用者要用哪一份資料」的唯一入口；
+        //    城市由使用者自己選（`/bus city`），沒選過的人用預設。
+        var cities = userCities ?? new UserCityStore(
+            cfg.Tdx.EffectiveCities.Count > 0 ? cfg.Tdx.EffectiveCities : [BusCity.Default],
+            cfg.Tdx.City);
+
+        var dataCatalog = catalog ?? new BusDataCatalog(
+            new Dictionary<string, BusDataService> { [cities.Default] = data }, cities);
+
+        services.AddSingleton(cities);
+        services.AddSingleton(dataCatalog);
+
         services.AddSingleton<BusActionService>();
         services.AddSingleton(sp => new GuildPersonaStore(
             sp.GetRequiredService<ILlmStateStore>(), cfg.Llm.BuildPersonaLimits()));
@@ -109,7 +128,8 @@ internal static class BotServices
             sp.GetRequiredService<ConversationStore>(),
             sp.GetRequiredService<WeeklyTokenBudget>(),
             sp.GetRequiredService<IChatToolProvider>(),
-            sp.GetRequiredService<GuildPersonaStore>())
+            sp.GetRequiredService<GuildPersonaStore>(),
+            userCities)      // 城市是「問的人」自己選的（/bus city），提示詞要跟著他
         {
             // 偷聽判斷的提示詞要用 Bot 自己的名字
             BotName = client.CurrentUser?.Username ?? "Bot"

@@ -131,13 +131,16 @@ public sealed class ChatOrchestrator
         set => _client = value;
     }
 
+    private readonly Bus.UserCityStore? _cities;
+
     public ChatOrchestrator(
         ILlmClient llm,
         LlmOptions options,
         ConversationStore conversations,
         WeeklyTokenBudget budget,
         IChatToolProvider? tools = null,
-        GuildPersonaStore? personas = null)
+        GuildPersonaStore? personas = null,
+        Bus.UserCityStore? cities = null)
     {
         _llm = llm;
         _options = options;
@@ -145,8 +148,20 @@ public sealed class ChatOrchestrator
         _budget = budget;
         _tools = tools ?? NoChatTools.Instance;
         _personas = personas ?? new GuildPersonaStore();
+        _cities = cities;
         _detector = new TopicSwitchDetector(llm, options);
     }
+
+    /// <summary>
+    /// 「這個**問的人**選的城市」那一段（`/bus city`）。
+    ///
+    /// 城市是使用者自己選的，所以提示詞也要跟著那個人 ——
+    /// 不然小明選了臺南，模型還是會跟他聊臺中的路線。
+    /// </summary>
+    private string CityNoteFor(ulong userId)
+        => _cities is null
+            ? _options.CityNote
+            : LlmOptions.CityNoteFor(Bus.BusCity.DisplayOf(_cities.Get(userId)), _cities.HasChoice);
 
     public ConversationStore Conversations => _conversations;
 
@@ -164,7 +179,8 @@ public sealed class ChatOrchestrator
     /// 也才壓得過前面那些通用規則（使用者教它「講話簡短一點」就該真的簡短）。
     /// </summary>
     public string EffectiveSystemPrompt(
-        ulong guildId, bool isOwner = false, bool ambientContext = false, string? selfName = null)
+        ulong guildId, bool isOwner = false, bool ambientContext = false, string? selfName = null,
+        string? cityNote = null)
     {
         var prompt = isOwner
             ? OwnerInstructions.TrimStart() + "\n\n" + _options.SystemPrompt
@@ -175,7 +191,7 @@ public sealed class ChatOrchestrator
         //   主機一旦設了 `LLM_SYSTEM_PROMPT`，模型就完全不知道自己服務哪個縣市，
         //   於是跑臺南的實例還是會跟使用者聊台中公車（使用者實際遇到的問題）。
         //   這是「這個行程的事實」，不是使用者的偏好，所以不受自訂提示詞影響。
-        prompt += _options.CityNote;
+        prompt += cityNote ?? _options.CityNote;
 
         // 「你在這裡叫什麼」——伺服器把 Bot 改暱稱時，有人喊那個名字它才知道是在叫它。
         if (_options.TellSelfName && SelfNameNote(ResolveSelfName(selfName)) is { } note)
@@ -418,7 +434,8 @@ public sealed class ChatOrchestrator
                 guildId,
                 admin.IsAdmin,
                 ambientContext: trimmed.Turns.Any(t => t.Ambient),
-                selfName: selfName),
+                selfName: selfName,
+                cityNote: CityNoteFor(incoming.AuthorId)),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,

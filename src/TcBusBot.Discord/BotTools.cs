@@ -28,6 +28,9 @@ public sealed class BusTools
     private readonly SubscriptionService _subs;
     private readonly ChatToolContext _context;
     private readonly ToolCallLog _log;
+
+    /// <summary>問的人是誰 —— 他可以用 `/bus city` 選城市，工具要跟著看同一份資料。</summary>
+    private ulong _userId => _context.UserId;
     private readonly Func<ChatToolContext, string?, CancellationToken, Task<string>>? _arrivals;
 
     /// <summary>模型剛剛取消了訂閱時放這裡，讓呼叫端可以掛「↩️ 復原」。</summary>
@@ -58,7 +61,7 @@ public sealed class BusTools
     public string SearchStops(
         [Description("站名關鍵字，站名關鍵字，例如「火車站」「靜宜」「科大」")] string keyword)
     {
-        var result = _actions.SearchStops(keyword);
+        var result = _actions.SearchStops(keyword, userId: _userId);
         _log.Record("search_stops", keyword);
         return result;
     }
@@ -69,7 +72,7 @@ public sealed class BusTools
     public string SearchRoutes(
         [Description("路線號碼，例如 300、304、藍1")] string number)
     {
-        var result = _actions.SearchRoutes(number);
+        var result = _actions.SearchRoutes(number, userId: _userId);
         _log.Record("search_routes", number);
         return result;
     }
@@ -81,7 +84,7 @@ public sealed class BusTools
         [Description("起點站名，例如「火車站」「靜宜」")] string origin,
         [Description("終點站名，例如 靜宜大學")] string destination)
     {
-        var result = _actions.FindRoutes(origin, destination);
+        var result = _actions.FindRoutes(origin, destination, userId: _userId);
         _log.Record("find_routes", $"{origin} → {destination}");
         return result;
     }

@@ -14,20 +14,23 @@ namespace TcBusBot.Discord.Modules;
 /// </summary>
 public sealed class BusComponentModule : BusModuleBase
 {
-    private readonly BusDataService _data;
+    private readonly BusDataCatalog _catalog;
+
+    /// <summary>**這個人**選的城市要用哪一份資料（訂公車的人自己選，見 `/bus city`）。</summary>
+    private BusDataService MyData => _catalog.For(Context.User.Id);
     private readonly SubscriptionService _subs;
     private readonly BusSessionStore _sessions;
     private readonly BotRuntime _runtime;
     private readonly SavedGroupStore _savedGroups;
 
     public BusComponentModule(
-        BusDataService data,
+        BusDataCatalog catalog,
         SubscriptionService subs,
         BusSessionStore sessions,
         BotRuntime runtime,
         SavedGroupStore savedGroups)
     {
-        _data = data;
+        _catalog = catalog;
         _subs = subs;
         _sessions = sessions;
         _runtime = runtime;
@@ -140,7 +143,7 @@ public sealed class BusComponentModule : BusModuleBase
         session.LastKeyword = keyword ?? "";
 
         // 有「完全／前綴相符」的結果時就只顯示那些，避免被模糊相符的雜訊塞滿 25 個選項
-        var all = _data.Search.SearchGrouped(keyword).ToList();
+        var all = MyData.Search.SearchGrouped(keyword).ToList();
         var (shown, hiddenFuzzy) = BusUi.PreferStrongMatches(all);
 
         session.LastSearch = shown;
@@ -149,8 +152,8 @@ public sealed class BusComponentModule : BusModuleBase
         // Modal 的回應只能是一則新訊息（不能在 Modal 上做 Update），
         // 所以這裡送出一則新的 ephemeral 訊息，之後的步驟都會更新它。
         await RespondAsync(
-            embed: BusUi.SearchResult(session.LastKeyword, shown, _data, hiddenFuzzy),
-            components: BusUi.SearchComponents(isOrigin, shown, _data, Array.Empty<string>()),
+            embed: BusUi.SearchResult(session.LastKeyword, shown, MyData, hiddenFuzzy),
+            components: BusUi.SearchComponents(isOrigin, shown, MyData, Array.Empty<string>()),
             ephemeral: true);
     }
 
@@ -176,8 +179,8 @@ public sealed class BusComponentModule : BusModuleBase
         var uids = ResolveStopUids(effective);
 
         await UpdateAsync(
-            embed: BusUi.PickedSummary(isOrigin, uids, values, _data),
-            components: BusUi.SearchComponents(isOrigin, session.LastSearch, _data, values));
+            embed: BusUi.PickedSummary(isOrigin, uids, values, MyData),
+            components: BusUi.SearchComponents(isOrigin, session.LastSearch, MyData, values));
     }
 
     [ComponentInteraction(Cid.SelectAllOrigin)]
@@ -192,14 +195,14 @@ public sealed class BusComponentModule : BusModuleBase
         var session = Session!;
 
         // 全選 = 實際選項清單裡的全部值（不能自己拼，否則會帶入不存在的值）
-        var all = BusUi.AllStopValues(session.LastSearch, _data);
+        var all = BusUi.AllStopValues(session.LastSearch, MyData);
 
         session.PendingPick = all;
         var uids = ResolveStopUids(all);
 
         await UpdateAsync(
-            embed: BusUi.PickedSummary(isOrigin, uids, all, _data),
-            components: BusUi.SearchComponents(isOrigin, session.LastSearch, _data, all));
+            embed: BusUi.PickedSummary(isOrigin, uids, all, MyData),
+            components: BusUi.SearchComponents(isOrigin, session.LastSearch, MyData, all));
     }
 
     [ComponentInteraction(Cid.ConfirmOrigin)]
@@ -224,11 +227,11 @@ public sealed class BusComponentModule : BusModuleBase
                     .WithTitle("沒有選到任何站牌")
                     .WithDescription("請至少勾選一個站牌或一個群組，再按「確認」。")
                     .Build(),
-                components: BusUi.SearchComponents(isOrigin, session.LastSearch, _data, session.PendingPick));
+                components: BusUi.SearchComponents(isOrigin, session.LastSearch, MyData, session.PendingPick));
             return;
         }
 
-        var target = _data.TargetFromStops(uids);
+        var target = MyData.TargetFromStops(uids);
         if (isOrigin) session.Origin = target;
         else session.Destination = target;
 
@@ -261,7 +264,7 @@ public sealed class BusComponentModule : BusModuleBase
             return;
         }
 
-        var routes = _data.FindRoutes(session.Origin!, session.Destination!);
+        var routes = MyData.FindRoutes(session.Origin!, session.Destination!);
         session.LastRoutes = routes.ToList();
         session.PickedRouteValues = new List<string>();   // 重新搜尋就清掉先前的勾選
 
@@ -906,7 +909,7 @@ public sealed class BusComponentModule : BusModuleBase
             }
 
             var wanted = leg.Routes.Select(r => (r.RouteUid, r.Direction)).ToHashSet();
-            var chosen = _data.FindRoutes(origin, destination)
+            var chosen = MyData.FindRoutes(origin, destination)
                                .Where(r => wanted.Contains((r.RouteUid, r.Direction)))
                                .ToList();
 
@@ -1103,14 +1106,14 @@ public sealed class BusComponentModule : BusModuleBase
     /// 這樣「值怎麼編碼」與「怎麼解碼」在同一處，也讓離線驗證能一起測。
     /// </summary>
     private List<string> ResolveStopUids(IEnumerable<string> values)
-        => BusUi.ResolveStopValues(values, _data);
+        => BusUi.ResolveStopValues(values, MyData);
 
     /// <summary>
     /// 使用者沒有手動勾選時，預設用「完全相符／前綴相符」的群組。
     /// 由 BusUi 統一推導，確保與實際存在的選項一致。
     /// </summary>
     private List<string> DefaultPicks(IReadOnlyList<StopSearchGroupResult> groups)
-        => BusUi.DefaultStopPicks(groups, _data);
+        => BusUi.DefaultStopPicks(groups, MyData);
 
     private static (string RouteUid, int Direction)? ParseRouteValue(string value)
     {

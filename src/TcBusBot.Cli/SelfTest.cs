@@ -3544,14 +3544,64 @@ public static class SelfTest
         // 多城市時，模型要知道「同名站牌可能兩個城市都有」
         var multiCityOptions = new LlmOptions { CityDisplays = ["臺中", "臺南"], SystemPrompt = "x" };
 
-        Check("★ 多城市時，提示詞會說明「同名站牌要問清楚哪個城市」",
+        Check("★ 可選多個城市時，提示詞會告訴模型「使用者自己選了哪一個」",
             multiCityOptions.MultiCity
-            && multiCityOptions.CityNote.Contains("同名站牌在兩個城市都有時", StringComparison.Ordinal),
+            && multiCityOptions.CityNote.Contains("/bus city", StringComparison.Ordinal),
             multiCityOptions.CityNote.Replace("\n", " ｜ "));
 
         Check("單一城市時不會多那句（省 token）",
             !new LlmOptions { CityDisplays = ["臺中"] }.CityNote
-                .Contains("同名站牌在兩個城市都有時", StringComparison.Ordinal));
+                .Contains("/bus city", StringComparison.Ordinal));
+
+        // ── 3e) 城市是**按使用者**選的（/bus city）──────────────────
+        //     使用者要的是「讓要訂公車的人自己選」，不是伺服器也不是主機設定。
+        var cityStore = new UserCityStore(["Taichung", "Tainan"]);
+
+        Check("★ 沒選過的人用預設（BUS_CITY 的第一個＝臺中）",
+            cityStore.Get(1UL) == "Taichung" && !cityStore.HasOwnChoice(1UL));
+
+        Check("★ 每個人各自選（小明改臺南，小華還是臺中）",
+            cityStore.Set(1UL, "臺南")
+            && cityStore.Get(1UL) == "Tainan"
+            && cityStore.Get(2UL) == "Taichung");
+
+        Check("選過之後記得住（HasOwnChoice）",
+            cityStore.HasOwnChoice(1UL) && !cityStore.HasOwnChoice(2UL));
+
+        Check("★ 不在可用清單裡的城市不會被設定（不會亂設）",
+            !cityStore.Set(3UL, "Kaohsiung") && cityStore.Get(3UL) == "Taichung");
+
+        Check("可以改回其他城市",
+            cityStore.Set(1UL, "Taichung") && cityStore.Get(1UL) == "Taichung");
+
+        Check("可以忘掉自己的選擇（回到預設）",
+            cityStore.Set(1UL, "Tainan") && cityStore.Clear(1UL)
+            && !cityStore.HasOwnChoice(1UL) && cityStore.Get(1UL) == "Taichung");
+
+        Check("只有一個城市時 HasChoice = false（/bus city 沒有意義）",
+            !new UserCityStore(["Taichung"]).HasChoice
+            && new UserCityStore(["Taichung", "Tainan"]).HasChoice);
+
+        Check("說明看得出目前選什麼、可選什麼",
+            new UserCityStore(["Taichung", "Tainan"]).Describe(9UL).Contains("臺中", StringComparison.Ordinal)
+            && new UserCityStore(["Taichung", "Tainan"]).Describe(9UL).Contains("臺南", StringComparison.Ordinal));
+
+        // 資料目錄：每個人拿到自己的那一份
+        var catalog = new BusDataCatalog(
+            new Dictionary<string, BusDataService>
+            {
+                ["Taichung"] = BuildSingleCityFixture("Taichung"),
+                ["Tainan"] = BuildSingleCityFixture("Tainan")
+            },
+            cityStore);
+
+        Check("★ 資料目錄：同一個伺服器裡，不同的人可以拿到不同城市的資料",
+            catalog.For(1UL).CityOf("TXG0001") is not null
+            && catalog.ForCity("Tainan").CityOf("TNN0001") is not null
+            && catalog.CityFor(1UL) == "Taichung");
+
+        Check("★ 即時到站分批用的是「站牌自己的城市」（換城市不會讓舊訂閱失效）",
+            catalog.GroupByCity(["TXG0001", "TNN0001"]).Count == 2);
 
         var multiOptions = new TdxOptions { City = "Taichung" };
         multiOptions.Cities = ["Taichung", "Tainan"];
@@ -3706,6 +3756,39 @@ public static class SelfTest
             Img("https://x").Describe().Contains("附件", StringComparison.Ordinal)
             && new ImageRef("https://x", ImageSource.Sticker, "貓貓").Describe().Contains("貼圖", StringComparison.Ordinal)
             && new ImageRef("https://x", ImageSource.Embed).Describe().Contains("嵌入", StringComparison.Ordinal));
+    }
+
+    /// <summary>單一城市的最小資料集（資料目錄「一個城市一份」用）。</summary>
+    private static BusDataService BuildSingleCityFixture(string city)
+    {
+        var full = BuildCityFixture();
+
+        var stops = new List<BusStop>
+        {
+            new() { StopUID = city == "Tainan" ? "TNN0001" : "TXG0001",
+                    StopID = "1",
+                    StopName = new(city == "Tainan" ? "臺南車站" : "臺中車站", null),
+                    City = city,
+                    StopPosition = new(120.2, 23.0, null) }
+        };
+
+        var sors = new List<BusStopOfRoute>
+        {
+            new() { RouteUID = city == "Tainan" ? "TNN5" : "TXG300", Direction = 1,
+                    RouteName = new(city == "Tainan" ? "5" : "300", null),
+                    Stops = [ new() { StopUID = stops[0].StopUID, StopSequence = 1,
+                                      StopName = new(stops[0].ZhTwName, null) } ] }
+        };
+
+        var routes = new List<BusRoute>
+        {
+            new() { RouteUID = sors[0].RouteUID, RouteName = new(sors[0].RouteZhTwName, null) }
+        };
+
+        var data = new BusDataService();
+        data.Load(stops, sors, routes);
+
+        return data;
     }
 
     /// <summary>兩個城市的最小資料集（臺中 TXG／臺南 TNN），用來驗「按城市分批」。</summary>

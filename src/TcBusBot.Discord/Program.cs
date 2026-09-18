@@ -62,8 +62,12 @@ public static class Program
             Console.WriteLine();
         }
 
-        // ── 1) 靜態資料 ────────────────────────────────────
-        BusDataService data;
+        // ── 1) 靜態資料（**每個城市各一份**）──────────────────
+        //    為什麼不是合併成一份：`/bus city` 讓**訂公車的人自己選城市**，
+        //    而「合併再過濾」只要漏掉任何一條查詢路徑，就會吐出別的城市站牌
+        //    （而且不會報錯）。一個城市一份索引，選哪一份由資料目錄決定，
+        //    就**不可能看錯城市**。
+        var byCity = new Dictionary<string, BusDataService>(StringComparer.OrdinalIgnoreCase);
         TdxApiClient? api = null;
         string sourceDesc;
 
@@ -83,9 +87,28 @@ public static class Program
                 // 用 TdxApiClient.CreateHttpClient()：它會開啟 AutomaticDecompression，
                 // 否則 TDX 回傳的 gzip 內容會讓 JSON 解析失敗。
                 api = new TdxApiClient(TdxApiClient.CreateHttpClient(), cfg.Tdx);
-                var set = await StaticDataLoader.LoadManyAsync(api, cfg.Tdx, cfg.Refresh, Console.WriteLine);
-                data = new BusDataService();
-                data.Load(set.Stops, set.StopOfRoutes, set.Routes);
+
+                foreach (var city in cfg.Tdx.EffectiveCities)
+                {
+                    var cityOptions = new TdxOptions
+                    {
+                        BaseUrl = cfg.Tdx.BaseUrl,
+                        City = city,
+                        Cities = [city],
+                        CacheDirectory = cfg.Tdx.CacheDirectory,
+                        ClientId = cfg.Tdx.ClientId,
+                        ClientSecret = cfg.Tdx.ClientSecret
+                    };
+
+                    var set = await StaticDataLoader.LoadAsync(api, cityOptions, cfg.Refresh, Console.WriteLine);
+
+                    var service = new BusDataService();
+                    service.Load(set.Stops, set.StopOfRoutes, set.Routes);
+                    byCity[city] = service;
+
+                    Console.WriteLine($"[資料] {BusCity.DisplayOf(city)}：{set.Describe()}");
+                }
+
                 sourceDesc = api.IsVisitorMode
                     ? $"TDX {cityDisplay}公車（訪客模式：沒有 API 金鑰，每日 20 次上限）"
                     : $"TDX {cityDisplay}公車（會員模式）";
@@ -94,7 +117,7 @@ public static class Program
             else if (cfg.Tdx.EffectiveCities.Count == 1 && BusCity.Normalize(cfg.Tdx.City) == BusCity.Default)
             {
                 var root = MiniFixtureSource.ResolveRoot(cfg.FixturesPath);
-                data = MiniFixtureSource.Load(root);
+                byCity[BusCity.Default] = MiniFixtureSource.Load(root);
                 sourceDesc = $"內建最小資料集（{root}）";
             }
             else
@@ -127,11 +150,20 @@ public static class Program
             Console.WriteLine("   改用內建最小資料集繼續執行（搜尋範圍僅限臺中車站～靜宜大學走廊）。");
             Console.WriteLine("   修正後可用 --refresh 重新抓取。");
             Console.WriteLine();
-            data = MiniFixtureSource.Load(MiniFixtureSource.ResolveRoot(cfg.FixturesPath));
+            byCity[BusCity.Default] = MiniFixtureSource.Load(MiniFixtureSource.ResolveRoot(cfg.FixturesPath));
             sourceDesc = "內建最小資料集（TDX 載入失敗後的備援）";
         }
 
-        Console.WriteLine($"✅ 資料就緒：{data.StopCount} 個站牌、{data.TripCount} 筆路線站序");
+        // 資料目錄：**「哪個使用者要用哪一份資料」的唯一入口**
+        // （城市由使用者自己選，見 /bus city；沒選過的人用 BUS_CITY 的第一個）
+        var userCities = new UserCityStore(cfg.Tdx.EffectiveCities, cfg.Tdx.EffectiveCities[0]);
+
+        var catalog = new BusDataCatalog(byCity, userCities);
+        var data = catalog.DefaultData;
+
+        Console.WriteLine($"✅ 資料就緒：{catalog.Describe()}");
+        if (catalog.HasChoice)
+            Console.WriteLine($"   使用者可用 `/bus city` 選城市（預設 {BusCity.DisplayOf(catalog.Default)}）");
         Console.WriteLine();
 
         BotStatus.DataSource = sourceDesc;
@@ -208,7 +240,8 @@ public static class Program
 
         // ── 2b) 服務組裝（**DI 容器**，註冊集中在 BotServices）──
         //   `--dryrun` 用的是同一份註冊程式碼，所以離線驗證通過 = 這裡也組得起來。
-        var services = BotServices.Create(cfg, data, api, client, sourceDesc, Console.WriteLine);
+        var services = BotServices.Create(cfg, data, api, client, sourceDesc, Console.WriteLine,
+            catalog: catalog, userCities: userCities);
 
         using var provider = services.BuildServiceProvider(new ServiceProviderOptions
         {
@@ -218,6 +251,9 @@ public static class Program
 
         // ★ 儲存方案：後端（MongoDB／SQLite／文字檔／記憶體）是在註冊時就挑好的，
         //   Program 不需要知道現在是哪一種 —— 只把它印出來並給健康檢查端點用。
+        // 城市選擇要接上儲存區才會「重啟後還在」（容器比靜態資料晚建好，所以在這裡接）
+        userCities.Attach(provider.GetRequiredService<ILlmStateStore>());
+
         using var scopeForLog = provider.CreateScope();
         var savedGroups = provider.GetRequiredService<SavedGroupStore>();
         Console.WriteLine($"✅ 訂閱組儲存：{savedGroups.Describe()}");
@@ -322,7 +358,7 @@ public static class Program
                 BotStatus.Poller = runtime.PollerDescription;
 
                 var token = _stop?.Token ?? CancellationToken.None;
-                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds, data);
+                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds, catalog);
                 _ = Task.Run(() => poller.RunAsync(token), token);
 
                 Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
@@ -467,7 +503,7 @@ public static class Program
             if (BotStatus.DiscordReady)
             {
                 runtime.PollerDescription = $"啟用中，每 {cfg.PollIntervalSeconds} 秒一次";
-                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds, data);
+                var poller = new EtaPoller(client, api, subs, cache, cfg.PollIntervalSeconds, catalog);
                 _ = Task.Run(() => poller.RunAsync(cts.Token), cts.Token);
                 pollerStarted = true;
                 Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");

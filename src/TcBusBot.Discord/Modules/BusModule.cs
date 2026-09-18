@@ -92,19 +92,93 @@ public sealed class BusModule : BusModuleBase
     private readonly BusSessionStore _sessions;
     private readonly BotRuntime _runtime;
     private readonly SavedGroupStore _savedGroups;
+    private readonly BusDataCatalog _catalog;
+    private readonly UserCityStore _cities;
 
     public BusModule(
         BusDataService data,
         SubscriptionService subs,
         BusSessionStore sessions,
         BotRuntime runtime,
-        SavedGroupStore savedGroups)
+        SavedGroupStore savedGroups,
+        BusDataCatalog catalog,
+        UserCityStore cities)
     {
         _data = data;
         _subs = subs;
         _sessions = sessions;
         _runtime = runtime;
         _savedGroups = savedGroups;
+        _catalog = catalog;
+        _cities = cities;
+    }
+
+    /// <summary>這個人目前選的城市（訂公車的人自己決定要看哪個城市）。</summary>
+    private string MyCity => _cities.Get(Context.User.Id);
+
+    /// <summary>這個人要用哪一份資料。</summary>
+    private BusDataService MyData => _catalog.For(Context.User.Id);
+
+    /// <summary>
+    /// `/bus city`：**選要看哪個城市的公車**。
+    ///
+    /// 為什麼是「按使用者」而不是伺服器或主機設定：
+    /// 同一個伺服器裡可能有人通勤看臺中、有人回老家看臺南。
+    /// 主機設 `BUS_CITY` 只能整個行程一套（兩種站牌混在一起，分不出哪個是哪個），
+    /// 所以由**要訂公車的那個人**自己選，預設是主機載入的第一個城市（通常是臺中）。
+    ///
+    /// 只影響「搜尋與面板看到哪個城市的站牌」——
+    /// **已經訂好的訂閱不會失效**（即時到站是依站牌自己的城市去查的）。
+    /// </summary>
+    [SlashCommand("city", "選擇你要查哪個城市的公車（臺中／臺南…；只影響你自己的搜尋與面板）")]
+    public async Task CityAsync(
+        [Summary("城市", "要查的城市（留空＝顯示目前設定與可選清單）")] string? city = null)
+    {
+        var available = _cities.Available;
+
+        if (string.IsNullOrWhiteSpace(city))
+        {
+            await RespondAsync(embed: new EmbedBuilder()
+                .WithColor(new Color(0x2B, 0x6C, 0xB0))
+                .WithTitle("🌏 你要查哪個城市的公車？")
+                .WithDescription(
+                    $"目前：**{BusCity.DisplayOf(MyCity)}**" +
+                    (_cities.HasOwnChoice(Context.User.Id) ? "（你自己選的）" : "（預設）") + "\n\n" +
+                    (available.Count > 1
+                        ? "可以選：\n" + string.Join("\n", available.Select(c =>
+                            $"• `{BusCity.DisplayOf(c)}`（`/bus city 城市:{c}`）"))
+                        : "⚠️ 主機目前只載入了這一個城市（`BUS_CITY`）。\n" +
+                          "要能選多個城市，請在主機端設定 `BUS_CITY=Taichung,Tainan`。"))
+                .WithFooter("只影響你自己看到的站牌搜尋與面板；已訂閱的路線不受影響")
+                .Build(),
+                ephemeral: true);
+
+            return;
+        }
+
+        if (!_cities.Set(Context.User.Id, city))
+        {
+            await RespondAsync(
+                $"❌ 沒有「{city}」這個城市可選。\n" +
+                $"目前可以選：{string.Join("、", available.Select(BusCity.DisplayOf))}" +
+                (available.Count == 1 ? "（主機只載入了這一個；要更多請設 `BUS_CITY`）" : ""),
+                ephemeral: true);
+            return;
+        }
+
+        var chosen = MyCity;
+        var data = MyData;
+
+        await RespondAsync(embed: new EmbedBuilder()
+            .WithColor(new Color(0x2E, 0x8B, 0x57))
+            .WithTitle($"✅ 改成查「{BusCity.DisplayOf(chosen)}」的公車")
+            .WithDescription(
+                $"資料集：{data.StopCount} 個站牌、{data.TripCount} 筆路線站序\n\n" +
+                "接下來 `/bus panel` 的站牌搜尋、以及 @ 我問路線，都只會看這個城市。\n" +
+                "（已經訂好的訂閱不會變 —— 它們各自記著自己的站牌。）")
+            .WithFooter("要換回來就再打一次 /bus city")
+            .Build(),
+            ephemeral: true);
     }
 
     [SlashCommand("panel", "開啟訂閱面板：設定起點與目的地，找出可以搭的路線")]
@@ -195,7 +269,12 @@ public sealed class BusModule : BusModuleBase
         var embed = new EmbedBuilder()
             .WithTitle("🤖 TcBusBot 狀態")
             .WithColor(new Color(0x2B, 0x6C, 0xB0))
-            .AddField("靜態資料", $"{_data.StopCount} 個站牌、{_data.TripCount} 筆路線站序", inline: false)
+            .AddField("你要查的城市",
+                $"{BusCity.DisplayOf(MyCity)}" +
+                (_cities.HasOwnChoice(Context.User.Id) ? "（你自己選的）" : "（預設）") +
+                (_cities.HasChoice ? $"　可換：{BusCity.DisplayOfMany(_cities.Available)}（`/bus city`）" : ""),
+                inline: false)
+            .AddField("靜態資料（這個城市）", $"{MyData.StopCount} 個站牌、{MyData.TripCount} 筆路線站序", inline: false)
             .AddField("資料來源", _runtime.DataSourceDescription, inline: false)
             .AddField("訂閱", $"{_subs.GroupCount} 組、{_subs.SubscriptionCount} 個訂閱", inline: true)
             .AddField("面板 session", $"{_sessions.Count} 個", inline: true)

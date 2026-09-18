@@ -22,7 +22,7 @@ public sealed class EtaPoller
     private readonly SubscriptionService _subs;
     private readonly RealtimeBusCache _cache;
     private readonly SubscriptionMatcher _matcher;
-    private readonly BusDataService _data;
+    private readonly BusDataCatalog _catalog;
     private readonly int _intervalSeconds;
     private readonly int _batchSize;
 
@@ -32,14 +32,14 @@ public sealed class EtaPoller
         SubscriptionService subs,
         RealtimeBusCache cache,
         int intervalSeconds,
-        BusDataService data,
+        BusDataCatalog catalog,
         int batchSize = 40)
     {
         _client = client;
         _api = api;
         _subs = subs;
         _cache = cache;
-        _data = data;
+        _catalog = catalog;
         _matcher = new SubscriptionMatcher(subs, cache, staleDataSeconds: 180);
         _intervalSeconds = intervalSeconds;
         _batchSize = batchSize;
@@ -81,7 +81,9 @@ public sealed class EtaPoller
         // ⚠️ 即時到站的網址裡有城市（`/City/{City}`），所以**一定要按城市分批**：
         //    多城市同時跑（臺中＋臺南）時，把臺南的站牌拿去問臺中端點只會回空資料，
         //    使用者看到的是「明明訂閱了卻一直沒有到站時間」。
-        foreach (var (city, cityStops) in _data.GroupByCity(stops, _api.City))
+        //    這裡用**站牌自己的城市**（不是訂閱者現在選的城市）——
+        //    同一個人可能兩邊都訂了，而且換城市不該讓舊訂閱失效。
+        foreach (var (city, cityStops) in _catalog.GroupByCity(stops))
         {
             foreach (var chunk in cityStops.Chunk(_batchSize))
             {

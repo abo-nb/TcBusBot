@@ -1236,7 +1236,7 @@ public static class DryRun
             .Select(c => c.Name)
             .ToHashSet(StringComparer.Ordinal);
 
-        var expectedSubs = new[] { "panel", "list", "groups", "next", "status", "end" };
+        var expectedSubs = new[] { "panel", "city", "list", "groups", "next", "status", "end" };
         var missingSubs = expectedSubs.Where(e => !subNames.Contains(e)).ToList();
 
         if (missingSubs.Count > 0)
@@ -1811,7 +1811,7 @@ public static class DryRun
         // ── 多城市：即時到站要按城市分批（網址裡有城市）──────────
         if (llm.CityDisplays.Count > 1)
         {
-            Console.WriteLine($"  ℹ 多城市：{llm.CityDisplay}（資料合併成一份，ETA 按城市分批查）");
+            Console.WriteLine($"  ℹ 多城市：{llm.CityDisplay}（每個城市各一份資料，使用者用 /bus city 自己選；ETA 按站牌的城市分批查）");
 
             var poller = typeof(EtaPoller).GetMethod("PollOnceAsync",
                 BindingFlags.Instance | BindingFlags.NonPublic);
@@ -1819,7 +1819,7 @@ public static class DryRun
 
             if (poller is null)
                 Problem("找不到 EtaPoller.PollOnceAsync —— 無法驗證多城市的 ETA 分批");
-            else if (!pollerCalls.Contains("BusDataService.GroupByCity"))
+            else if (!pollerCalls.Contains("BusDataCatalog.GroupByCity"))
                 Problem("輪詢沒有按城市分批（GroupByCity）—— 臺南的站牌會被拿去問臺中端點，永遠沒有到站時間");
             else
                 Console.WriteLine("  ✔ 輪詢真的會按城市分批查 ETA");

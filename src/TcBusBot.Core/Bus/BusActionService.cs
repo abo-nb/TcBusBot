@@ -15,10 +15,12 @@ namespace TcBusBot.Core.Bus;
 public sealed class BusActionService
 {
     private readonly BusDataService _data;
+    private readonly BusDataCatalog? _catalog;
     private readonly Subscriptions.SubscriptionService _subs;
 
-    public BusActionService(BusDataService data, Subscriptions.SubscriptionService subs)
+    public BusActionService(BusDataService data, Subscriptions.SubscriptionService subs, BusDataCatalog? catalog = null)
     {
+        _catalog = catalog;
         _data = data;
         _subs = subs;
     }
@@ -28,24 +30,29 @@ public sealed class BusActionService
     // ─────────────────────────────────────────────────────
 
     /// <summary>搜尋站牌，回傳「模型看得懂」的文字清單。</summary>
-    public string SearchStops(string keyword, int limit = 8)
+    /// <summary>問的人要用哪一份資料（他可以用 /bus city 選城市）。</summary>
+    private BusDataService DataFor(ulong userId) => _catalog?.For(userId) ?? _data;
+
+    public string SearchStops(string keyword, int limit = 8, ulong userId = 0)
     {
         keyword = (keyword ?? "").Trim();
         if (keyword.Length < 2) return "關鍵字太短（至少 2 個字）。";
 
-        var (shown, hidden) = PreferStrong(_data.Search.SearchGrouped(keyword));
+        var data = DataFor(userId);
+
+        var (shown, hidden) = PreferStrong(data.Search.SearchGrouped(keyword));
 
         if (shown.Count == 0)
             return $"找不到符合「{keyword}」的站牌。" +
-                   $"這份資料集裡有的站名例如：{string.Join("、", _data.ExampleStopNames(6))}";
+                   $"這份資料集裡有的站名例如：{string.Join("、", data.ExampleStopNames(6))}";
 
         var lines = shown.Take(Math.Max(1, limit)).Select(g =>
         {
             // 除了站名，也把「有哪幾條路線經過」講出來 —— 模型很常需要這個才能判斷
             // 「使用者講的是哪一個站」（同名站牌在不同路口時，經過的路線不一樣）
             var routes = g.Hits
-                .SelectMany(h => _data.GetOccurrences(h.Entry.StopUid))
-                .Select(o => _data.GetRouteName(o.RouteUid))
+                .SelectMany(h => data.GetOccurrences(h.Entry.StopUid))
+                .Select(o => data.GetRouteName(o.RouteUid))
                 .Distinct(StringComparer.Ordinal)
                 .OrderBy(n => n, StringComparer.Ordinal)
                 .Take(5)
@@ -68,12 +75,13 @@ public sealed class BusActionService
     // ─────────────────────────────────────────────────────
 
     /// <summary>用路線號碼查路線（「300」「304」「藍1」…）。</summary>
-    public string SearchRoutes(string number, int limit = 8)
+    public string SearchRoutes(string number, int limit = 8, ulong userId = 0)
     {
+        var data = DataFor(userId);
         number = (number ?? "").Trim();
         if (number.Length == 0) return "請給我路線號碼，例如 300、304、藍1。";
 
-        var routes = _data.FindRoutesByNumber(number, limit);
+        var routes = data.FindRoutesByNumber(number, limit);
 
         if (routes.Count == 0)
             return $"找不到號碼符合「{number}」的路線。（可以先用 search_stops 查站牌，" +
@@ -91,23 +99,25 @@ public sealed class BusActionService
     //  查路線（不建立訂閱）
     // ─────────────────────────────────────────────────────
 
-    public string FindRoutes(string origin, string destination)
+    public string FindRoutes(string origin, string destination, ulong userId = 0)
     {
-        var from = Resolve(origin);
-        var to = Resolve(destination);
+        var from = Resolve(origin, userId);
+        var to = Resolve(destination, userId);
 
         if (from.Uids.Count == 0)
-            return $"起點：{DescribeUnresolved(origin, from)}";
+            return $"起點：{DescribeUnresolved(origin, from, userId)}";
 
         if (to.Uids.Count == 0)
-            return $"終點：{DescribeUnresolved(destination, to)}";
+            return $"終點：{DescribeUnresolved(destination, to, userId)}";
 
-        var routes = _data.FindRoutes(from.Target, to.Target);
+        var data = DataFor(userId);
+
+        var routes = data.FindRoutes(from.Target, to.Target);
 
         if (routes.Count == 0)
         {
             // 沒有直達 → 幫忙找「轉一次」的走法（以前這裡就只回「沒有直達」，等於幫不上忙）
-            var transfers = _data.FindTransferRoutes(from.Target, to.Target);
+            var transfers = data.FindTransferRoutes(from.Target, to.Target);
             var head = $"{from.Target.DisplayName} → {to.Target.DisplayName} **沒有直達路線**。";
 
             if (transfers.Count == 0)
@@ -128,7 +138,7 @@ public sealed class BusActionService
         if (routes.Count == 1)
         {
             // 只有一條時，順便提一下轉乘的可能（使用者常常想比較哪個快）
-            var transfers = _data.FindTransferRoutes(from.Target, to.Target, max: 1);
+            var transfers = DataFor(userId).FindTransferRoutes(from.Target, to.Target, max: 1);
 
             if (transfers.Count > 0 && transfers[0].TotalStops < 40)
                 text += $"\n（另外也可以轉車：{transfers[0].Describe()}）";
@@ -164,15 +174,15 @@ public sealed class BusActionService
         ulong? guildId = null,
         ulong? channelId = null)
     {
-        var from = Resolve(origin);
-        var to = Resolve(destination);
+        var from = Resolve(origin, userId);
+        var to = Resolve(destination, userId);
 
         if (from.Uids.Count == 0)
-            return new SubscribeOutcome(false, $"起點：{DescribeUnresolved(origin, from)}",
+            return new SubscribeOutcome(false, $"起點：{DescribeUnresolved(origin, from, userId)}",
                 null, null, null, []);
 
         if (to.Uids.Count == 0)
-            return new SubscribeOutcome(false, $"終點：{DescribeUnresolved(destination, to)}",
+            return new SubscribeOutcome(false, $"終點：{DescribeUnresolved(destination, to, userId)}",
                 null, null, null, []);
 
         return SubscribeTargets(userId, from.Target, to.Target, null, notifyMinutes, guildId, channelId);
@@ -194,7 +204,7 @@ public sealed class BusActionService
         if (origin.CandidateStopUids.Count == 0 || destination.CandidateStopUids.Count == 0)
             return new SubscribeOutcome(false, "起點或終點還沒有站牌，請先設定起訖。", null, null, null, []);
 
-        var routes = _data.FindRoutes(origin, destination);
+        var routes = DataFor(userId).FindRoutes(origin, destination);
 
         if (onlyRoutes is { Count: > 0 })
         {
@@ -237,13 +247,13 @@ public sealed class BusActionService
     /// 把「站名關鍵字」解析成候選站集合（面板／UI 動作共用同一套）。
     /// 回傳 null 代表找不到、或模糊到不能自己挑（原因寫在 <paramref name="message"/>）。
     /// </summary>
-    public LocationTarget? ResolveKeyword(string keyword, out string message)
+    public LocationTarget? ResolveKeyword(string keyword, out string message, ulong userId = 0)
     {
-        var resolved = Resolve(keyword);
+        var resolved = Resolve(keyword, userId);
 
         if (resolved.Uids.Count == 0)
         {
-            message = DescribeUnresolved(keyword, resolved);
+            message = DescribeUnresolved(keyword, resolved, userId);
             return null;
         }
 
@@ -252,8 +262,8 @@ public sealed class BusActionService
     }
 
     /// <summary>用「已經解析好的起訖」找路線（面板／UI 動作用）。</summary>
-    public IReadOnlyList<RouteOption> FindRoutesFor(LocationTarget origin, LocationTarget destination)
-        => _data.FindRoutes(origin, destination);
+    public IReadOnlyList<RouteOption> FindRoutesFor(LocationTarget origin, LocationTarget destination, ulong userId = 0)
+        => DataFor(userId).FindRoutes(origin, destination);
 
     // ─────────────────────────────────────────────────────
     //  查詢／取消自己的訂閱
@@ -329,7 +339,7 @@ public sealed class BusActionService
     /// 停在其他月台的路線就整條找不到（面板按 `g:` 時是取整個站區，所以面板找得到）。
     /// 這就是「同名站牌找不到」的根因。
     /// </summary>
-    private Resolved Resolve(string keyword)
+    private Resolved Resolve(string keyword, ulong userId = 0)
     {
         keyword = (keyword ?? "").Trim();
 
@@ -337,21 +347,23 @@ public sealed class BusActionService
             return new Resolved(EmptyTarget(), [], true, false, []);
 
         // 與面板相同：有強相符時只留強相符，不要被模糊相符的雜訊塞滿
-        var (shown, _) = PreferStrong(_data.Search.SearchGrouped(keyword));
+        var data = DataFor(userId);
+
+        var (shown, _) = PreferStrong(data.Search.SearchGrouped(keyword));
 
         if (shown.Count == 0)
             return new Resolved(EmptyTarget(), [], true, false, []);
 
-        var (uids, ambiguous, candidates) = StopPicks.ResolveDefaults(shown, _data);
+        var (uids, ambiguous, candidates) = StopPicks.ResolveDefaults(shown, data);
 
         if (ambiguous)
             return new Resolved(EmptyTarget(), [], true, true, candidates);
 
-        return new Resolved(_data.TargetFromStops(uids), uids, false, false, []);
+        return new Resolved(data.TargetFromStops(uids), uids, false, false, []);
     }
 
     /// <summary>找不到站牌／對到多個站區時要講的話（讓模型去問使用者，而不是自己猜）。</summary>
-    private string DescribeUnresolved(string keyword, Resolved resolved)
+    private string DescribeUnresolved(string keyword, Resolved resolved, ulong userId = 0)
     {
         if (resolved.Ambiguous)
         {
@@ -364,7 +376,7 @@ public sealed class BusActionService
         }
 
         return $"找不到符合「{keyword}」的站牌。請先問使用者正確的站名，或用 search_stops 查。" +
-               $"這份資料集裡有的站名例如：{string.Join("、", _data.ExampleStopNames(6))}。";
+               $"這份資料集裡有的站名例如：{string.Join("、", DataFor(userId).ExampleStopNames(6))}。";
     }
 
     private static LocationTarget EmptyTarget() => new() { DisplayName = "", CandidateStopUids = [] };

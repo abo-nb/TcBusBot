@@ -36,6 +36,9 @@ public sealed class UiTools
     private readonly ChatToolContext _context;
     private readonly ToolCallLog _log;
 
+    /// <summary>問的人是誰 —— 他可以用 `/bus city` 選城市，工具要跟著看同一份資料。</summary>
+    private ulong _userId => _context.UserId;
+
     /// <summary>模型要求附上的元件（由 LlmChatService 負責真的畫出來）。</summary>
     public UiRequest? PendingUi { get; private set; }
 
@@ -100,7 +103,7 @@ public sealed class UiTools
 
     private string SetStop(string keyword, bool isOrigin)
     {
-        var target = _actions.ResolveKeyword(keyword, out var message);
+        var target = _actions.ResolveKeyword(keyword, out var message, _userId);
         var label = isOrigin ? "起點" : "目的地";
 
         if (target is null)
@@ -168,7 +171,7 @@ public sealed class UiTools
     }
 
     private IReadOnlyList<RouteOption> _data_FindRoutes(BusSession session)
-        => _actions.FindRoutesFor(session.Origin!, session.Destination!);
+        => _actions.FindRoutesFor(session.Origin!, session.Destination!, _userId);
 
     [KernelFunction("subscribe_panel_routes")]
     [Description("用面板目前的起訖訂閱公車（等於他勾了路線之後按「訂閱這 N 條路線」）。" +

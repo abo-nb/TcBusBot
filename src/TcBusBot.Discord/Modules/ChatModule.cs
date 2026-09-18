@@ -1,6 +1,7 @@
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
+using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
 
 namespace TcBusBot.Discord.Modules;
@@ -25,6 +26,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly GuildPersonaStore _personas;
     private readonly PersonaGrantStore _grants;
     private readonly LlmDiagnostics _diagnostics;
+    private readonly UserCityStore _cities;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -38,7 +40,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         ILlmClient llm,
         GuildPersonaStore personas,
         PersonaGrantStore grants,
-        LlmDiagnostics diagnostics)
+        LlmDiagnostics diagnostics,
+        UserCityStore cities)
     {
         _options = options;
         _conversations = conversations;
@@ -47,6 +50,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         _personas = personas;
         _grants = grants;
         _diagnostics = diagnostics;
+        _cities = cities;
     }
 
     /// <summary>
@@ -74,7 +78,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .WithTitle("🤖 AI 聊天狀態")
             .WithColor(enabled ? new Color(0x2B, 0x6C, 0xB0) : new Color(0x5A, 0x5A, 0x5A))
             .AddField("啟用", enabled ? "✅ 已啟用" : "❌ 未啟用（主機沒有設定 LLM_API_KEY）", inline: false)
-            .AddField("服務城市", _options.MultiCity
+            .AddField("你要查的城市（`/bus city`）", _cities.Describe(Context.User.Id), inline: false)
+            .AddField("服務城市（主機載入的）", _options.MultiCity
                     ? $"{_options.CityDisplay}（同時服務多個城市，即時到站按城市分批查）"
                     : $"{_options.CityDisplay}（模型會被明確告知只回答這個縣市）", inline: false)
             .AddField("模型", enabled ? $"{_options.Model} @ {_options.EndpointHost}" : "—", inline: false)

@@ -46,8 +46,8 @@ services:
         sync: false
 
       # ── 選填但強烈建議：訂閱組存到 MongoDB（容器沒有持久化磁碟）──
-      # 服務哪個城市的公車（預設臺中）。可以同時多個，用逗號分隔：
-      #   Taichung,Tainan = 臺中＋臺南一起用（資料合併、ETA 按城市分批查）
+      # 要載入哪些城市的公車資料（預設臺中）。可以多個，用逗號分隔；
+      #   Taichung,Tainan = 使用者可以用 /bus city 自己選臺中或臺南（預設第一個）
       - key: BUS_CITY
         value: Taichung,Tainan
       - key: TCBUS_MONGO

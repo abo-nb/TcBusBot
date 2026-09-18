@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 655 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 665 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 655 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 665 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3859,34 +3859,32 @@ cfg.Llm.SystemPrompt = string.IsNullOrWhiteSpace(systemPrompt)
 | 沒給城市＝臺中檔名、給中文也對到同一個路徑 | 相容與正規化 |
 | 預設人格含 `{city}`，代入臺南後**不再出現**「查台中公車」、也不會留下沒被取代的 `{...}` | 人格跟著城市走 |
 
-#### 20.23.4 同時跑多個城市（`BUS_CITY=Taichung,Tainan`）
+#### 20.23.4 城市改成「**按使用者**選」（`/bus city`）
 
-使用者要的是「公車臺中＋臺南**同時**使用」。原本的設計是「一個行程一個城市」，
-分開跑兩個實例也可以，但訂閱、通知、AI 都要各自維護一份。
+使用者真正的需求是：**「讓要訂公車的人自己選」** —— 不是主機設定，也不是按伺服器。
+
+| 角色 | 決定什麼 | 怎麼決定 |
+| --- | --- | --- |
+| 主機 | **有哪些城市可以選**（要載入哪幾份資料） | `BUS_CITY=Taichung,Tainan` |
+| 使用者 | **我要查哪一個** | `/bus city 城市:臺南`（持久化在 `user_cities` blob，重啟後還在） |
 
 | 決定 | 為什麼 |
 | --- | --- |
-| `BUS_CITY` 接受**多個**城市（逗號／頓號／空白分隔） | 大家的輸入習慣不一樣；`ParseList` 去重、保留順序（第一個＝主要城市） |
-| 靜態資料**合併成一份** | 站牌 UID 有城市前綴（`TXG…`／`TNN…`）、路線 UID 也一樣，接起來不會撞。於是一個 `BusDataService` 同時服務兩個城市 |
-| 每個城市各自一份快取（`Stop.{City}.json`） | 沿用 §20.23 的設計：換城市不會讀到別的城市 |
-| **即時到站按城市分批查** | ⚠️ 這是多城市唯一會靜默出錯的地方：ETA 網址是 `/Bus/EstimatedTimeOfArrival/City/{City}`，把臺南的站牌拿去問臺中端點只會回空資料 → 使用者看到「訂閱了卻一直沒有到站時間」。作法是 `BusDataService` 保留 StopUID → 城市對照，`GroupByCity` 分批，`EtaPoller` 逐城市呼叫 |
-| 找不到城市對應的站牌 → 歸到主要城市 | 舊快取沒有 `City` 欄位時，至少還查得到（不會整批靜默失效） |
-| 提示詞改成說明「同時服務兩個城市」 | 同名站牌可能在兩個城市都有，模型要依使用者提到的城市判斷，不確定就問 |
-| 內建最小資料集只在「剛好只有臺中」時使用 | 那份只有臺中走廊；跑兩個城市卻拿它當備援，會一半的站牌查不到 |
+| **每個城市各一份 `BusDataService`**，不是合併再過濾 | 合併的做法要在每一條查詢路徑都記得加城市過濾（搜尋、站區群組、路線號碼、轉乘、面板選項…）。漏掉任何一條，那條路徑就會吐出別的城市站牌**而且不會報錯**。這個專案已經吃過同一類的虧（快取檔名沒帶城市、ETA 沒按城市分批），所以改成「選哪一份由目錄決定」——**不可能看錯城市** |
+| `BusDataCatalog` 是「哪個使用者用哪一份資料」的唯一入口 | 面板、元件互動、LLM 工具全部走它，就不會出現「某一條路徑忘了看城市」 |
+| 按**使用者**（不是按伺服器） | 同一個伺服器裡有人通勤看臺中、有人回老家看臺南。按伺服器要整群人共用一個選擇；按使用者最貼近「誰要訂公車，就由誰決定」 |
+| **預設＝`BUS_CITY` 的第一個** | 沒選過的人行為跟以前完全一樣（「默認臺中」） |
+| 即時到站按**站牌自己的城市**分批（不是按使用者的選擇） | 換城市不該讓舊訂閱失效；同一個人可能兩邊都訂了 |
+| AI 的「服務範圍」也用**問的人**選的城市 | 否則小明選了臺南，模型還是跟他聊臺中路線（實際被回報過的問題） |
 
-驗收：`tcbus selftest` 新增 **12 項**（多城市解析與去重、顯示名、`TdxOptions.EffectiveCities`、
-資料集的 `Cities`／`CityOf`／`GroupByCity` 分組、查詢網址帶對城市、未知站牌的 fallback、
-多城市提示詞），`--dryrun` 另外用 IL 掃描確認 `EtaPoller` 真的呼叫 `GroupByCity`。
+驗收（`tcbus selftest` 新增 **11 項**）：沒選過用預設、**每個人各自選**、不在清單裡的城市不會被設定、
+可改回、可忘掉選擇、單一城市時沒有選擇意義、說明文字、資料目錄同伺服器不同人拿到不同城市、
+ETA 分批用站牌自己的城市。`--dryrun`：`/bus` 7 個子指令（含 `city`）、IL 掃描確認 `EtaPoller`
+用 `BusDataCatalog.GroupByCity`。
 
-真實資料實測：`BUS_CITY=Taichung,Tainan` → **25,365 個站牌、1,078 筆路線站序**
-（臺中 14,036 ＋ 臺南 11,329），`--dryrun` exit 0。
+真實資料：`BUS_CITY=Taichung,Tainan` → 臺中 14,036 ＋ 臺南 11,329 個站牌，兩份各自獨立，`--dryrun` exit 0。
 
-`--dryrun` 新增「服務城市檢查」：城市代碼認得、快取檔名帶城市、**抽查資料裡真的有該城市的地名**
-（例：臺南 → 臺南車站／安平／成大，實測 3/3）。
-
-真實 API 驗證：`BUS_CITY=Tainan` 從 TDX 抓到 **11,329 個站牌、323 筆路線站序**，
-`--dryrun` exit 0（臺中為 14,036／755）。
-
+---
 ---
 
 ### 20.24 「LLM 有沒有接上」的可觀測性（`/ai test`、`/ai status`、`LlmDiagnostics`）
