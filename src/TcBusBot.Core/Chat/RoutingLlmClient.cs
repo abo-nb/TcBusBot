@@ -24,11 +24,13 @@ public sealed class RoutingLlmClient : ILlmClient
 {
     private readonly ILlmClient _main;
     private readonly ILlmClient? _judge;
+    private readonly LlmDiagnostics? _diagnostics;
 
-    public RoutingLlmClient(ILlmClient main, ILlmClient? judge)
+    public RoutingLlmClient(ILlmClient main, ILlmClient? judge, LlmDiagnostics? diagnostics = null)
     {
         _main = main;
         _judge = judge;
+        _diagnostics = diagnostics;
     }
 
     /// <summary>有幾個模型可以用（1 = 只有主模型）。</summary>
@@ -46,7 +48,33 @@ public sealed class RoutingLlmClient : ILlmClient
             : $"{_main.Describe()}｜短判斷走：{_judge.Describe()}";
 
     public Task<LlmReply> CompleteAsync(LlmRequest request, CancellationToken cancellationToken)
-        => For(request).CompleteAsync(request, cancellationToken);
+        => CompleteAndRecordAsync(request, cancellationToken);
+
+    /// <summary>
+    /// 呼叫 ＋ 記一筆診斷（成功或失敗都記）。
+    ///
+    /// 為什麼記在這裡而不是各個偵測器：這一層是**所有**呼叫的必經之路
+    /// （聊天、工具、短判斷都走它），所以在這裡記就一定記得到 ——
+    /// 「LLM 到底有沒有接上」才回答得出來。
+    /// </summary>
+    private async Task<LlmReply> CompleteAndRecordAsync(LlmRequest request, CancellationToken cancellationToken)
+    {
+        var started = DateTimeOffset.UtcNow;
+
+        try
+        {
+            var reply = await For(request).CompleteAsync(request, cancellationToken);
+            _diagnostics?.Record(request, reply, null, DateTimeOffset.UtcNow - started);
+            return reply;
+        }
+        catch (Exception ex)
+        {
+            // ⚠️ 例外一定要原樣往上丟（呼叫端靠它決定「先不出聲」或回一句錯誤），
+            //    這裡只多做一件事：把訊息留下來給 `/ai status` 看。
+            _diagnostics?.Record(request, null, ex, DateTimeOffset.UtcNow - started);
+            throw;
+        }
+    }
 
     /// <summary>
     /// 需要幾個模型就建幾個：<paramref name="judgeOptions"/> 為 null（或主設定沒有另外指定判斷模型）時
@@ -59,26 +87,27 @@ public sealed class RoutingLlmClient : ILlmClient
     /// 這個錯真的發生過，而且只有**真的打一次 API** 才看得出來（設定看起來完全正常）。
     /// </summary>
     public static (RoutingLlmClient Client, string Message) Create(
-        LlmOptions mainOptions, LlmOptions? judgeOptions, Func<LlmOptions, (ILlmClient?, string)> factory)
+        LlmOptions mainOptions, LlmOptions? judgeOptions, Func<LlmOptions, (ILlmClient?, string)> factory,
+        LlmDiagnostics? diagnostics = null)
     {
         var (main, mainMessage) = factory(mainOptions);
 
-        if (main is null) return (new RoutingLlmClient(DisabledLlmClient.Instance, null), mainMessage);
+        if (main is null) return (new RoutingLlmClient(DisabledLlmClient.Instance, null, diagnostics), mainMessage);
 
         if (judgeOptions is null || !mainOptions.HasSeparateJudgeModel)
-            return (new RoutingLlmClient(main, null), mainMessage);
+            return (new RoutingLlmClient(main, null, diagnostics), mainMessage);
 
         var (judge, judgeMessage) = factory(judgeOptions);
 
         if (judge is null)
         {
             // 判斷模型建不起來**不可以**拖垮整個 AI 功能 —— 退回只有主模型
-            return (new RoutingLlmClient(main, null),
+            return (new RoutingLlmClient(main, null, diagnostics),
                 $"{mainMessage}\n⚠️  判斷用的模型（{judgeOptions.JudgeModel}）建立失敗 → 短判斷改用主模型：" +
                 judgeMessage);
         }
 
-        return (new RoutingLlmClient(main, judge),
+        return (new RoutingLlmClient(main, judge, diagnostics),
             $"{mainMessage}\n✅ 短判斷（是在跟我說話嗎／換話題了沒）走另一個模型：{judge.Describe()}");
     }
 }

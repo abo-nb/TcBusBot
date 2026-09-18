@@ -1258,7 +1258,7 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset" };
+            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "test" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)
@@ -1315,6 +1315,19 @@ public static class DryRun
             else
                 Console.WriteLine("  ✔ /ai pset 真的會擋人（LLM_ADMIN_IDS 或來源同意）" +
                                   "＋複製前確認來源，而且走的是可測試的 SetRules／CopyFrom");
+
+            // ── /ai test：用一次真的呼叫確認「AI 有沒有接上」──────────
+            var testAsync = typeof(ChatModule).GetMethod(nameof(ChatModule.TestAsync));
+            var testCalls = testAsync is null ? [] : CollectCalls(testAsync, resolveAll: true);
+
+            if (testAsync is null)
+                Problem("找不到 /ai test —— 使用者沒辦法自己確認 AI 接不接得上");
+            else if (!testCalls.Contains("ILlmClient.CompleteAsync"))
+                Problem("/ai test 沒有真的呼叫 LLM（那它就只會說「應該可以吧」）");
+            else if (!testCalls.Contains("ChatModule.CanSetPersona"))
+                Problem("/ai test 沒有擋人 —— 任何人都能拿它燒額度");
+            else
+                Console.WriteLine("  ✔ /ai test 會真的呼叫一次（失敗時把 API 的原話貼出來），而且只有管理員能用");
 
             // ── 授權按鈕：同意的人要真的被檢查資格 ────────────
             var approver = typeof(PersonaGrantModule).GetMethod(nameof(PersonaGrantModule.IsApprover));

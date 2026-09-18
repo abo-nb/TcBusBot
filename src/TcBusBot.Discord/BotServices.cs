@@ -78,7 +78,12 @@ internal static class BotServices
         // ── LLM 聊天 ──────────────────────────────────────
         // ILlmClient **一定要註冊**（沒設定時是空物件）：模組的建構子參數
         // 只要有一個解析不到，Discord.Net 就建不出模組 → 整個 Bot 起不來。
-        services.AddSingleton<ILlmClient>(_ => CreateLlmClient(cfg.Llm, log));
+        //
+        // LlmDiagnostics 是「LLM 有沒有接上」的可觀測性：最後幾次呼叫的結果
+        // （成功、錯誤訊息、耗時）會留著，`/ai status` 與 `/ai test` 直接講給使用者聽。
+        services.AddSingleton<LlmDiagnostics>();
+        services.AddSingleton<ILlmClient>(sp =>
+            CreateLlmClient(cfg.Llm, log, sp.GetRequiredService<LlmDiagnostics>()));
 
         services.AddSingleton<BusActionService>();
         services.AddSingleton(sp => new GuildPersonaStore(
@@ -137,7 +142,7 @@ internal static class BotServices
     /// 再用 <see cref="RoutingLlmClient"/> 把短判斷導過去 ——
     /// 為什麼不共用一個客戶端、在請求裡換模型名稱：SK 這個版本會忽略 `ModelId`（實測）。
     /// </summary>
-    private static ILlmClient CreateLlmClient(LlmOptions options, Action<string> log)
+    private static ILlmClient CreateLlmClient(LlmOptions options, Action<string> log, LlmDiagnostics diag)
     {
         if (!options.IsConfigured)
         {
@@ -154,7 +159,7 @@ internal static class BotServices
         {
             var (created, createdMessage) = SemanticKernelLlmClient.Create(opts);
             return ((ILlmClient?)created, createdMessage);
-        });
+        }, diag);
 
         log(message);
 

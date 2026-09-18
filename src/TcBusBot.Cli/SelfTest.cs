@@ -3477,6 +3477,68 @@ public static class SelfTest
 
         Check("不會留下沒被取代的 {city}",
             !taichungPrompt.Contains('{') && !tainanPrompt.Contains('{'));
+
+        // ── 4) 「LLM 有沒有接上」的可觀測性（/ai status 要講得出來）──────
+        //     使用者反應「LLM 似乎沒有接上」時，最難的是看不出是哪一種壞掉：
+        //     金鑰無效、餘額不足、模型名稱打錯、逾時，還是根本沒被叫到。
+        var diag = new LlmDiagnostics();
+
+        Check("還沒呼叫過時，說明也講得清楚（不是空白）",
+            diag.Describe().Contains("還沒有任何呼叫紀錄", StringComparison.Ordinal), diag.Describe());
+
+        LlmRequest Probe(string tag) => new(
+            SystemPrompt: "x", History: [],
+            Incoming: new ChatTurn(ChatRole.User, "小明", 1UL, 1UL, "ping", DateTimeOffset.UtcNow),
+            MaxTokens: 8, Temperature: 0, Tag: tag);
+
+        diag.Record(Probe("chat"), new LlmReply("OK", 120, 5, true, "deepseek-flash",
+            TimeSpan.FromSeconds(1.2), null), null, TimeSpan.FromSeconds(1.2));
+
+        Check("★ 成功的呼叫記得下模型與用量",
+            diag.Last is { Ok: true, Model: "deepseek-flash", InputTokens: 120 }
+            && diag.Describe().Contains("deepseek-flash", StringComparison.Ordinal),
+            diag.Describe().Replace("\n", " ｜ "));
+
+        diag.Record(Probe("addressee"), null, new LlmException("呼叫失敗：401 Unauthorized（金鑰無效）"),
+            TimeSpan.FromSeconds(0.3));
+
+        Check("★ 失敗的呼叫記得下**錯誤訊息**（這才是「接不上」的證據）",
+            diag.LastFailure is { Ok: false } failure
+            && failure.Error!.Contains("401", StringComparison.Ordinal)
+            && diag.Describe().Contains("401", StringComparison.Ordinal),
+            diag.Describe().Replace("\n", " ｜ "));
+
+        diag.Record(Probe("chat"), new LlmReply("OK", 10, 2, true, "deepseek-flash",
+            TimeSpan.FromSeconds(0.8), null), null, TimeSpan.FromSeconds(0.8));
+
+        Check("★ 之後若成功了，會同時標出「最後一次」與「最後一次失敗」",
+            diag.Describe().Contains("最後一次：", StringComparison.Ordinal)
+            && diag.Describe().Contains("最後一次失敗", StringComparison.Ordinal)
+            && diag.Describe().Contains("401", StringComparison.Ordinal),
+            diag.Describe().Replace("\n", " ｜ "));
+
+        Check("★ 成功與失敗的筆數都算得出來",
+            diag.Total == 3 && diag.FailureCount == 1, $"{diag.FailureCount}/{diag.Total}");
+
+        for (var i = 0; i < LlmDiagnostics.MaxEntries + 5; i++)
+            diag.Record(Probe("chat"), new LlmReply("OK", 1, 1, true, "m", TimeSpan.Zero, null), null, TimeSpan.Zero);
+
+        Check("★ 診斷紀錄有上限（只留最近幾筆，不會無限長大）",
+            diag.Total == LlmDiagnostics.MaxEntries, $"{diag.Total} 筆");
+
+        // 路由層一定要把每一次呼叫都記下來（不然 /ai status 會說「沒有紀錄」）
+        var diagMain = new CountingLlmClient("OK");
+        var diagRouter = new RoutingLlmClient(diagMain, null, new LlmDiagnostics());
+        var empty = new LlmDiagnostics();
+        var routing = new RoutingLlmClient(diagMain, null, empty);
+
+        routing.CompleteAsync(Probe("chat"), default).GetAwaiter().GetResult();
+
+        Check("★ 經過路由層的呼叫都會被記下來（/ai status 才有東西可看）",
+            empty.Total == 1 && empty.Last!.Ok, $"{empty.Total} 筆");
+
+        Check("路由層沒有診斷物件時也不會壞（可選參數）",
+            diagRouter.For(Probe("chat")) is not null);
     }
 
     /// <summary>

@@ -24,6 +24,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly ILlmClient _llm;
     private readonly GuildPersonaStore _personas;
     private readonly PersonaGrantStore _grants;
+    private readonly LlmDiagnostics _diagnostics;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -36,7 +37,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         WeeklyTokenBudget budget,
         ILlmClient llm,
         GuildPersonaStore personas,
-        PersonaGrantStore grants)
+        PersonaGrantStore grants,
+        LlmDiagnostics diagnostics)
     {
         _options = options;
         _conversations = conversations;
@@ -44,6 +46,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         _llm = llm;
         _personas = personas;
         _grants = grants;
+        _diagnostics = diagnostics;
     }
 
     /// <summary>
@@ -108,6 +111,14 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                       (snapshot.AmbientTurnCount > 0 ? $"（含 {snapshot.AmbientTurnCount} 則偷聽到的閒聊）" : "") +
                       (snapshot.Idle is { } idle ? $"（最後一次 {idle.TotalMinutes:0} 分鐘前）" : ""),
                 inline: false)
+            .AddField("最近幾次呼叫（接不接得上就看這裡）",
+                !enabled
+                    ? "—（沒有設定金鑰）"
+                    : _diagnostics.Describe() +
+                      (Context.Guild is null || _options.AllowDm
+                          ? ""
+                          : "\nℹ️ 私訊不回（`LLM_ALLOW_DM=false`）—— 請在伺服器頻道 @ 我"),
+                inline: false)
             .AddField("記憶容量（環境變數可調）",
                 _options.DescribeMemory(),
                 inline: false)
@@ -120,7 +131,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                         : $"✅ 已啟用（回完話後開始聽：最多判斷 {_options.EavesdropMaxMessages} 則／" +
                           $"安靜 {_options.EavesdropSeconds} 秒後回到「等 @」）",
                 inline: false)
-            .WithFooter("用法：@ 我 或 回覆我的訊息就會回話｜/ai forget 可以清掉這個頻道的記憶");
+            .WithFooter("用法：@ 我 或 回覆我的訊息就會回話｜/ai test 可以測 AI 通不通｜/ai forget 清記憶");
 
         // 誰在花額度（全域額度的代價就是需要看得出來誰在花）
         var top = _budget.Usage.ByGuild
@@ -390,6 +401,120 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                "我會在**那個伺服器**發一則通知，那邊的管理員按「同意」之後，" +
                "你就能維護**這裡**的設定\n" +
                (listConfigured ? "" : "\n（目前主機端沒有設定 `LLM_ADMIN_IDS`，所以名單那條路是空的）");
+    }
+
+    /// <summary>
+    /// `/ai test`：**用一次真的呼叫**確認 LLM 管線通不通。
+    ///
+    /// 為什麼需要這個指令：使用者說「LLM 好像沒接上」時，最常見的診斷困難是
+    /// 「看不出來是哪一種壞掉」—— 金鑰無效、餘額不足、模型名稱打錯、逾時、
+    /// 還是根本沒被叫到？這個指令直接打一次，成功就回覆內容與用量，
+    /// 失敗就把**API 的原話**貼出來（例如 `401 Unauthorized` 就是金鑰問題）。
+    ///
+    /// 會花掉一點額度（一次短呼叫，幾十個 token），所以只開放給
+    /// 管理員／已授權的人。
+    /// </summary>
+    [SlashCommand("test", "用一次真的呼叫確認 AI 有沒有接上（會花掉一點額度）")]
+    public async Task TestAsync(
+        [Summary("text", "要對它說的話（留空＝最簡單的 ping）")] string? text = null)
+    {
+        var guildId = Context.Guild?.Id ?? 0;
+
+        if (!CanSetPersona(guildId, Context.User.Id))
+        {
+            await RespondAsync(NotAuthorizedMessage(), ephemeral: true);
+            return;
+        }
+
+        await DeferAsync(ephemeral: true);
+
+        var probe = text?.Trim() is { Length: > 0 } t ? t : "ping：請只回一個字 OK";
+
+        var request = new LlmRequest(
+            SystemPrompt: "你是一個測試用的助理。只回答一個簡短的句子。",
+            History: [],
+            Incoming: new ChatTurn(
+                ChatRole.User, Context.User.Username, Context.User.Id, 0UL,
+                probe, DateTimeOffset.UtcNow),
+            MaxTokens: 64,
+            Temperature: 0,
+            Tag: "probe");
+
+        var started = DateTimeOffset.UtcNow;
+        LlmReply? reply = null;
+        string? error = null;
+
+        try
+        {
+            reply = await _llm.CompleteAsync(request, CancellationToken.None);
+
+            // 真的呼叫要算進每週額度（不然「測試」會變成繞過額度的後門）
+            _budget.Record(reply.InputTokens, reply.OutputTokens, guildId, DateTimeOffset.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            error = ex is LlmException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}";
+        }
+
+        var elapsed = DateTimeOffset.UtcNow - started;
+
+        if (reply is not null)
+        {
+            await FollowupAsync(embed: new EmbedBuilder()
+                .WithColor(new Color(0x2E, 0x8B, 0x57))
+                .WithTitle("✅ AI 接得上")
+                .WithDescription($"它回你：{Truncate(reply.Text, 500)}")
+                .AddField("模型", reply.Model, inline: true)
+                .AddField("用量", $"in {reply.InputTokens} / out {reply.OutputTokens}", inline: true)
+                .AddField("往返時間", $"{elapsed.TotalSeconds:0.0} 秒", inline: true)
+                .AddField("這一週剩下",
+                    _budget.Limit <= 0
+                        ? "不限"
+                        : $"{Math.Max(0, _budget.Limit - _budget.Usage.TotalTokens):N0} tokens",
+                    inline: false)
+                .WithFooter("這次呼叫也會算進每週額度")
+                .Build(), ephemeral: true);
+
+            return;
+        }
+
+        await FollowupAsync(embed: new EmbedBuilder()
+            .WithColor(new Color(0xC0, 0x39, 0x2B))
+            .WithTitle("❌ AI 呼叫失敗")
+            .WithDescription($"`{Truncate(error ?? "（沒有錯誤訊息）", 800)}`")
+            .AddField("設定", $"{_options.Model} @ {_options.EndpointHost}" +
+                             (_options.HasSeparateJudgeModel ? $"（判斷用：{_options.JudgeModel}）" : ""),
+                inline: false)
+            .AddField("怎麼查", CheckList(error), inline: false)
+            .WithFooter($"{elapsed.TotalSeconds:0.0} 秒後失敗")
+            .Build(), ephemeral: true);
+    }
+
+    /// <summary>依錯誤訊息給對應的檢查方向（不然使用者只看到一串英文）。</summary>
+    private static string CheckList(string? error)
+    {
+        var text = error ?? "";
+
+        if (text.Contains("401", StringComparison.Ordinal) || text.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase))
+            return "🔑 **金鑰無效**：`LLM_API_KEY` 打錯或被撤銷了（到服務供應商的後台重新產生一組）。";
+
+        if (text.Contains("402", StringComparison.Ordinal) || text.Contains("Insufficient", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("balance", StringComparison.OrdinalIgnoreCase))
+            return "💳 **餘額不足**：到服務供應商的後台儲值。";
+
+        if (text.Contains("404", StringComparison.Ordinal) || text.Contains("model", StringComparison.OrdinalIgnoreCase)
+            && text.Contains("not", StringComparison.OrdinalIgnoreCase))
+            return "🏷 **模型名稱不對**：檢查 `LLM_MODEL`／`LLM_JUDGE_MODEL`（錯誤訊息裡通常會列出可用的名稱）。";
+
+        if (text.Contains("timeout", StringComparison.OrdinalIgnoreCase) || text.Contains("逾時", StringComparison.Ordinal))
+            return "⏱ **逾時**：服務商太慢或網路不通；可以調高 `LLM_TIMEOUT_SECONDS`。";
+
+        if (text.Contains("429", StringComparison.Ordinal) || text.Contains("rate", StringComparison.OrdinalIgnoreCase))
+            return "🚦 **被限流**：等幾分鐘再試，或降低呼叫頻率。";
+
+        return "• 先看「設定」那一行的模型與端點對不對\n" +
+               "• 再到服務供應商後台確認金鑰與餘額\n" +
+               "• 需要更多線索：`/ai status` 看最近幾次呼叫（含失敗訊息）";
     }
 
     private static string Truncate(string text, int max)

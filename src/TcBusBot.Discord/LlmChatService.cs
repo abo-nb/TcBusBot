@@ -119,7 +119,13 @@ public sealed class LlmChatService : IDisposable
         var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id ?? 0;
 
         // 私訊預設不回（沒有「@ 機器人」這個動作，容易被誤觸）
-        if (guildId == 0 && !_options.AllowDm) return;
+        if (guildId == 0 && !_options.AllowDm)
+        {
+            // 但**要說一聲**：很多人是用私訊測試的，完全沒有回應會被當成「壞掉了」。
+            // 每個人最多講一次（6 小時內不重複），避免有人拿私訊洗頻。
+            await ExplainDirectMessageAsync(userMessage);
+            return;
+        }
 
         var raw = message.Content ?? "";
         var referenced = userMessage.ReferencedMessage;
@@ -360,9 +366,34 @@ public sealed class LlmChatService : IDisposable
         => (message.Channel as SocketGuildChannel)?.Guild.Id ?? 0;
 
     /// <summary>
+    /// 「私訊預設不回」的說明（每個人最多講一次）。
+    ///
+    /// 為什麼要講：使用者用私訊測試時什麼都收不到，很容易下結論「LLM 沒接上」——
+    /// 但其實只是這個 Bot 刻意不在私訊回話（私訊沒有「@ 機器人」這個動作，容易被誤觸）。
+    /// </summary>
+    private async Task ExplainDirectMessageAsync(SocketUserMessage message)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        if (_dmExplained.TryGetValue(message.Author.Id, out var last) && now - last < TimeSpan.FromHours(6))
+            return;
+
+        _dmExplained[message.Author.Id] = now;
+        Console.WriteLine($"[llm] 收到私訊（{message.Author.Username}）→ 回一句說明（私訊預設不回）");
+
+        await SafeReplyAsync(message,
+            "📮 我預設**不在私訊裡回話**（私訊沒有「@ 我」這個動作，容易被誤觸），所以先前的訊息我都沒回。\n" +
+            "請到**伺服器頻道**裡 @ 我，或回覆我的訊息。\n\n" +
+            "（主機端要開放私訊的話：設定 `LLM_ALLOW_DM=true`。）");
+    }
+
+    /// <summary>「私訊預設不回」的說明有沒有講過的紀錄（每個人 6 小時一次）。</summary>
+    private readonly ConcurrentDictionary<ulong, DateTimeOffset> _dmExplained = new();
+
+    /// <summary>
     /// 這則訊息要不要進到 AI 流程？三個入口：**@ 它**、**回覆它**（含回覆記憶裡的訊息）、
     /// **正在偷聽**。
-    ///
+
     /// ⚠️ 抽成公開的純函式是因為這裡真的出過大包：偷聽的程式碼寫好了，
     /// 但上面那行 `if (!mentioned && !replyAddressed) return;` 會在到達偷聽之前就返回，
     /// 所以「回完話後繼續聽」**從來沒有真的生效過** —— 使用者看到的是
