@@ -63,7 +63,7 @@ public static class Program
         }
 
         // ── 1) 靜態資料 ────────────────────────────────────
-        TaichungBusDataService data;
+        BusDataService data;
         TdxApiClient? api = null;
         string sourceDesc;
 
@@ -75,7 +75,7 @@ public static class Program
                 // 否則 TDX 回傳的 gzip 內容會讓 JSON 解析失敗。
                 api = new TdxApiClient(TdxApiClient.CreateHttpClient(), cfg.Tdx);
                 var set = await StaticDataLoader.LoadAsync(api, cfg.Tdx, cfg.Refresh, Console.WriteLine);
-                data = new TaichungBusDataService();
+                data = new BusDataService();
                 data.Load(set.Stops, set.StopOfRoutes, set.Routes);
                 sourceDesc = api.IsVisitorMode
                     ? "TDX 台中公車（訪客模式：沒有 API 金鑰，每日 20 次上限）"

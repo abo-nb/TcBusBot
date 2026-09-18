@@ -87,14 +87,14 @@ public sealed class MergeGroupsModal : IModal
 [Group("bus", "台中公車訂閱")]
 public sealed class BusModule : BusModuleBase
 {
-    private readonly TaichungBusDataService _data;
+    private readonly BusDataService _data;
     private readonly SubscriptionService _subs;
     private readonly BusSessionStore _sessions;
     private readonly BotRuntime _runtime;
     private readonly SavedGroupStore _savedGroups;
 
     public BusModule(
-        TaichungBusDataService data,
+        BusDataService data,
         SubscriptionService subs,
         BusSessionStore sessions,
         BotRuntime runtime,

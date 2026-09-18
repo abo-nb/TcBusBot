@@ -195,7 +195,7 @@ public static class SelfTest
             StopNameNormalizer.ForGroup("靜宜大學") == StopNameNormalizer.ForGroup("静宜大学"));
     }
 
-    private static void TestFuzzySearch(TaichungBusDataService data)
+    private static void TestFuzzySearch(BusDataService data)
     {
         Check($"搜尋索引已建立（{data.Search.EntryCount} 筆）", data.Search.EntryCount > 50);
 
@@ -233,7 +233,7 @@ public static class SelfTest
             string.Join(" / ", grouped.Take(6).Select(g => $"{g.DisplayName}({g.Hits.Count})")));
     }
 
-    private static void TestGrouping(TaichungBusDataService data)
+    private static void TestGrouping(BusDataService data)
     {
         var gA = data.GetGroupKeyForStop("TXG12251");   // 臺中車站(A月台)
         var gB = data.GetGroupKeyForStop("TXG11020");   // 臺中車站(臺灣大道)
@@ -253,7 +253,7 @@ public static class SelfTest
         Check("群組顯示名為人類可讀的站區名", group?.DisplayName == "臺中車站", group?.DisplayName);
     }
 
-    private static (LocationTarget Origin, LocationTarget Dest) TestRouteMatching(TaichungBusDataService data)
+    private static (LocationTarget Origin, LocationTarget Dest) TestRouteMatching(BusDataService data)
     {
         // 起點：使用者勾了「臺中車站」整組 + 干城站
         var origin = data.TargetFromStops(new[] { "TXG12251", "TXG11020", "TXG12769" });
@@ -296,7 +296,7 @@ public static class SelfTest
     }
 
     private static SubscriptionService TestSubscriptionCreation(
-        TaichungBusDataService data, LocationTarget origin, LocationTarget dest)
+        BusDataService data, LocationTarget origin, LocationTarget dest)
     {
         var routes = data.FindRoutes(origin, dest);
         var subs = new SubscriptionService();
@@ -488,7 +488,7 @@ public static class SelfTest
 
     // ─────────────────────────────────────────────────────
 
-    private static void TestSimplifiedInput(TaichungBusDataService data)
+    private static void TestSimplifiedInput(BusDataService data)
     {
         Console.WriteLine($"  ℹ 簡繁轉換來源：{(ChineseText.UsesWindowsApi ? "Windows LCMapStringEx（完整對照表）" : "內建字表（覆蓋率較低）")}");
 
@@ -920,7 +920,7 @@ public static class SelfTest
     /// 多段行程的訂閱組、合併、以及復原。
     /// 這幾個都是「一次影響很多東西」的操作，壞掉的代價很高，所以測得細一點。
     /// </summary>
-    private static void TestMergeAndUndo(TaichungBusDataService data)
+    private static void TestMergeAndUndo(BusDataService data)
     {
         const ulong user = 42UL;
 
@@ -1097,7 +1097,7 @@ public static class SelfTest
     ///   * 通知去重狀態必須還在（否則復原後同一班車會被再通知一次）
     ///   * 別人的訂閱不能被動到
     /// </summary>
-    private static void TestEndTracking(TaichungBusDataService data, LocationTarget origin, LocationTarget dest)
+    private static void TestEndTracking(BusDataService data, LocationTarget origin, LocationTarget dest)
     {
         const ulong me = 77UL;
         const ulong other = 78UL;
@@ -1486,7 +1486,7 @@ public static class SelfTest
     ///
     /// 全程不需要 LLM、不需要網路 —— 模型講什麼都只是字串輸入。
     /// </summary>
-    private static void TestBusActions(TaichungBusDataService data, LocationTarget origin, LocationTarget dest)
+    private static void TestBusActions(BusDataService data, LocationTarget origin, LocationTarget dest)
     {
         const ulong me = 555UL;
         const ulong other = 556UL;
@@ -2411,7 +2411,7 @@ public static class SelfTest
     /// （去回程各一組、專用道與慢車道各一組），用 UID 比對幾乎找不到轉乘點。
     /// 這裡用**自己造的資料集**驗演算法本身（fixture 是單一走廊，不一定有轉乘案例）。
     /// </summary>
-    private static void TestBusSearchPlus(TaichungBusDataService realData, LocationTarget origin, LocationTarget dest)
+    private static void TestBusSearchPlus(BusDataService realData, LocationTarget origin, LocationTarget dest)
     {
         // ── 1) 路線號碼查詢（真實 fixture）────────────────
         var service = new BusActionService(realData, Subs());
@@ -2494,7 +2494,7 @@ public static class SelfTest
 
         if (realCache is not null)
         {
-            var real = new TaichungBusDataService();
+            var real = new BusDataService();
             real.Load(realCache.Stops, realCache.StopOfRoutes, realCache.Routes);
 
             foreach (var (from, to) in new[] { ("干城站", "東海別墅"), ("靜宜大學", "逢甲大學"), ("新民高中", "霧峰") })
@@ -2520,7 +2520,7 @@ public static class SelfTest
     }
 
     /// <summary>造一個「A→共用站→C」的資料集：A 與 C 沒有共同站牌（UID 不同），只有同名站。</summary>
-    private static TaichungBusDataService BuildTransferFixture() => BuildFixture(
+    private static BusDataService BuildTransferFixture() => BuildFixture(
     [
         ("A", 0, "A 線", ["A1", "A2", "X1"]),        // X1 = 共用站（UID 與 C 線不同）
         ("C", 0, "C 線", ["X2", "C1", "C2"])         // X2 = 共用站（同名不同 UID）
@@ -2531,7 +2531,7 @@ public static class SelfTest
         ["X2"] = "共用站", ["C1"] = "中間C", ["C2"] = "終點C"
     });
 
-    private static TaichungBusDataService BuildSameNamePlatformFixture() => BuildFixture(
+    private static BusDataService BuildSameNamePlatformFixture() => BuildFixture(
     [
         ("P", 0, "P 線", ["P1", "M1", "P2"]),
         ("Q", 1, "Q 線", ["M9", "Q1", "Q2"])         // M9 與 M1 **同名**但不同 UID、不同方向
@@ -2547,7 +2547,7 @@ public static class SelfTest
     });
 
     /// <summary>把站名關鍵字變成候選集合（測試用；與 BusActionService 的規則一致：只取精確相符的群組）。</summary>
-    private static LocationTarget? TargetOf(TaichungBusDataService data, string keyword)
+    private static LocationTarget? TargetOf(BusDataService data, string keyword)
     {
         var groups = data.Search.SearchGrouped(keyword);
         var precise = groups.Where(g => g.IsDefaultPick).ToList();
@@ -2560,7 +2560,7 @@ public static class SelfTest
     }
 
     /// <summary>用假的站牌／站序造一個可查詢的資料集（測演算法用，不需要 TDX）。</summary>
-    private static TaichungBusDataService BuildFixture(
+    private static BusDataService BuildFixture(
         (string RouteUid, int Direction, string Name, string[] Stops)[] routes,
         Dictionary<string, string> stopNames)
     {
@@ -2609,7 +2609,7 @@ public static class SelfTest
             SubRoutes = new List<BusSubRoute>()
         }).ToList();
 
-        var data = new TaichungBusDataService();
+        var data = new BusDataService();
         data.Load(stops, stopOfRoutes, routeMetas);
         return data;
     }
@@ -2922,7 +2922,7 @@ public static class SelfTest
         }
 
         // ── 真實資料集（14,036 站牌）：這才是同名站牌問題真正會出現的地方 ──
-        var data = new TaichungBusDataService();
+        var data = new BusDataService();
         data.Load(cached.Stops, cached.StopOfRoutes, cached.Routes);
 
         var groups = StrongGroups(data, "臺中車站");
@@ -3006,7 +3006,7 @@ public static class SelfTest
     }
 
     /// <summary>與面板相同的過濾：有強相符時只留強相符。</summary>
-    private static IReadOnlyList<StopSearchGroupResult> StrongGroups(TaichungBusDataService data, string keyword)
+    private static IReadOnlyList<StopSearchGroupResult> StrongGroups(BusDataService data, string keyword)
     {
         var groups = data.Search.SearchGrouped(keyword);
         var strong = groups.Where(g => g.IsStrongMatch).ToList();

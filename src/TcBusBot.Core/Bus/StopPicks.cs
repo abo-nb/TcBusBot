@@ -44,7 +44,7 @@ public static class StopPicks
 
     public static StopPickSet Build(
         IReadOnlyList<StopSearchGroupResult> groups,
-        TaichungBusDataService data,
+        BusDataService data,
         IReadOnlyCollection<string>? selected = null)
     {
         var options = new List<StopPickOption>();
@@ -115,7 +115,7 @@ public static class StopPicks
     ///   `n:{群組ShortKey}:{索引}`  → 該群組裡第 N 種站名的全部站牌
     ///   `s:UID1,UID2,...`         → 直接指定（保留相容用）
     /// </summary>
-    public static List<string> Resolve(IEnumerable<string> values, TaichungBusDataService data)
+    public static List<string> Resolve(IEnumerable<string> values, BusDataService data)
     {
         var uids = new List<string>();
 
@@ -144,7 +144,7 @@ public static class StopPicks
 
     /// <summary>搜尋結果 → 預設勾選的 StopUID（面板的「一鍵套用」與 LLM 的預設都用這一條）。</summary>
     public static (List<string> Uids, bool Ambiguous, IReadOnlyList<string> Candidates) ResolveDefaults(
-        IReadOnlyList<StopSearchGroupResult> groups, TaichungBusDataService data)
+        IReadOnlyList<StopSearchGroupResult> groups, BusDataService data)
     {
         var set = Build(groups, data);
         var uids = Resolve(set.Defaults, data);

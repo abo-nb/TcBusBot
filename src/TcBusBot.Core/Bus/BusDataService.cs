@@ -43,7 +43,7 @@ internal sealed class TripStops
 ///   * 候選集合路線匹配 → 倒排索引 + 站序比較
 /// **建索引之後完全不需要再打 TDX 靜態資料 API。**
 /// </summary>
-public sealed class TaichungBusDataService
+public sealed class BusDataService
 {
     private readonly Dictionary<(string RouteUid, int Direction), TripStops> _trips = new();
     private readonly Dictionary<string, List<StopOccurrence>> _byStopUid = new(StringComparer.Ordinal);

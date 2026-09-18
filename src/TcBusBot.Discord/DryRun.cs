@@ -34,7 +34,7 @@ public static class DryRun
 
     private static string[]? _handlers;
 
-    public static int Run(TaichungBusDataService data, BotConfig cfg)
+    public static int Run(BusDataService data, BotConfig cfg)
     {
         _problems = 0;
         SeenIds.Clear();
@@ -484,7 +484,7 @@ public static class DryRun
     }
 
     /// <summary>邊界情況：搜尋不到、資料集很小、極端輸入。</summary>
-    private static void Boundary(TaichungBusDataService data)
+    private static void Boundary(BusDataService data)
     {
         Console.WriteLine();
         Console.WriteLine("▶ 邊界情況 A  搜尋資料集裡沒有的站名（例如「不存在站」）");
@@ -756,7 +756,7 @@ public static class DryRun
     /// 這裡用真實靜態資料算出預估筆數、用真實 payload 算出每筆大小。
     /// </summary>
     private static void PrintPollPlan(
-        TaichungBusDataService data, IReadOnlyCollection<string> pollStops, BotConfig cfg)
+        BusDataService data, IReadOnlyCollection<string> pollStops, BotConfig cfg)
     {
         Console.WriteLine();
         Console.WriteLine("▶ Step 8b  輪詢計畫（唯一會花點數的地方）");
@@ -861,7 +861,7 @@ public static class DryRun
         return list;
     }
 
-    private static List<string> Resolve(TaichungBusDataService data, IEnumerable<string> values)
+    private static List<string> Resolve(BusDataService data, IEnumerable<string> values)
     {
         var uids = new List<string>();
         foreach (var v in values)
@@ -1100,7 +1100,7 @@ public static class DryRun
     /// 而且炸在 <c>Ready</c> 事件裡 —— 使用者只會看到「指令不見了」，console 也不一定看得到。
     /// 這裡完全不連線，只建樹，離線就先抓到。
     /// </summary>
-    private static void AuditCommandTree(BotConfig cfg, TaichungBusDataService data, IServiceProvider services)
+    private static void AuditCommandTree(BotConfig cfg, BusDataService data, IServiceProvider services)
     {
         Console.WriteLine();
         Console.WriteLine("▶ 指令樹檢查  斜線指令 ↔ 模組註冊");
@@ -1978,7 +1978,7 @@ public static class DryRun
     ///      （順便確認值沒有被 Discord 的 100 字元上限截斷 —— 那會安靜地少掉候選站）
     ///   3. 解析出來的站牌數＝整個站區的站牌數（不是搜尋命中的數量）
     /// </summary>
-    private static void AuditStopPicks(TaichungBusDataService data)
+    private static void AuditStopPicks(BusDataService data)
     {
         Console.WriteLine();
         Console.WriteLine("▶ 站牌解析檢查  面板（BusUi）↔ LLM 工具（StopPicks）");
@@ -2058,7 +2058,7 @@ public static class DryRun
     /// 開面板 → 設起訖 → 找路線 → 訂閱 → 復原，
     /// 並且**每一步都驗 session 與元件真的建得出來**。
     /// </summary>
-    private static void AuditUiTools(TaichungBusDataService data)
+    private static void AuditUiTools(BusDataService data)
     {
         Console.WriteLine();
         Console.WriteLine("▶ 面板動作檢查  模型幫使用者按按鈕（ui plugin）");
@@ -2311,7 +2311,7 @@ public static class DryRun
     /// 回傳 null 代表容器建不起來（後面的檢查就跳過）。
     /// </summary>
     private static IServiceProvider? AuditDependencyInjection(
-        BotConfig cfg, TaichungBusDataService data, DiscordSocketClient client)
+        BotConfig cfg, BusDataService data, DiscordSocketClient client)
     {
         Console.WriteLine();
         Console.WriteLine("▶ DI 容器檢查  服務註冊 ↔ 建構子需求");

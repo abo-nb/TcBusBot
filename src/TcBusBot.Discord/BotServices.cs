@@ -40,7 +40,7 @@ internal static class BotServices
     /// </param>
     public static IServiceCollection Create(
         BotConfig cfg,
-        TaichungBusDataService data,
+        BusDataService data,
         TdxApiClient? api,
         DiscordSocketClient client,
         string sourceDesc,

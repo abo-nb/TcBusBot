@@ -40,13 +40,13 @@ public static class MiniFixtureSource
             "找不到 tests/fixtures。請用 --fixtures <路徑> 指定，或在專案根目錄執行。");
     }
 
-    public static TaichungBusDataService Load(string fixturesRoot)
+    public static BusDataService Load(string fixturesRoot)
     {
         var stops = LoadStops(Path.Combine(fixturesRoot, StopsFile.Replace('/', Path.DirectorySeparatorChar)));
         var (stopOfRoutes, routes) = LoadStopOfRoutes(
             Path.Combine(fixturesRoot, StopOfRouteFile.Replace('/', Path.DirectorySeparatorChar)));
 
-        var svc = new TaichungBusDataService();
+        var svc = new BusDataService();
         svc.Load(stops, stopOfRoutes, routes);
         return svc;
     }

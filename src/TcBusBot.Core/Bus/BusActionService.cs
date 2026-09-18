@@ -14,10 +14,10 @@ namespace TcBusBot.Core.Bus;
 /// </summary>
 public sealed class BusActionService
 {
-    private readonly TaichungBusDataService _data;
+    private readonly BusDataService _data;
     private readonly Subscriptions.SubscriptionService _subs;
 
-    public BusActionService(TaichungBusDataService data, Subscriptions.SubscriptionService subs)
+    public BusActionService(BusDataService data, Subscriptions.SubscriptionService subs)
     {
         _data = data;
         _subs = subs;

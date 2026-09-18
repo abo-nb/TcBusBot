@@ -14,14 +14,14 @@ namespace TcBusBot.Discord.Modules;
 /// </summary>
 public sealed class BusComponentModule : BusModuleBase
 {
-    private readonly TaichungBusDataService _data;
+    private readonly BusDataService _data;
     private readonly SubscriptionService _subs;
     private readonly BusSessionStore _sessions;
     private readonly BotRuntime _runtime;
     private readonly SavedGroupStore _savedGroups;
 
     public BusComponentModule(
-        TaichungBusDataService data,
+        BusDataService data,
         SubscriptionService subs,
         BusSessionStore sessions,
         BotRuntime runtime,

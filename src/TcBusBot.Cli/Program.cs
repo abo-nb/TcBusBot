@@ -57,7 +57,7 @@ public static class Program
 
     // ─────────────────────────────────────────────────────
 
-    private static int RunSearch(TaichungBusDataService data, string[] args)
+    private static int RunSearch(BusDataService data, string[] args)
     {
         if (args.Length == 0) { Console.Error.WriteLine("用法：tcbus search <站名關鍵字>"); return 1; }
 
@@ -96,7 +96,7 @@ public static class Program
         return 0;
     }
 
-    private static int RunRoute(TaichungBusDataService data, string[] args)
+    private static int RunRoute(BusDataService data, string[] args)
     {
         if (args.Length < 2) { Console.Error.WriteLine("用法：tcbus route <起點關鍵字> <目的地關鍵字>"); return 1; }
 
@@ -143,14 +143,14 @@ public static class Program
     /// 載入資料：預設優先使用本機快取（Bot 抓過的全量 TDX 資料），
     /// 沒有的話才退回內建最小資料集。這樣離線也能對真實資料做診斷。
     /// </summary>
-    private static TaichungBusDataService LoadData(string? fixtures, string dataMode, string cacheDir)
+    private static BusDataService LoadData(string? fixtures, string dataMode, string cacheDir)
     {
         if (dataMode is "auto" or "cache")
         {
             var cached = StaticDataLoader.TryReadCache(cacheDir);
             if (cached is not null)
             {
-                var svc = new TaichungBusDataService();
+                var svc = new BusDataService();
                 svc.Load(cached.Stops, cached.StopOfRoutes, cached.Routes);
                 var ts = StaticDataLoader.CacheTimestamp(cacheDir);
                 Console.WriteLine($"[資料] 本機快取 {cacheDir}（{svc.StopCount} 個站牌、{svc.TripCount} 筆路線站序，抓取於 {ts:yyyy-MM-dd HH:mm}）");
@@ -170,7 +170,7 @@ public static class Program
     /// 診斷「為什麼某條路線沒有被找出來」。
     /// 跟 Bot 用完全一樣的匹配邏輯，但會記錄每個被排除的原因。
     /// </summary>
-    private static int RunDiag(TaichungBusDataService data, string[] args)
+    private static int RunDiag(BusDataService data, string[] args)
     {
         if (args.Length < 2)
         {
@@ -222,7 +222,7 @@ public static class Program
         return 0;
     }
 
-    private static LocationTarget? ResolveTarget(TaichungBusDataService data, string keyword, string label)
+    private static LocationTarget? ResolveTarget(BusDataService data, string keyword, string label)
     {
         // ★ 與面板／LLM 工具走同一份站牌解析（StopPicks），不要自己再寫一套 ——
         //   以前這裡取 groups[0]，LLM 那條路取搜尋命中，三套不一致，

@@ -110,7 +110,7 @@ public static class BusUi
     public static Embed SearchResult(
         string keyword,
         IReadOnlyList<StopSearchGroupResult> groups,
-        TaichungBusDataService data,
+        BusDataService data,
         int hiddenFuzzyCount = 0)
     {
         var b = new EmbedBuilder().WithColor(Info);
@@ -198,7 +198,7 @@ public static class BusUi
     public static MessageComponent SearchComponents(
         bool isOrigin,
         IReadOnlyList<StopSearchGroupResult> groups,
-        TaichungBusDataService data,
+        BusDataService data,
         IReadOnlyCollection<string> selected)
     {
         var options = BuildStopOptions(groups, data, selected);
@@ -241,17 +241,17 @@ public static class BusUi
     /// 同名站牌就找不到 —— 面板與 AI 對同一句話必須給出同一組站牌。
     /// </summary>
     public static List<string> ResolveStopValues(
-        IEnumerable<string> values, TaichungBusDataService data)
+        IEnumerable<string> values, BusDataService data)
         => StopPicks.Resolve(values, data);
 
     /// <summary>使用者沒有手動勾選時，預設要勾的項目（強相符的群組／站牌）。</summary>
     public static List<string> DefaultStopPicks(
-        IReadOnlyList<StopSearchGroupResult> groups, TaichungBusDataService data)
+        IReadOnlyList<StopSearchGroupResult> groups, BusDataService data)
         => StopPicks.Build(groups, data).Defaults.ToList();
 
     /// <summary>「全選」要帶入的值 —— 必須與實際存在的選項完全一致。</summary>
     public static List<string> AllStopValues(
-        IReadOnlyList<StopSearchGroupResult> groups, TaichungBusDataService data)
+        IReadOnlyList<StopSearchGroupResult> groups, BusDataService data)
         => StopPicks.Build(groups, data).AllValues.ToList();
 
     /// <summary>
@@ -262,7 +262,7 @@ public static class BusUi
     /// </summary>
     private static StopOptions BuildStopOptions(
         IReadOnlyList<StopSearchGroupResult> groups,
-        TaichungBusDataService data,
+        BusDataService data,
         IReadOnlyCollection<string> selected)
     {
         var set = StopPicks.Build(groups, data, selected);
@@ -296,7 +296,7 @@ public static class BusUi
         List<string> AllValues);
 
     public static Embed PickedSummary(bool isOrigin, IReadOnlyList<string> stopUids,
-        IReadOnlyList<string> groupNames, TaichungBusDataService data)
+        IReadOnlyList<string> groupNames, BusDataService data)
     {
         var title = isOrigin ? "起點" : "目的地";
         if (stopUids.Count == 0)
