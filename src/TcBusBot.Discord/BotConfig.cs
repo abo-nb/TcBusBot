@@ -372,6 +372,15 @@ public sealed class BotConfig
             ["LLM_EAVESDROP_CONTEXT"]).Value;
         if (!string.IsNullOrWhiteSpace(eavesContext)) cfg.Llm.EavesdropContext = !IsFalsy(eavesContext!);
 
+        // ── 圖片理解（只有「被指定」的那一則才會附圖）──────────
+        var vision = SettingResolver.Resolve(args, "--llm-vision", file, ["LLM_VISION"]).Value;
+        if (!string.IsNullOrWhiteSpace(vision)) cfg.Llm.Vision = !IsFalsy(vision!);
+        if (args.Contains("--no-llm-vision")) cfg.Llm.Vision = false;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-vision-max", file,
+                ["LLM_VISION_MAX_IMAGES"]).Value, out var visionMax) && visionMax is >= 0 and <= 10)
+            cfg.Llm.VisionMaxImages = visionMax;
+
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
         cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;
         if (args.Contains("--no-message-intent")) cfg.EnableMessageContentIntent = false;

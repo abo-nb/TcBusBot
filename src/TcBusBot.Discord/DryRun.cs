@@ -1808,6 +1808,43 @@ public static class DryRun
             Console.WriteLine("  ✔ 短判斷被標成 JudgeCall，而且建立流程真的會建出「兩個模型」那一層");
         }
 
+        // ── 圖片理解（只有「被指定」的那一則才會附圖）──────────
+        Console.WriteLine($"  ℹ 圖片理解：{(llm.Vision ? $"開啟（一次最多 {llm.VisionMaxImages} 張，每張最多約 1024 tokens）" : "關閉（LLM_VISION=false）")}");
+
+        if (llm.Vision && llm.VisionMaxImages <= 0)
+            Console.WriteLine("  ℹ 提示：LLM_VISION_MAX_IMAGES=0 → 等於關閉圖片理解");
+
+        if (llm.Vision && llm.VisionMaxImages > 4)
+            Console.WriteLine($"  ℹ 提示：一次附 {llm.VisionMaxImages} 張圖最多會多花約 {llm.VisionMaxImages * 1024:N0} tokens；" +
+                              "通常兩張就很夠了");
+
+        // ★ 接線：真的要有人把圖片挑出來、而且**偷聽時不能挑**
+        var imagesOf = typeof(LlmChatService).GetMethod("ImagesOf",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        var visionAnswer = typeof(LlmChatService).GetMethod("AnswerAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        var visionCalls = visionAnswer is null ? [] : CollectCalls(visionAnswer, resolveAll: true);
+        var imageCalls = imagesOf is null ? [] : CollectCalls(imagesOf, resolveAll: true);
+
+        if (imagesOf is null || visionAnswer is null)
+        {
+            Problem("找不到 LlmChatService.ImagesOf／AnswerAsync —— 無法驗證圖片理解有沒有接上");
+        }
+        else if (!visionCalls.Contains("VisionPolicy.Select") || !visionCalls.Contains("LlmChatService.ImagesOf"))
+        {
+            Problem("AnswerAsync 沒有用 ImagesOf／VisionPolicy —— 圖片不會被送出去（或沒有篩選規則）");
+        }
+        else if (!imageCalls.Contains("SocketSticker.get_Format"))
+        {
+            Problem("ImagesOf 沒有處理貼圖（stickers）—— 使用者貼的貼圖會看不到");
+        }
+        else
+        {
+            Console.WriteLine("  ✔ 圖片真的接得上：訊息 → ImagesOf（附件／貼圖／嵌入 → 篩選格式）" +
+                              " → VisionPolicy.Select（只有被指定、最多 N 張）");
+        }
+
         // ── 名字（暱稱 vs @帳號）────────────────────────────        //    這決定了「模型認不認得大家在講誰」，也決定判斷器準不準。
         Console.WriteLine($"  ℹ 模型看到的名字：{(llm.ShowNicknames ? "Discord 暱稱（伺服器顯示名稱）" : "@帳號（username）")}" +
                           (llm.ExposeUserIds

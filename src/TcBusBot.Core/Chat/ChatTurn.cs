@@ -34,19 +34,36 @@ public sealed record ChatTurn(
     /// <summary>
     /// 「偷聽到的閒聊」：不是對 Bot 說的訊息，但被留下來當上下文。
     ///
-    /// 為什麼要區分：這些句子進到提示詞裡會長得跟「對 Bot 說的話」一模一樣
+    /// 為什麼要區分：這些句子進到提示詞裡會長得像「對 Bot 說的話」一模一樣
     /// （「你要不要一起去？」看起來就像在問 Bot），所以標成 `[閒聊]`，
     /// 讓模型知道那是別人之間的對話、只是背景。
     /// </summary>
-    bool Ambient = false)
+    bool Ambient = false,
+    /// <summary>
+    /// 這一則附的圖片（**只有被明確指定的那一則才會送給模型看**，見 <see cref="VisionPolicy"/>）。
+    ///
+    /// ⚠️ 歷史訊息裡的圖片**不會**重複送出去（那會每輪都花 1024 tokens／張）；
+    ///    只有「這一次的訊息」與「它回覆的那一則」會被 <c>SemanticKernelLlmClient</c> 當成圖片內容。
+    ///    歷史裡的圖片只留文字記號（見 <see cref="ToPromptText"/>）。
+    /// </summary>
+    IReadOnlyList<ImageRef>? Images = null)
 {
     public bool IsBot => Role == ChatRole.Assistant;
 
+    /// <summary>這一則有幾張圖片（沒有就是 0）。</summary>
+    public int ImageCount => Images?.Count ?? 0;
+
     /// <summary>這一則在提示詞裡要長什麼樣（多人頻道要分得出誰在說話）。</summary>
     public string ToPromptText()
-        => IsBot ? Content
-         : Ambient ? $"[閒聊] {PromptLabel ?? AuthorName}：{Content}"
-         : $"{PromptLabel ?? AuthorName}：{Content}";
+    {
+        var body = IsBot ? Content
+                 : Ambient ? $"[閒聊] {PromptLabel ?? AuthorName}：{Content}"
+                 : $"{PromptLabel ?? AuthorName}：{Content}";
+
+        // 圖片只用文字記號帶過：模型知道「這裡有一張圖」，
+        // 但只有被指定的那一則才會真的附上圖片內容（成本考量）。
+        return ImageCount == 0 ? body : $"{body}（附 {ImageCount} 張圖片）";
+    }
 
     public string Describe()
         => $"[{(IsBot ? "Bot" : AuthorName)} @ {At.ToLocalTime():HH:mm:ss}] {Preview(Content)}";

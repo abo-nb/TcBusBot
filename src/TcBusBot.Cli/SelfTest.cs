@@ -3539,6 +3539,60 @@ public static class SelfTest
 
         Check("路由層沒有診斷物件時也不會壞（可選參數）",
             diagRouter.For(Probe("chat")) is not null);
+
+        // ── 5) 圖片理解：只有「被指定」的那一則才會附圖 ─────────────────
+        //     使用者要的是「讓模型看得到圖片，但要用戶指定才會用」——
+        //     所以規則本身就是功能：偷聽到的、別人聊天的照片一律不送
+        //     （成本：一張圖最多 1024 tokens；隱私：別人的照片不該送去外部模型）。
+        ImageRef Img(string url) => new(url, ImageSource.Attachment, "a.png", 1000);
+
+        var mine = new[] { Img("https://cdn.discordapp.com/attachments/1/a.png") };
+        var theirs = new[] { Img("https://cdn.discordapp.com/attachments/2/b.jpg") };
+
+        Check("★ 明確對它說話（@ 它）時才會附圖",
+            VisionPolicy.Select(mine, [], addressed: true, maxImages: 2).Count == 1);
+
+        Check("★ 偷聽到的訊息**不會**附圖（別人的照片不送去外部模型）",
+            VisionPolicy.Select(mine, theirs, addressed: false, maxImages: 2).Count == 0);
+
+        Check("★ 回覆某張圖時，被回覆那一則的圖片也算（「這張圖是什麼？」很自然）",
+            VisionPolicy.Select([], theirs, addressed: true, maxImages: 2).Count == 1);
+
+        Check("★ 一次最多幾張有上限（成本：一張最多 1024 tokens）",
+            VisionPolicy.Select(mine, theirs, addressed: true, maxImages: 1).Count == 1);
+
+        Check("上限設 0 → 等於關掉（一張都不送）",
+            VisionPolicy.Select(mine, theirs, addressed: true, maxImages: 0).Count == 0);
+
+        Check("當前訊息的圖片優先於被回覆的（先看使用者自己貼的）",
+            VisionPolicy.Select(mine, theirs, addressed: true, maxImages: 1)[0].Url == mine[0].Url);
+
+        Check("同一張圖不會重複送（回覆自己那張圖的情況）",
+            VisionPolicy.Select(mine, mine, addressed: true, maxImages: 2).Count == 1);
+
+        Check("空白網址會被濾掉（不會送出一定失敗的請求）",
+            VisionPolicy.Select([Img("")], [], addressed: true, maxImages: 2).Count == 0);
+
+        Check("★ 有圖但沒開圖片理解時，會留一句「看不到」讓模型別亂編",
+            VisionPolicy.Note(1, 0, visionEnabled: false).Contains("沒有開啟圖片理解", StringComparison.Ordinal));
+
+        Check("有圖但超過張數時，說明「附上幾張、幾張沒附」",
+            VisionPolicy.Note(3, 2, visionEnabled: true).Contains("另外 1 張沒有附上", StringComparison.Ordinal),
+            VisionPolicy.Note(3, 2, visionEnabled: true));
+
+        Check("沒有圖片時不會多出任何提示文字（省 token）",
+            VisionPolicy.Note(0, 0, visionEnabled: true).Length == 0);
+
+        Check("★ 提示詞裡的圖片只留文字記號（歷史訊息不會每輪重送圖片）",
+            new ChatTurn(ChatRole.User, "小明", 1UL, 1UL, "這是什麼", DateTimeOffset.UtcNow,
+                Images: mine).ToPromptText().Contains("（附 1 張圖片）", StringComparison.Ordinal)
+            && new ChatTurn(ChatRole.User, "小明", 1UL, 2UL, "沒有圖",
+                DateTimeOffset.UtcNow).ToPromptText().EndsWith("沒有圖", StringComparison.Ordinal));
+
+        Check("圖片來源分得出來（log 用：附件／貼圖／嵌入）",
+            Img("https://x").Describe().Contains("附件", StringComparison.Ordinal)
+            && new ImageRef("https://x", ImageSource.Sticker, "貓貓").Describe().Contains("貼圖", StringComparison.Ordinal)
+            && new ImageRef("https://x", ImageSource.Embed).Describe().Contains("嵌入", StringComparison.Ordinal));
     }
 
     /// <summary>

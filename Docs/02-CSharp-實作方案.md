@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 624 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 637 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 624 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 637 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3879,6 +3879,79 @@ BUS_CITY=高雄          # 中文也通
 
 `--dryrun`：`/ai` 6 個子指令（含 `test`）、IL 掃描確認 `/ai test` 真的呼叫
 `ILlmClient.CompleteAsync` 而且會擋人。
+
+---
+
+### 20.25 圖片理解：只有「使用者指定」才會用（`LLM_VISION`）
+
+需求：「讓模型看得到別人發的圖片或貼圖，**但要用戶指定才會用**」。
+
+#### 20.25.1 為什麼「看到圖就送」是錯的
+
+| 問題 | 說明 |
+| --- | --- |
+| 成本 | 官方換算：一張圖最多 **1024 tokens**（縮到約 1300×1300 的總像素），群組一天丟幾十張圖就是幾萬 tokens |
+| 隱私 | 偷聽到的訊息本來只是「聽」；把別人隨手貼的照片送去外部模型是另一件事 |
+| 雜訊 | 大量貼圖跟對話無關，硬塞給模型只會讓回答變差 |
+
+所以規則寫成一條可離線測試的政策（`VisionPolicy`）：**只有「明確對 Bot 說話」的那一則**
+（@ 它、或回覆它）才可能附圖；偷聽到的訊息一律只有文字。細節：
+
+| 情況 | 行為 |
+| --- | --- |
+| @ 它並附圖 | 附圖（最多 `LLM_VISION_MAX_IMAGES` 張） |
+| 回覆某張圖的訊息 | 附**被回覆那一則**的圖（「這張圖是什麼？」最自然的用法）；當前訊息也有圖時，當前的優先 |
+| 偷聽到的訊息（沒 @ 它） | **不附圖**，只留文字記號 |
+| 有圖但 `LLM_VISION=false` | 不附圖，但文字加一句「（有 N 張圖片，主機沒有開啟圖片理解）」→ 模型知道自己沒看到，不會憑空編造 |
+| 歷史訊息 | 只留「（附 N 張圖片）」的文字記號 —— **不重送圖片**（否則每輪都再花一次圖片 token） |
+| 貼圖 | 只處理 PNG／APNG（`StickerFormatType`）；Lottie 是動畫 JSON，模型看不懂 |
+| 附件格式 | 只送 JPEG／PNG／GIF／WebP（同時看副檔名與 `ContentType`） |
+
+傳輸方式：**直接給模型 Discord 附件的 https 網址**（`ImageContent(Uri)`），
+不自己下載、不 base64（省頻寬，也不會撞到 48 MiB 請求體上限）。
+
+#### 20.25.2 實作時踩到的坑（真實 API 才看得出來）
+
+第一版用 `new ImageContent(new Uri(url))`，實測**直接丟例外**：
+
+```
+System.InvalidOperationException: For DataUri contents, use DataUri property.
+   at Microsoft.SemanticKernel.BinaryContent.SetUri(Uri uri)
+```
+
+SK 的 `ImageContent` 有兩個不同的建構子：`ImageContent(Uri)`（http(s)）與
+`ImageContent(string dataUri)`（data URI），用錯就炸。這正是為什麼這個功能**一定要用真實 API 驗**：
+它會在「第一張圖」就讓整則回覆失敗，而單元測試完全看不到。
+
+修法：
+
+```csharp
+url.StartsWith("data:image/")  → new ImageContent(url)      // data URI 用字串建構子
+http(s)://…                    → new ImageContent(uri)      // 遠端網址用 Uri 建構子
+其他／壞掉                     → 不送這張圖（只記一行 log，不讓整則回覆失敗）
+```
+
+另外「多塊內容」要傳 `ChatMessageContentItemCollection`（不是 `List<KernelContent>`），
+這是 OpenAI 的 `content` 陣列格式 —— 純字串是送不出圖片的。
+
+#### 20.25.3 驗收
+
+`tcbus selftest` 新增 **13 項**（`VisionPolicy` 是純 Core）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| @ 它才附圖；**偷聽到的訊息一張都不附** | 需求的核心 |
+| 回覆某張圖時附被回覆那張；當前訊息的圖優先 | 使用情境 |
+| 一次最多 N 張、`0` 等於關閉、同一張不重複、空白網址濾掉 | 邊界 |
+| 沒開圖片理解時留「看不到」的說明；超過張數時說「另外 N 張沒附上」 | 誠實性 |
+| 提示詞裡只留「（附 N 張圖片）」記號 | 歷史不重送（成本） |
+| 來源分得出附件／貼圖／嵌入 | log |
+
+`--dryrun`：印出圖片理解設定，並用 **IL 掃描**確認 `AnswerAsync` 真的經過
+`ImagesOf` ＋ `VisionPolicy.Select`，而且 `ImagesOf` 真的處理貼圖（`SocketSticker.get_Format`）。
+
+真實 API 驗證：**待補**（見 §20.25.2 —— 需要一把有效的 `LLM_API_KEY`；
+本機檔案裡的那把已回 401，正是「LLM 接不上」的原因）。
 
 ---
 

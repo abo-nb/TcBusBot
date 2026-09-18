@@ -404,6 +404,73 @@ public sealed class LlmChatService : IDisposable
         => mentioned || replyAddressed || listening;
 
     /// <summary>
+    /// 這一則訊息（或它回覆的那一則）附的圖片。
+    ///
+    /// 為什麼要自己判斷格式：Discord 的附件型別是**宣稱**的（`ContentType`），
+    /// 實際上傳什麼都可能；而模型的限制是 JPEG／PNG／GIF／WebP。
+    /// 這裡用副檔名 + ContentType 兩邊都看，寧可少送一張也不要送出一定失敗的東西。
+    /// 貼圖只有 PNG／APNG 能看（Lottie 是動畫 JSON，模型看不懂）。
+    /// </summary>
+    private static List<ImageRef> ImagesOf(IMessage? message)
+    {
+        if (message is null) return [];
+
+        var images = new List<ImageRef>();
+
+        foreach (var attachment in message.Attachments)
+        {
+            if (!LooksLikeImage(attachment.Filename, attachment.ContentType)) continue;
+
+            images.Add(new ImageRef(attachment.Url, ImageSource.Attachment,
+                attachment.Filename, attachment.Size));
+        }
+
+        if (message is SocketUserMessage userMessage)
+        {
+            foreach (var sticker in userMessage.Stickers)
+            {
+                // Lottie 是動畫（JSON），不是圖片檔 → 跳過
+                if (sticker.Format == StickerFormatType.Lottie) continue;
+
+                var url = sticker.Format is StickerFormatType.Apng or StickerFormatType.Png or StickerFormatType.Gif
+                    ? $"https://media.discordapp.net/stickers/{sticker.Id}.{(sticker.Format == StickerFormatType.Gif ? "gif" : "png")}"
+                    : null;
+
+                if (url is null) continue;
+
+                images.Add(new ImageRef(url, ImageSource.Sticker, sticker.Name));
+            }
+
+            foreach (var embed in userMessage.Embeds)
+            {
+                if (embed.Image is { } image)
+                    images.Add(new ImageRef(image.Url, ImageSource.Embed));
+
+                if (embed.Thumbnail is { } thumbnail)
+                    images.Add(new ImageRef(thumbnail.Url, ImageSource.Embed));
+            }
+        }
+
+        return images;
+    }
+
+    /// <summary>看起來是模型看得懂的圖片嗎（JPEG／PNG／GIF／WebP）。</summary>
+    private static bool LooksLikeImage(string? fileName, string? contentType)
+    {
+        var name = (fileName ?? "").ToLowerInvariant();
+        var type = (contentType ?? "").ToLowerInvariant();
+
+        if (type.StartsWith("image/", StringComparison.Ordinal))
+            return type is "image/jpeg" or "image/jpg" or "image/png" or "image/gif" or "image/webp";
+
+        return name.EndsWith(".jpg", StringComparison.Ordinal)
+               || name.EndsWith(".jpeg", StringComparison.Ordinal)
+               || name.EndsWith(".png", StringComparison.Ordinal)
+               || name.EndsWith(".gif", StringComparison.Ordinal)
+               || name.EndsWith(".webp", StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// 把 Discord 的訊息轉成對話裡的一則。
     ///
     /// 名字有兩份，而且**兩份都有用**：
@@ -461,7 +528,30 @@ public sealed class LlmChatService : IDisposable
         bool addressed = true,
         bool mentionsOtherHuman = false)
     {
-        var incoming = BuildTurn(message, text);
+        // ── 圖片理解（只有「被明確指定」的那一則才會附圖）──────────
+        //   1. 一定要是**對 Bot 說話**的訊息（@ 它、回覆它）—— 偷聽到的圖片不送
+        //      （成本：一張圖最多 1024 tokens；隱私：別人隨手貼的照片不該送去外部模型）
+        //   2. 回覆某則訊息時，**被回覆那一則的圖片**也算（「這張圖是什麼？」很自然）
+        //   3. 一次最多 LLM_VISION_MAX_IMAGES 張
+        var current = addressed ? ImagesOf(message) : [];
+        var repliedImages = addressed && referenced is not null ? ImagesOf(referenced) : [];
+
+        var images = _options.Vision
+            ? VisionPolicy.Select(current, repliedImages, addressed, _options.VisionMaxImages)
+            : [];
+
+        var imageNote = VisionPolicy.Note(
+            current.Count + repliedImages.Count, images.Count, _options.Vision);
+
+        var incoming = BuildTurn(message, text) with { Images = images.Count > 0 ? images : null };
+
+        // 有圖但沒送（沒開功能／超過張數）→ 在文字裡講清楚，模型才不會憑空編造
+        if (imageNote.Length > 0 && images.Count == 0)
+            incoming = incoming with { Content = $"{incoming.Content}\n{imageNote}" };
+
+        if (images.Count > 0)
+            Console.WriteLine($"[llm] 🖼 附上 {images.Count} 張圖片給模型：" +
+                              string.Join("、", images.Select(i => i.Describe())));
 
         var replyTarget = referenced is null ? null : ToTurn(referenced, _client.CurrentUser?.Id ?? 0);
         var where = DescribeWhere(guildId, message);

@@ -3,6 +3,7 @@ using System.Reflection;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
+using TcBusBot.Core.Storage;
 
 namespace TcBusBot.Core.Chat;
 
@@ -104,10 +105,13 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
     {
         var history = new ChatHistory(request.SystemPrompt);
 
+        // ⚠️ 歷史訊息一律只送文字：圖片只附在「這一次的訊息」上。
+        //    歷史裡每張圖都會再算一次 token（最多 1024/張），每輪都送會讓額度瞬間見底；
+        //    而且 Discord 的附件網址會過期，舊圖多半也抓不到了。
         foreach (var turn in request.History)
-            history.Add(ToMessage(turn));
+            history.Add(ToMessage(turn, includeImages: false));
 
-        history.Add(ToMessage(request.Incoming));
+        history.Add(ToMessage(request.Incoming, includeImages: request.Incoming.ImageCount > 0));
 
         var settings = new OpenAIPromptExecutionSettings
         {
@@ -192,10 +196,72 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
         }
     }
 
-    private static ChatMessageContent ToMessage(ChatTurn turn)
-        => turn.IsBot
-            ? new ChatMessageContent(AuthorRole.Assistant, turn.Content)
-            : new ChatMessageContent(AuthorRole.User, turn.ToPromptText());
+    /// <summary>
+    /// 把對話裡的一則轉成 SK 的訊息。
+    ///
+    /// ⚠️ 圖片要用 <see cref="ImageContent"/> 變成一則**多塊內容**（text + image_url），
+    ///    也就是 OpenAI 的 <c>content</c> 陣列格式 —— 純字串是送不出圖片的。
+    ///    這一條路真的能通（有實測：見 Docs §20.25），因為 SK 這個版本對
+    ///    「送不出去」的東西往往**默默忽略**（`ExtensionData`、`ModelId` 都是這樣），
+    ///    所以這種功能一定要用真實 API 驗過。
+    /// </summary>
+    private static ChatMessageContent ToMessage(ChatTurn turn, bool includeImages)
+    {
+        if (turn.IsBot) return new ChatMessageContent(AuthorRole.Assistant, turn.Content);
+
+        var text = turn.ToPromptText();
+
+        if (!includeImages || turn.ImageCount == 0)
+            return new ChatMessageContent(AuthorRole.User, text);
+
+        // 多塊內容（text ＋ image_url）＝ OpenAI 的 content 陣列格式。
+        // SK 這個版本的建構子要的是 ChatMessageContentItemCollection，不是 List<T>。
+        var items = new ChatMessageContentItemCollection { new TextContent(text) };
+
+        foreach (var image in turn.Images!)
+        {
+            if (ToImageContent(image.Url) is { } content) items.Add(content);
+        }
+
+        return items.Count == 1
+            ? new ChatMessageContent(AuthorRole.User, text)
+            : new ChatMessageContent(AuthorRole.User, items);
+    }
+
+    /// <summary>
+    /// 一個圖片網址 → SK 的圖片內容。
+    ///
+    /// ⚠️ 兩種網址要用**不同**的建構子，而且用錯會直接丟例外：
+    ///    * `http(s)://…`  → <c>ImageContent(Uri)</c>（模型自己去抓；Discord 附件就是這種）
+    ///    * `data:image/…` → <c>ImageContent(DataUri)</c>
+    ///      （<c>ImageContent(Uri)</c> 對 data URI 會丟
+    ///       「For DataUri contents, use DataUri property.」—— 實測踩到的）
+    ///
+    /// 另外**任何一張圖有問題都不該讓整則回覆失敗**：這裡壞掉就只是那張圖不送，
+    /// 文字照樣問得到答案（圖片是加分功能，不該變成「有圖就整個壞掉」）。
+    /// </summary>
+    private static ImageContent? ToImageContent(string url)
+    {
+        try
+        {
+            if (url.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase))
+                return new ImageContent(url);   // ← 專給 data URI 的字串建構子
+
+            return Uri.TryCreate(url, UriKind.Absolute, out var uri)
+                   && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+                ? new ImageContent(uri)
+                : null;
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warn($"[llm] 這張圖片送不出去（{ex.GetType().Name}）：{ShortenUrl(url)}");
+            return null;
+        }
+    }
+
+    /// <summary>log 用的短網址（Discord 的簽章網址很長，不要整串印出來）。</summary>
+    private static string ShortenUrl(string url)
+        => url.Length <= 80 ? url : url[..80] + "…";
 
     /// <summary>把 API 的例外翻成看得懂的一句話（400／401／429 是最常見的三種）。</summary>
     private string Friendly(Exception ex)

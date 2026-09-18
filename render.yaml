@@ -131,6 +131,11 @@ services:
       # 同一個人在幾秒內連打的訊息合併成一題（0 = 不合併）
       - key: LLM_MERGE_SECONDS
         value: "4"
+      # 圖片理解：只有被 @ 或回覆的訊息才會附圖（偷聽到的照片不送）
+      - key: LLM_VISION
+        value: "true"
+      - key: LLM_VISION_MAX_IMAGES
+        value: "2"
       # ── 對話記憶的容量（記憶體用量；Render 免費層記憶體有限）──
       - key: LLM_MAX_TURNS_PER_SEGMENT
         value: "24"
