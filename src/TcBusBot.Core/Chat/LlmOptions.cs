@@ -299,6 +299,10 @@ public sealed class LlmOptions
     ///
     /// ⚠️ 城市是**按使用者**選的（`/bus city`），所以實際內容是「問的人選的那個城市」——
     /// 這裡只提供格式，實際的 city 由 <see cref="ChatOrchestrator"/> 依使用者決定。
+    ///
+    /// 多城市時刻意**不要**寫「你只有某個城市的資料」：那是單一城市才成立的話。
+    /// 工具其實會跨城市找（見 `BusActionService.SourcesFor`／`TryCitySource`），
+    /// 提示詞如果跟工具的行為相反，模型就會跟使用者說「我只有臺中的資料」然後拒答。
     /// </summary>
     public static string CityNoteFor(string cityDisplay, bool multiCity)
         => string.IsNullOrWhiteSpace(cityDisplay)
@@ -308,11 +312,12 @@ public sealed class LlmOptions
 
                 【服務範圍】
                 你查到的公車資料都是**{cityDisplay}**的（站牌、路線、到站時間都是）。
-                不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{cityDisplay}的資料。
                 {(multiCity
                     ? "使用者可以自己選城市（`/bus city`）—— 你看到的資料就是他選的那一個。" +
-                      "如果他要查別的縣市，請他先打 `/bus city` 換過去。"
-                    : "")}
+                      "而查站牌與路線的工具會**自己跨城市找**（結果會標出「（城市：…）」），" +
+                      "所以他講得出城市時，就在工具裡填 `city`（例如 city: \"Tainan\"）。" +
+                      "沒有列在上面的縣市才是真的沒有資料，不要回答那些縣市的路線。"
+                    : $"不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{cityDisplay}的資料。")}
                 """;
 
     /// <summary>

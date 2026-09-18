@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 665 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 678 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 665 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 678 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3883,6 +3883,45 @@ ETA 分批用站牌自己的城市。`--dryrun`：`/bus` 7 個子指令（含 `c
 用 `BusDataCatalog.GroupByCity`。
 
 真實資料：`BUS_CITY=Taichung,Tainan` → 臺中 14,036 ＋ 臺南 11,329 個站牌，兩份各自獨立，`--dryrun` exit 0。
+
+#### 20.23.5 LLM 工具也要**跨城市找**（而且不能被「模糊相符」騙走）
+
+使用者回報「本來抓不到臺南」。這裡有**兩個**不同的原因，第二個是修好第一個之後才浮出來的：
+
+| 原因 | 症狀 | 修法 |
+| --- | --- | --- |
+| 工具只看「問的人選的城市」 | 問「臺南車站到安平要搭幾號」，他的城市還是預設臺中 → 回「找不到站牌」 | `SourcesFor`：先試他選的城市，再試其他載入的城市；結果標出**是哪個城市的站牌** |
+| 照「第一個有回應的城市」走，會被**模糊相符**攔走 | 在臺中的資料裡搜「臺南車站」也會有回應（`日南車站`，編輯距離 1）→ 他問臺南，卻拿到**臺中**的站牌，而且看起來像真的答案 | `Lookup`：**強相符（精確／前綴／子字串／縮寫）的城市優先**，兩個城市都只有模糊相符時才回頭用他自己選的城市 |
+
+真實資料（`tcbus search 臺南車站`）就是這樣：
+
+| 資料 | 最強的一筆 | 種類 | 判斷 |
+| --- | --- | --- | --- |
+| 臺中 | 日南車站（12 個站牌，183 分） | `Edit`（打字猜測） | 弱 → 不該拿去回答「臺南」 |
+| 臺南 | 臺南火車站（14 個站牌，895 分，預設勾選） | `Prefix` | 強 → 這才是他要的 |
+
+⚠️ 這裡踩過一個**自己寫出來的**坑：一開始用「`PreferStrong` 濾掉了幾組」當成強相符的判斷，
+但 `PreferStrong` 在「全部都是強相符」時回傳的濾除數是 **0** —— 於是每個城市都被跳過，
+最後回頭拿了使用者自己的城市（也就是**照樣**回臺中）。所以強弱要看 `StopSearchGroupResult.IsStrongMatch`
+這個旗標，不能用「濾掉幾組」推論。
+
+另外，模型現在也能**自己指名城市**（`search_stops`／`find_routes`／`subscribe_bus` 都有選填的 `city`）：
+使用者說「我要查臺南的」時，模型可以把城市一起送進來（只查那一個城市，不會混到別的城市）。
+指名了沒載入的城市（`Kaohsiung`）或亂打的城市（`火星`）時，工具會回一份**「我能查的城市：臺中、臺南」**
+而不是空手而回 —— 模型才知道要怎麼重試。
+
+驗收（`tcbus selftest` 新增 **7 項**）：強相符優先（問臺南不會被臺中的模糊相符攔走）、
+指名城市只回那個城市、指名城市時 `find_routes`／`subscribe` 也照辦、
+指名沒載入的城市會列出可查的城市、中文與英文城市名都通。
+`--dryrun`（單城市與 `BUS_CITY=Taichung,Tainan` 兩種）exit 0，並新增一節
+「LLM 公車工具檢查」：用反射檢查 8 個工具**每個工具與每個參數都有 `[Description]`**、
+以及 `search_stops`／`find_routes`／`subscribe_bus` 都收得下選填的 `city`
+（這種事 C# 編譯器不會擋：參數被拿掉或忘了寫說明，行為測試照樣全過 ——
+因為那些測試是直接呼叫方法的，只有模型會看不到）。
+
+順手拆掉一個**和現在的設計矛盾**的死碼：`StaticDataLoader.LoadManyAsync`
+（把多個城市合併成一份資料集）已經沒有呼叫端，留著只會讓人以後又走回
+「合併再過濾」那條路（見 20.23.4 的說明），所以直接刪掉並在原地留一段註解說明為什麼不提供。
 
 ---
 ---

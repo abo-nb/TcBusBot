@@ -28,6 +28,7 @@ public sealed class BusTools
     private readonly SubscriptionService _subs;
     private readonly ChatToolContext _context;
     private readonly ToolCallLog _log;
+    private readonly UserCityStore? _cities;
 
     /// <summary>問的人是誰 —— 他可以用 `/bus city` 選城市，工具要跟著看同一份資料。</summary>
     private ulong _userId => _context.UserId;
@@ -41,28 +42,67 @@ public sealed class BusTools
         SubscriptionService subs,
         ChatToolContext context,
         ToolCallLog log,
-        Func<ChatToolContext, string?, CancellationToken, Task<string>>? arrivals = null)
+        Func<ChatToolContext, string?, CancellationToken, Task<string>>? arrivals = null,
+        UserCityStore? cities = null)
     {
         _actions = actions;
         _subs = subs;
         _context = context;
         _log = log;
         _arrivals = arrivals;
+        _cities = cities;
     }
 
     // ─────────────────────────────────────────────────────
     //  搜尋與查詢（唯讀）
     // ─────────────────────────────────────────────────────
 
+    /// <summary>
+    /// 切換這位使用者要查的城市（`set_city`）。
+    ///
+    /// 為什麼需要這個工具：使用者很自然地會直接說「臺南車站到安平要搭幾號」——
+    /// 他不會先打 `/bus city`。搜尋類工具雖然會**跨城市找**
+    /// （見 <c>BusActionService.SourcesFor</c>），但「以後都幫我查臺南」這種要求
+    /// 只能靠這個工具記下來。
+    /// </summary>
+    [KernelFunction("set_city")]
+    [Description("切換這位使用者要查的城市（例如從臺中改成臺南）。" +
+                 "使用者說「以後都幫我查臺南」「我要查臺南的公車」時呼叫。")]
+    public string SetCity(
+        [Description("城市名稱，例如 臺中、臺南、Taichung、Tainan")] string city)
+    {
+        if (_cities is null) return "這台 Bot 目前只載入了一個城市，不需要切換。";
+
+        var before = _cities.Get(_context.UserId);
+
+        if (!_cities.Set(_context.UserId, city))
+        {
+            _log.Record("set_city", $"{city}（失敗）");
+
+            return $"沒有「{city}」這個城市。目前可以選：" +
+                   string.Join("、", _cities.Available.Select(c => $"{BusCity.DisplayOf(c)}（{c}）"));
+        }
+
+        var after = _cities.Get(_context.UserId);
+        _log.Record("set_city", $"{BusCity.DisplayOf(before)} → {BusCity.DisplayOf(after)}");
+
+        return $"已把你要查的城市改成「{BusCity.DisplayOf(after)}」（原本是 {BusCity.DisplayOf(before)}）。" +
+               "接下來查站牌與路線都會用這個城市的資料。請用一句話跟使用者確認。";
+    }
+
     [KernelFunction("search_stops")]
     [Description("用關鍵字查公車站牌的正確名稱，並回報有哪幾條路線經過" +
                  "（支援模糊比對：打「台中」也會找到「臺中」、打「火車站」也會找到「車站」、縮寫也通）。" +
-                 "站名不確定時先用這個查，不要用猜的。")]
+                 "**會自動跨城市找**，也會在結果裡標出是哪個城市的站牌 —— 所以問「臺南車站」也查得到" +
+                 "（不必先切城市）。站名不確定時先用這個查，不要用猜的。")]
     public string SearchStops(
-        [Description("站名關鍵字，站名關鍵字，例如「火車站」「靜宜」「科大」")] string keyword)
+        [Description("站名關鍵字，例如「火車站」「靜宜」「科大」")] string keyword,
+        [Description("要查哪個城市，可留白。使用者有講到城市時才填（例如「臺南的」「臺中的公車」），" +
+                     "留白時系統會跨城市自己找。")]
+        string? city = null)
     {
-        var result = _actions.SearchStops(keyword, userId: _userId);
-        _log.Record("search_stops", keyword);
+        var result = _actions.SearchStops(keyword, userId: _userId, city: city);
+        _log.Record("search_stops", city is null ? keyword : $"{keyword}（{city}）");
         return result;
     }
 
@@ -79,13 +119,17 @@ public sealed class BusTools
 
     [KernelFunction("find_routes")]
     [Description("查「從某一站到某一站」可以搭哪些公車（只查詢，不會建立訂閱）。" +
-                 "沒有直達時會回報「轉一次」的走法。使用者只是想知道怎麼去時用這個。")]
+                 "沒有直達時會回報「轉一次」的走法。使用者只是想知道怎麼去時用這個。" +
+                 "**會自動跨城市找**；起訖分散在不同城市時，請用 city 指定要查的城市。")]
     public string FindRoutes(
         [Description("起點站名，例如「火車站」「靜宜」")] string origin,
-        [Description("終點站名，例如 靜宜大學")] string destination)
+        [Description("終點站名，例如 靜宜大學")] string destination,
+        [Description("要查哪個城市，可留白。使用者有講到城市、或上一個工具說「找不到」時可以填" +
+                     "（例如 臺南）。")]
+        string? city = null)
     {
-        var result = _actions.FindRoutes(origin, destination, userId: _userId);
-        _log.Record("find_routes", $"{origin} → {destination}");
+        var result = _actions.FindRoutes(origin, destination, userId: _userId, city: city);
+        _log.Record("find_routes", $"{origin} → {destination}" + (city is null ? "" : $"（{city}）"));
         return result;
     }
 
@@ -122,11 +166,14 @@ public sealed class BusTools
 
     [KernelFunction("subscribe_bus")]
     [Description("幫使用者訂閱「從某一站到某一站」的公車，公車快到時會通知他。" +
-                 "使用者明確說「幫我訂」「我要收到通知」時才呼叫。站名不確定請先用 search_stops 查或直接問使用者。")]
+                 "使用者明確說「幫我訂」「我要收到通知」時才呼叫。站名不確定請先用 search_stops 查或直接問使用者；" +
+                 "使用者有講到城市（例如「臺南的」）時填 city。")]
     public string SubscribeBus(
         [Description("起點站名，例如「火車站」「靜宜」")] string origin,
         [Description("終點站名，例如 靜宜大學")] string destination,
-        [Description("提前幾分鐘通知，1~60，預設 10")] int notifyMinutes = 10)
+        [Description("提前幾分鐘通知，1~60，預設 10")] int notifyMinutes = 10,
+        [Description("要訂哪個城市，可留白。使用者有講到城市時才填（例如「臺南的」）。")]
+        string? city = null)
     {
         var outcome = _actions.Subscribe(
             userId: _context.UserId,
@@ -134,7 +181,8 @@ public sealed class BusTools
             destination: destination,
             notifyMinutes: notifyMinutes,
             guildId: _context.IsDirectMessage ? null : _context.GuildId,
-            channelId: _context.ChannelId);
+            channelId: _context.ChannelId,
+            city: city);
 
         _log.Record("subscribe_bus",
             outcome.Ok
@@ -264,6 +312,9 @@ public sealed class BotToolProvider : IChatToolProvider
     private readonly BusSessionStore? _sessions;
     private readonly Func<ChatToolContext, string?, CancellationToken, Task<string>>? _arrivals;
 
+    /// <summary>使用者選的城市（給 <c>set_city</c> 工具用）。</summary>
+    private readonly UserCityStore? _cities;
+
     /// <summary>最近一次提問的工具實例（用來拿 <see cref="BusTools.PendingUndo"/>）。</summary>
     private BusTools? _last;
 
@@ -276,7 +327,8 @@ public sealed class BotToolProvider : IChatToolProvider
         GuildPersonaStore personas,
         Func<ChatToolContext, string?, CancellationToken, Task<string>>? arrivals = null,
         BusSessionStore? sessions = null,
-        Core.Storage.SavedGroupStore? savedGroups = null)
+        Core.Storage.SavedGroupStore? savedGroups = null,
+        UserCityStore? cities = null)
     {
         _actions = actions;
         _subs = subs;
@@ -284,11 +336,12 @@ public sealed class BotToolProvider : IChatToolProvider
         _arrivals = arrivals;
         _sessions = sessions;
         _savedGroups = savedGroups;
+        _cities = cities;
     }
 
     public IReadOnlyList<KernelPlugin> CreateFor(ChatToolContext context, ToolCallLog log)
     {
-        var tools = new BusTools(_actions, _subs, context, log, _arrivals);
+        var tools = new BusTools(_actions, _subs, context, log, _arrivals, _cities);
         _last = tools;
         _lastUi = null;
 

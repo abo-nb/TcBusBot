@@ -104,7 +104,7 @@ internal static class BotServices
         services.AddSingleton(cities);
         services.AddSingleton(dataCatalog);
 
-        services.AddSingleton<BusActionService>();
+        services.AddSingleton(sp => new BusActionService(dataCatalog.DefaultData, sp.GetRequiredService<SubscriptionService>(), dataCatalog));
         services.AddSingleton(sp => new GuildPersonaStore(
             sp.GetRequiredService<ILlmStateStore>(), cfg.Llm.BuildPersonaLimits()));
 
@@ -119,7 +119,8 @@ internal static class BotServices
                     sp.GetRequiredService<GuildPersonaStore>(),
                     ArrivalsAsync(sp),
                     cfg.Llm.UiActions ? sp.GetRequiredService<BusSessionStore>() : null,
-                    cfg.Llm.UiActions ? sp.GetRequiredService<SavedGroupStore>() : null)
+                    cfg.Llm.UiActions ? sp.GetRequiredService<SavedGroupStore>() : null,
+                    sp.GetRequiredService<UserCityStore>())   // set_city 工具（使用者自己選城市）
                 : NoChatTools.Instance);
 
         services.AddSingleton(sp => new ChatOrchestrator(

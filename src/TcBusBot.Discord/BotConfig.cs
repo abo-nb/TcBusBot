@@ -187,8 +187,9 @@ public sealed class BotConfig
 
         if (cities.Count > 1)
             Console.WriteLine($"ℹ️  同時服務 {BusCity.DisplayOfMany(cities)}" +
-                              $"（{string.Join(" + ", cities)}）：站牌與路線合併成一份，" +
-                              "即時到站會按城市分批查。");
+                              $"（{string.Join(" + ", cities)}）：每個城市各一份資料" +
+                              "（不會混在一起 —— 使用者用 /bus city 選自己要查哪一個），" +
+                              "即時到站會按站牌的城市分批查。");
 
         cfg.Tdx.CacheDirectory = SettingResolver.Resolve(args, "--cache", file, ["TCBUS_CACHE"]).Value ?? "cache";
 

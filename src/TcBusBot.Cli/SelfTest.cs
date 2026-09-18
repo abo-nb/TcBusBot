@@ -3547,7 +3547,14 @@ public static class SelfTest
         Check("★ 可選多個城市時，提示詞會告訴模型「使用者自己選了哪一個」",
             multiCityOptions.MultiCity
             && multiCityOptions.CityNote.Contains("/bus city", StringComparison.Ordinal),
-            multiCityOptions.CityNote.Replace("\n", " ｜ "));
+            multiCityOptions.CityNote.Replace("\n", "  ｜ "));
+
+        // ⚠️ 多城市時**不能**說「你只有某個城市的資料」：工具其實會跨城市找，
+        //    提示詞跟工具講相反的話，模型就會跟使用者說「我只有臺中的資料」然後拒答。
+        Check("★ 多城市時不會說「你只有某個城市」（那跟工具的行為相反）",
+            !multiCityOptions.CityNote.Contains("你只有", StringComparison.Ordinal)
+            && multiCityOptions.CityNote.Contains("跨城市", StringComparison.Ordinal)
+            && multiCityOptions.CityNote.Contains("city", StringComparison.Ordinal));
 
         Check("單一城市時不會多那句（省 token）",
             !new LlmOptions { CityDisplays = ["臺中"] }.CityNote
@@ -3602,6 +3609,83 @@ public static class SelfTest
 
         Check("★ 即時到站分批用的是「站牌自己的城市」（換城市不會讓舊訂閱失效）",
             catalog.GroupByCity(["TXG0001", "TNN0001"]).Count == 2);
+
+        // ── 3f) LLM 工具要**跨城市找**（使用者實際回報：它抓不到臺南）──
+        //     使用者問「臺南車站到安平要搭幾號」時，他的城市很可能還是預設的臺中
+        //     （沒有人會先打 /bus city）。工具如果只看一份資料就會回「找不到站牌」，
+        //     使用者看到的是「它抓不到臺南」。
+        var cityActions = new BusActionService(
+            catalog.DefaultData, new SubscriptionService(), catalog);
+
+        var tainanStopSearch = cityActions.SearchStops("臺南車站", userId: 1UL);
+
+        Check("★ 城市還是臺中時，search_stops 也找得到臺南的站牌（並標示城市）",
+            tainanStopSearch.Contains("臺南車站", StringComparison.Ordinal)
+            && tainanStopSearch.Contains("臺南", StringComparison.Ordinal),
+            tainanStopSearch.Split('\n')[0]);
+
+        // ⚠️ 這一條抓的是「模糊相符搶走別的城市」的真實 bug：
+        //    在臺中的資料裡搜「臺南車站」也會撈到弱相符（例如臺中車站），
+        //    如果照「第一個有回應的城市」走，問臺南就會拿到臺中的站牌 ——
+        //    而且看起來像真的答案。所以一定要「強相符的城市優先」。
+        Check("★ 強相符優先：問臺南不會被臺中的模糊相符攔走（標籤要是臺南）",
+            tainanStopSearch.Contains("城市：臺南", StringComparison.Ordinal),
+            tainanStopSearch.Split('\n')[0]);
+
+        Check("★ find_routes 也跨城市（臺南車站 → 安平古堡）",
+            cityActions.FindRoutes("臺南車站", "安平古堡", userId: 1UL)
+                .Contains("臺南", StringComparison.Ordinal),
+            cityActions.FindRoutes("臺南車站", "安平古堡", userId: 1UL).Split('\n')[0]);
+
+        Check("還是找得到自己城市的（臺中車站 → 臺中公園）",
+            cityActions.FindRoutes("臺中車站", "臺中公園", userId: 1UL)
+                .Contains("臺中", StringComparison.Ordinal));
+
+        Check("★ 查路線號碼也跨城市（300 在臺中、5 在臺南，兩個都查得到）",
+            cityActions.SearchRoutes("300", userId: 1UL).Contains("300", StringComparison.Ordinal)
+            && cityActions.SearchRoutes("5", userId: 1UL).Contains("5", StringComparison.Ordinal));
+
+        // ── 指名城市（`city` 參數）：使用者說「我要查臺南的」時，模型可以直接指定 ──
+        //    為什麼需要：站名模糊比對很寬鬆，兩個城市都可能「有點像」，
+        //    只有使用者自己說得出他要哪一個城市。
+        var onlyTainan = cityActions.SearchStops("車站", userId: 1UL, city: "Tainan");
+
+        Check("★ 指名城市：search_stops(city: 臺南) 只回臺南的站牌（不會混到臺中）",
+            onlyTainan.Contains("臺南車站", StringComparison.Ordinal)
+            && !onlyTainan.Contains("臺中車站", StringComparison.Ordinal),
+            onlyTainan.Split('\n')[0]);
+
+        Check("★ 指名城市：find_routes 也只在那個城市找",
+            cityActions.FindRoutes("臺南車站", "安平古堡", userId: 1UL, city: "Tainan")
+                .Contains("臺南：臺南車站 → 安平古堡", StringComparison.Ordinal));
+
+        var citySub = cityActions.Subscribe(9UL, "臺南車站", "安平古堡", city: "Tainan");
+
+        Check("★ 指名城市：subscribe 訂得到（訂閱記在臺南的站牌上）",
+            citySub.Ok && citySub.Message.Contains("安平古堡", StringComparison.Ordinal),
+            citySub.Message.Split('\n')[0]);
+
+        Check("★ 指名「沒載入的城市」時講清楚能查哪些（模型才知道怎麼重試）",
+            cityActions.SearchStops("車站", userId: 1UL, city: "Kaohsiung")
+                .Contains("我能查的城市", StringComparison.Ordinal)
+            && cityActions.SearchStops("車站", userId: 1UL, city: "火星")
+                .Contains("不認識城市", StringComparison.Ordinal),
+            cityActions.SearchStops("車站", userId: 1UL, city: "Kaohsiung"));
+
+        Check("★ 指名的城市聽得懂中文與英文（臺南／Tainan／台南 都通）",
+            cityActions.SearchStops("車站", userId: 1UL, city: "臺南").Contains("臺南車站", StringComparison.Ordinal)
+            && cityActions.SearchStops("車站", userId: 1UL, city: "台南").Contains("臺南車站", StringComparison.Ordinal));
+
+        var notFound = cityActions.SearchStops("不存在的站XYZ", userId: 1UL);
+
+        Check("★ 找不到時會列出「有哪些城市可以查」（模型才知道要換城市）",
+            notFound.Contains("臺中", StringComparison.Ordinal)
+            && notFound.Contains("臺南", StringComparison.Ordinal),
+            notFound.Replace("\n", " ｜ "));
+
+        // set_city：使用者說「以後都幫我查臺南」時，模型可以把他的城市記下來
+        Check("★ 模型可以幫使用者切換城市（set_city → UserCityStore）",
+            cityStore.Set(1UL, "Tainan") && cityStore.Get(1UL) == "Tainan");
 
         var multiOptions = new TdxOptions { City = "Taichung" };
         multiOptions.Cities = ["Taichung", "Tainan"];
@@ -3763,21 +3847,31 @@ public static class SelfTest
     {
         var full = BuildCityFixture();
 
+        var tainan = city == "Tainan";
+
         var stops = new List<BusStop>
         {
-            new() { StopUID = city == "Tainan" ? "TNN0001" : "TXG0001",
+            new() { StopUID = tainan ? "TNN0001" : "TXG0001",
                     StopID = "1",
-                    StopName = new(city == "Tainan" ? "臺南車站" : "臺中車站", null),
+                    StopName = new(tainan ? "臺南車站" : "臺中車站", null),
                     City = city,
-                    StopPosition = new(120.2, 23.0, null) }
+                    StopPosition = new(120.21, 22.99, null) },
+            new() { StopUID = tainan ? "TNN0002" : "TXG0002",
+                    StopID = "2",
+                    StopName = new(tainan ? "安平古堡" : "臺中公園", null),
+                    City = city,
+                    StopPosition = new(120.16, 23.0, null) }
         };
 
         var sors = new List<BusStopOfRoute>
         {
-            new() { RouteUID = city == "Tainan" ? "TNN5" : "TXG300", Direction = 1,
-                    RouteName = new(city == "Tainan" ? "5" : "300", null),
-                    Stops = [ new() { StopUID = stops[0].StopUID, StopSequence = 1,
-                                      StopName = new(stops[0].ZhTwName, null) } ] }
+            new() { RouteUID = tainan ? "TNN5" : "TXG300", Direction = 1,
+                    RouteName = new(tainan ? "5" : "300", null),
+                    Stops =
+                    [
+                        new() { StopUID = stops[0].StopUID, StopSequence = 1, StopName = new(stops[0].ZhTwName, null) },
+                        new() { StopUID = stops[1].StopUID, StopSequence = 2, StopName = new(stops[1].ZhTwName, null) }
+                    ] }
         };
 
         var routes = new List<BusRoute>

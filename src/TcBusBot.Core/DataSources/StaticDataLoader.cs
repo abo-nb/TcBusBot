@@ -159,53 +159,16 @@ public static class StaticDataLoader
         }
     }
 
-    /// <summary>
-    /// **多城市**載入：每個城市各自讀快取／抓 API，再合併成一份資料集。
-    ///
-    /// 為什麼可以直接合併：站牌 UID 有城市前綴（臺中 `TXG…`、臺南 `TNN…`）、
-    /// 路線 UID／SubRouteUID 也一樣，所以兩個城市的清單接起來不會撞。
-    /// 站名索引仍然照站名建立 —— 於是「臺南車站」與「臺中車站」都查得到
-    /// （同名站牌各自屬於不同城市，查詢結果會分開列）。
-    /// </summary>
-    public static async Task<StaticDataSet> LoadManyAsync(
-        TdxApiClient api,
-        TdxOptions options,
-        bool refresh = false,
-        Action<string>? log = null,
-        CancellationToken ct = default)
-    {
-        var cities = options.EffectiveCities;
-
-        if (cities.Count == 1) return await LoadAsync(api, options, refresh, log, ct);
-
-        var stops = new List<BusStop>();
-        var sors = new List<BusStopOfRoute>();
-        var routes = new List<BusRoute>();
-
-        foreach (var city in cities)
-        {
-            var cityOptions = new TdxOptions
-            {
-                BaseUrl = options.BaseUrl,
-                City = city,
-                CacheDirectory = options.CacheDirectory,
-                ClientId = options.ClientId,
-                ClientSecret = options.ClientSecret
-            };
-
-            log?.Invoke($"[資料] {BusCity.DisplayOf(city)}：開始載入…");
-
-            var set = await LoadAsync(api, cityOptions, refresh, log, ct);
-
-            stops.AddRange(set.Stops);
-            sors.AddRange(set.StopOfRoutes);
-            routes.AddRange(set.Routes);
-
-            log?.Invoke($"[資料] {BusCity.DisplayOf(city)}：{set.Describe()}");
-        }
-
-        return new StaticDataSet(stops, sors, routes);
-    }
+    // ── 為什麼這裡**沒有**「多城市合併成一份」的方法 ───────────────
+    //
+    // 一開始曾經有一個 `LoadManyAsync`：把每個城市的站牌接成一大份。
+    // 站牌 UID 有城市前綴（臺中 `TXG…`、臺南 `TNN…`）所以接起來不會撞，
+    // 看起來很省事 —— 但那會讓**每一個查詢路徑**都必須記得過濾城市
+    // （站牌搜尋、站區群組、路線號碼、轉乘、面板選項…），漏掉一個就吐出別的城市的站牌，
+    // 而且不會報錯（使用者只會覺得「怎麼查到外縣市的站」）。
+    //
+    // 現在的作法是一 **個城市一份索引**，用 `BusDataCatalog.For(userId)` 決定要用哪一份
+    //（見 `BusDataCatalog` 的說明）。所以這裡刻意不提供合併的方法。
 
     /// <summary>快取檔存在嗎（不論新舊；有帶城市的新檔名優先，其次才是舊檔名）。</summary>
     public static bool CacheExists(string cacheDirectory, string? city = BusCity.Default)

@@ -1,9 +1,11 @@
+using System.ComponentModel;
 using System.Reflection;
 using System.Text;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.SemanticKernel;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
 using TcBusBot.Core.Configuration;
@@ -542,6 +544,9 @@ public static class DryRun
 
         // ── 模型「幫使用者按按鈕」（UI 動作）──────────────────
         AuditUiTools(data);
+
+        // ── LLM 公車工具的參數（模型看不看得懂怎麼填）──────────
+        AuditBusToolSchema();
 
         // ── 偷聽模式的入口（「後面的訊息全被忽略」的那個 bug）────
         AuditEavesdropWiring();
@@ -2217,6 +2222,76 @@ public static class DryRun
         else
             Console.WriteLine($"  ✔ {checkedCount} 組關鍵字：面板與 LLM 工具算出同一組站牌" +
                               "（含同名不同月台，不會漏）");
+    }
+
+    /// <summary>
+    /// **LLM 公車工具的參數**（`bus` plugin）的離線驗證。
+    ///
+    /// 為什麼要驗「參數」而不是只驗行為：模型只看得見 SK 的 schema ——
+    /// 參數被拿掉、或**忘了寫 `[Description]`**，模型就完全不知道可以填，
+    /// 這在 C# 這邊不會有任何錯誤（編譯照過、行為測試也照過，因為那些測試是直接呼叫方法的）。
+    /// 實際踩過的例子：使用者說「我要查臺南的」，模型手上卻沒有「指定城市」這個參數。
+    /// </summary>
+    private static void AuditBusToolSchema()
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ LLM 公車工具檢查  模型看得見哪些參數");
+
+        var before = _problems;
+
+        var methods = typeof(BusTools).GetMethods()
+            .Where(m => m.GetCustomAttribute<KernelFunctionAttribute>() is not null)
+            .ToList();
+
+        var names = methods
+            .Select(m => m.GetCustomAttribute<KernelFunctionAttribute>()!.Name ?? m.Name)
+            .ToList();
+
+        Console.WriteLine($"  ℹ {names.Count} 個工具：{string.Join("、", names)}");
+
+        foreach (var expected in new[] { "set_city", "search_stops", "find_routes", "subscribe_bus" })
+        {
+            if (!names.Contains(expected))
+                Problem($"公車工具少了一個：{expected}（模型會不知道這件事可以做）");
+        }
+
+        // 這三個工具收得下「使用者自己講的城市」—— 使用者說「我要查臺南的」時只能靠它
+        foreach (var tool in new[] { "search_stops", "find_routes", "subscribe_bus" })
+        {
+            var method = methods.FirstOrDefault(m =>
+                (m.GetCustomAttribute<KernelFunctionAttribute>()!.Name ?? m.Name) == tool);
+
+            if (method is null) continue;   // 上面已經報過了
+
+            var city = method.GetParameters().FirstOrDefault(p => p.Name == "city");
+
+            if (city is null)
+            {
+                Problem($"{tool} 沒有 city 參數 —— 使用者說「我要查臺南的」時模型沒辦法指名城市");
+                continue;
+            }
+
+            if (city.GetCustomAttribute<DescriptionAttribute>() is null)
+                Problem($"{tool} 的 city 參數沒有 [Description] —— 模型看不到說明就不會填它");
+
+            if (!city.HasDefaultValue)
+                Problem($"{tool} 的 city 一定要有預設值（不然模型每次都被迫填一個城市）");
+        }
+
+        // 每個參數都要有說明（SK 會把它變成 schema 的 description）
+        foreach (var method in methods)
+        {
+            var tool = method.GetCustomAttribute<KernelFunctionAttribute>()!.Name ?? method.Name;
+
+            foreach (var p in method.GetParameters().Where(p => p.GetCustomAttribute<DescriptionAttribute>() is null))
+                Problem($"{tool} 的參數 {p.Name} 沒有 [Description]（模型只看得到名字，很難填對）");
+
+            if (method.GetCustomAttribute<DescriptionAttribute>() is null)
+                Problem($"{tool} 這個工具本身沒有 [Description]（模型不知道什麼時候該用它）");
+        }
+
+        if (_problems == before)
+            Console.WriteLine("  ✔ 每個工具（含參數）都有說明，跨城市的三個工具都收得下 city");
     }
 
     /// <summary>把元件裡所有 Select Menu 的選項值抓出來。</summary>
