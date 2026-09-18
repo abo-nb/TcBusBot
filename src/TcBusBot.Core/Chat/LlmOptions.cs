@@ -273,6 +273,30 @@ public sealed class LlmOptions
     public bool TellSelfName { get; set; } = true;
 
     /// <summary>
+    /// 這個實例服務的城市顯示名（例：臺中、臺南）。由主機端依 `BUS_CITY` 填進來。
+    ///
+    /// 為什麼放在選項、而且**不管有沒有自訂提示詞都會寫進系統提示**：
+    /// 這是「這個行程的事實」（工具查到的站牌與路線都是那個城市的），
+    /// 不是使用者的偏好。之前只用 `{city}` 代入**預設**人格 ——
+    /// 一旦主機設了 `LLM_SYSTEM_PROMPT`，模型就完全不知道自己服務哪個城市，
+    /// 於是跑臺南的實例還是會跟使用者聊台中公車。
+    /// </summary>
+    public string CityDisplay { get; set; } = "臺中";
+
+    /// <summary>「你服務的是哪個城市」那一段（<see cref="CityDisplay"/> 為空時回傳空字串）。</summary>
+    public string CityNote
+        => string.IsNullOrWhiteSpace(CityDisplay)
+            ? ""
+            : $"""
+
+
+                【服務範圍】
+                你查到的公車資料都是**{CityDisplay}**的（站牌、路線、到站時間都是）。
+                不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有{CityDisplay}的資料，
+                並請他把 BUS_CITY 改過去（或改用那個縣市的 Bot）。
+                """;
+
+    /// <summary>
     /// **讓模型看得懂圖片**（`LLM_VISION`，預設開）。
     ///
     /// ⚠️ 重點是「**只有使用者指定才會用**」：

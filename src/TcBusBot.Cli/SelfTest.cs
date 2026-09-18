@@ -2403,8 +2403,11 @@ public static class SelfTest
             < prompt.IndexOf("很正式", StringComparison.Ordinal));
 
         var otherPrompt = orchestrator.EffectiveSystemPrompt(999UL);
-        Check("★ 沒有學過東西的伺服器拿到的是乾淨的提示詞",
-            otherPrompt == "【主機人格】", otherPrompt);
+        Check("★ 沒有學過東西的伺服器不會被加上任何規則（固定附加的只有「服務範圍」那一段）",
+            otherPrompt.StartsWith("【主機人格】", StringComparison.Ordinal)
+            && !otherPrompt.Contains("這個伺服器後天學到的規則", StringComparison.Ordinal)
+            && otherPrompt.Contains("服務範圍", StringComparison.Ordinal),
+            otherPrompt.Replace("\n", " ｜ "));
     }
 
     /// <summary>
@@ -3477,6 +3480,45 @@ public static class SelfTest
 
         Check("不會留下沒被取代的 {city}",
             !taichungPrompt.Contains('{') && !tainanPrompt.Contains('{'));
+
+        // ── 3b) 「LLM 不知道自己在服務哪個城市」──────────────
+        //     使用者實際遇到的問題：主機有自訂 LLM_SYSTEM_PROMPT 時，
+        //     原本只靠預設人格的 {city} 佔位代入 → 自訂提示詞的人**完全不會被代入**，
+        //     於是跑臺南的實例還是會跟使用者聊台中公車。
+        //     修法：服務城市改成獨立的一段，**無條件**附加在系統提示後面。
+        var customPromptOptions = new LlmOptions
+        {
+            SystemPrompt = "你是笨蛋猫猫，講話簡短。",   // ← 主機自訂，沒有 {city}
+            CityDisplay = "臺南",
+            ToolsEnabled = false
+        };
+
+        var customChat = new ChatOrchestrator(
+            new CountingLlmClient("OK"), customPromptOptions,
+            new ConversationStore(customPromptOptions),
+            new WeeklyTokenBudget(customPromptOptions), NoChatTools.Instance, new GuildPersonaStore());
+
+        var customEffective = customChat.EffectiveSystemPrompt(1UL);
+
+        Check("★ 就算主機自訂了提示詞，模型也一定知道自己在服務哪個城市",
+            customEffective.Contains("臺南", StringComparison.Ordinal)
+            && customEffective.Contains("服務範圍", StringComparison.Ordinal)
+            && customEffective.Contains("你是笨蛋猫猫", StringComparison.Ordinal),
+            customEffective.Replace("\n", " ｜ "));
+
+        Check("★ 而且會被告知「不要回答其他縣市」",
+            customEffective.Contains("不要回答其他縣市", StringComparison.Ordinal));
+
+        var taichungChat = new ChatOrchestrator(
+            new CountingLlmClient("OK"), new LlmOptions { SystemPrompt = "x", ToolsEnabled = false },
+            new ConversationStore(new LlmOptions()), new WeeklyTokenBudget(new LlmOptions()),
+            NoChatTools.Instance, new GuildPersonaStore());
+
+        Check("預設城市是臺中（沒特別設定時）",
+            taichungChat.EffectiveSystemPrompt(1UL).Contains("你查到的公車資料都是**臺中**", StringComparison.Ordinal));
+
+        Check("城市顯示名留空時不會多出那一段（省 token）",
+            !new LlmOptions { CityDisplay = "", SystemPrompt = "x" }.CityNote.Contains("服務範圍", StringComparison.Ordinal));
 
         // ── 4) 「LLM 有沒有接上」的可觀測性（/ai status 要講得出來）──────
         //     使用者反應「LLM 似乎沒有接上」時，最難的是看不出是哪一種壞掉：

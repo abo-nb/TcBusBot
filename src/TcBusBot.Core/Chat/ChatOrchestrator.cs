@@ -170,6 +170,13 @@ public sealed class ChatOrchestrator
             ? OwnerInstructions.TrimStart() + "\n\n" + _options.SystemPrompt
             : _options.SystemPrompt;
 
+        // ★「你服務的是哪個城市」**無條件**附加（在自訂人格之後）。
+        //   為什麼不靠 `{city}` 佔位：那只有代入**預設**人格時才會發生 ——
+        //   主機一旦設了 `LLM_SYSTEM_PROMPT`，模型就完全不知道自己服務哪個縣市，
+        //   於是跑臺南的實例還是會跟使用者聊台中公車（使用者實際遇到的問題）。
+        //   這是「這個行程的事實」，不是使用者的偏好，所以不受自訂提示詞影響。
+        prompt += _options.CityNote;
+
         // 「你在這裡叫什麼」——伺服器把 Bot 改暱稱時，有人喊那個名字它才知道是在叫它。
         if (_options.TellSelfName && SelfNameNote(ResolveSelfName(selfName)) is { } note)
             prompt += note;

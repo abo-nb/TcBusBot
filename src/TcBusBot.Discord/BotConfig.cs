@@ -212,7 +212,11 @@ public sealed class BotConfig
 
         var systemPrompt = SettingResolver.Resolve(args, "--llm-prompt", file, ["LLM_SYSTEM_PROMPT"]).Value;
 
-        // 沒自己寫提示詞時，把預設人格裡的 {city} 換成實際服務的城市
+        // 服務的城市（顯示名）——**不管有沒有自訂提示詞都要讓模型知道**
+        // （見 LlmOptions.CityNote：這是這個行程的事實，不是使用者的偏好）。
+        cfg.Llm.CityDisplay = BusCity.DisplayOf(cfg.Tdx.City);
+
+        // 沒自己寫提示詞時，順便把預設人格裡的 {city} 換成實際服務的城市
         // （不然跑臺南的實例會自稱「我主要幫大家查台中公車」）。
         cfg.Llm.SystemPrompt = string.IsNullOrWhiteSpace(systemPrompt)
             ? LlmOptions.DefaultSystemPrompt.Replace("{city}", BusCity.DisplayOf(cfg.Tdx.City))

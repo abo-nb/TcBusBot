@@ -53,7 +53,7 @@ public sealed class BusTools
 
     [KernelFunction("search_stops")]
     [Description("用關鍵字查公車站牌的正確名稱，並回報有哪幾條路線經過" +
-                 "（支援模糊比對：打「台中」也會找到「臺中」、「火車站」也會找到「車站」、縮寫也通）。" +
+                 "（支援模糊比對：打「台中」也會找到「臺中」、打「火車站」也會找到「車站」、縮寫也通）。" +
                  "站名不確定時先用這個查，不要用猜的。")]
     public string SearchStops(
         [Description("站名關鍵字，站名關鍵字，例如「火車站」「靜宜」「科大」")] string keyword)

@@ -74,6 +74,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .WithTitle("🤖 AI 聊天狀態")
             .WithColor(enabled ? new Color(0x2B, 0x6C, 0xB0) : new Color(0x5A, 0x5A, 0x5A))
             .AddField("啟用", enabled ? "✅ 已啟用" : "❌ 未啟用（主機沒有設定 LLM_API_KEY）", inline: false)
+            .AddField("服務城市", $"{_options.CityDisplay}（模型會被明確告知只回答這個縣市）", inline: false)
             .AddField("模型", enabled ? $"{_options.Model} @ {_options.EndpointHost}" : "—", inline: false)
             .AddField("判斷用的模型",
                 !enabled

@@ -1808,6 +1808,26 @@ public static class DryRun
             Console.WriteLine("  ✔ 短判斷被標成 JudgeCall，而且建立流程真的會建出「兩個模型」那一層");
         }
 
+        // ── 服務城市有沒有真的告訴模型 ──────────────────────
+        //    （使用者實際遇到的問題：主機自訂提示詞時，模型不知道自己服務哪個城市）
+        Console.WriteLine($"  ℹ 服務範圍會寫進系統提示：{llm.CityDisplay}（不論有沒有自訂提示詞）");
+
+        var cityProbe = new ChatOrchestrator(
+            new DisabledLlmClient(), llm, new ConversationStore(llm),
+            new WeeklyTokenBudget(llm), NoChatTools.Instance, new GuildPersonaStore());
+
+        var cityPrompt = cityProbe.EffectiveSystemPrompt(1UL);
+
+        if (!cityPrompt.Contains(llm.CityDisplay, StringComparison.Ordinal)
+            || !cityPrompt.Contains("服務範圍", StringComparison.Ordinal))
+        {
+            Problem($"系統提示沒有告訴模型它服務的是{llm.CityDisplay} —— 它會跟使用者聊別的縣市");
+        }
+        else
+        {
+            Console.WriteLine($"  ✔ 系統提示含「服務範圍：{llm.CityDisplay}」（自訂提示詞也蓋不掉）");
+        }
+
         // ── 圖片理解（只有「被指定」的那一則才會附圖）──────────
         Console.WriteLine($"  ℹ 圖片理解：{(llm.Vision ? $"開啟（一次最多 {llm.VisionMaxImages} 張，每張最多約 1024 tokens）" : "關閉（LLM_VISION=false）")}");
 

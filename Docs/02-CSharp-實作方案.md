@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 637 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 641 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 637 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 641 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -3809,6 +3809,42 @@ BUS_CITY=高雄          # 中文也通
 | AI 預設人格改用 `{city}` 佔位 | 自訂 `LLM_SYSTEM_PROMPT` 的人有自己的字，不該被改；沒自訂的才代入實際城市 |
 | `--dryrun` 在非臺中時**改用內建資料集跑劇本**，並另外檢查城市設定 | 那整套劇本（臺中車站 → 靜宜大學、300／304、干城站）是以臺中走廊寫的 |
 | 順手把 `TaichungBusDataService` 改名 `BusDataService` | 服務多個城市之後，類別名稱不該綁一個城市 |
+
+#### 20.23.2b 「模型不知道自己服務哪個城市」（實際遇到的問題）
+
+上線後使用者回報：「指臺南的部分 LLM 不知道」。
+根因：城市只靠**預設人格**裡的 `{city}` 佔位代入，而那段程式碼是
+
+```csharp
+cfg.Llm.SystemPrompt = string.IsNullOrWhiteSpace(systemPrompt)
+    ? LlmOptions.DefaultSystemPrompt.Replace("{city}", cityDisplay)   // ← 只有沒自訂時才走這裡
+    : systemPrompt!;                                                  // ← 自訂的人完全沒有城市資訊
+```
+
+主機一旦設了 `LLM_SYSTEM_PROMPT`（這個實例就有），模型就**完全不知道自己服務哪個縣市** ——
+跑臺南的實例照樣跟使用者聊台中公車。
+
+修法：把「服務哪個城市」從**人格的一部分**改成**獨立的一段事實**，
+由 `LlmOptions.CityNote` 提供、`EffectiveSystemPrompt` **無條件**附加
+（在自訂人格之後、工具說明之前）：
+
+```
+【服務範圍】
+你查到的公車資料都是**臺南**的（站牌、路線、到站時間都是）。
+不要回答其他縣市的路線或班次；如果使用者問別的縣市，就說明你只有臺南的資料，
+並請他把 BUS_CITY 改過去（或改用那個縣市的 Bot）。
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| 城市用「附加一段」而不是「代入佔位」 | 佔位只在預設人格裡生效，自訂提示詞的人就拿不到；而「這個行程服務哪個縣市」是**事實**，不該取決於使用者的偏好 |
+| 明確寫「不要回答其他縣市」 | 模型的訓練資料裡有全台公車；不講清楚它會很自然地聊起台中的路線 |
+| `{city}` 佔位仍然保留 | 沒自訂提示詞的人，人格讀起來還是順的（「主要幫大家查臺南公車」） |
+| `/ai status` 新增「服務城市」欄位 | 使用者要能自己確認這件事有沒有生效 |
+
+驗收（`tcbus selftest` 新增 **5 項**）：自訂提示詞 ＋ 城市＝臺南 → 系統提示仍含「服務範圍／臺南」；
+含「不要回答其他縣市」；預設是臺中；`CityDisplay` 留空時不多加那一段。
+`--dryrun` 也會用同一條路徑產生一次系統提示，確認城市真的在裡面。
 
 #### 20.23.3 驗收
 
