@@ -16,6 +16,23 @@ public static class PersonaGrantCid
 }
 
 /// <summary>
+/// 授權通知上那兩顆按鈕的產生。
+///
+/// 為什麼要抽出來（而不是留在 <c>/ai pset</c> 的流程裡）：`--dryrun` 的接線檢查
+/// 是「畫面上出現的每個 custom_id 都要有處理函式、每個處理函式都要有按鈕」，
+/// 而這則通知是發到**別的伺服器**、不會在本機的驗證畫面上出現 ——
+/// 抽成純函式之後，驗證程式就能把它建出來對照，不必靠「例外名單」放行。
+/// </summary>
+public static class PersonaGrantButtons
+{
+    public static MessageComponent Notice(string requestId)
+        => new ComponentBuilder()
+            .WithButton("✅ 同意並複製", PersonaGrantCid.AllowButton(requestId), ButtonStyle.Success)
+            .WithButton("🚫 拒絕", PersonaGrantCid.DenyButton(requestId), ButtonStyle.Danger)
+            .Build();
+}
+
+/// <summary>
 /// `/ai pset from:` 的**授權按鈕**：在來源伺服器按下同意或拒絕。
 ///
 /// 為什麼要一顆按鈕而不是叫對方改環境變數：

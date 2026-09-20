@@ -150,7 +150,25 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         if (_budget.Usage.ByGuild.Count > 0)
             embed.AddField("用量來源", string.Join("\n", top), inline: false);
 
-        await RespondAsync(embed: embed.Build(), ephemeral: true);
+        // 管理員多一顆「♻️ 重置本週額度」——額度用完時唯一的即時解法
+        //（以前只能改環境變數＋重啟，或等到 UTC 週一）。
+        // ⚠️ 按鈕「只給管理員看」只是方便，**不是**安全機制：
+        //    按下去的當下會再檢查一次（見 QuotaResetPolicy）。
+        var isAdmin = QuotaResetPolicy.IsAdmin(_options, Context.User.Id);
+
+        if (isAdmin)
+            embed.AddField("重置額度",
+                _budget.Usage.TotalTokens > 0
+                    ? "按下面的按鈕可以把這一週的用量歸零（會先跳一次確認）。"
+                    : "這一週還沒有用量（不用重置）。按鈕仍然可以按，會顯示確認畫面。",
+                inline: false);
+
+        await RespondAsync(
+            embed: embed.Build(),
+            components: isAdmin
+                ? QuotaResetButtons.StatusRow(Context.User.Id).Build()
+                : null,
+            ephemeral: true);
     }
 
     [SlashCommand("learned", "看我（這個伺服器）學到了哪些規矩與自訂表情的意思")]
@@ -353,10 +371,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 "只有這個伺服器的管理員（或有 `Manage Server` 權限的人）能按")
             .Build();
 
-        var buttons = new ComponentBuilder()
-            .WithButton("✅ 同意並複製", PersonaGrantCid.AllowButton(request.Id), ButtonStyle.Success)
-            .WithButton("🚫 拒絕", PersonaGrantCid.DenyButton(request.Id), ButtonStyle.Danger)
-            .Build();
+        var buttons = PersonaGrantButtons.Notice(request.Id);
 
         try
         {

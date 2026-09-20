@@ -1370,6 +1370,52 @@ public static class SelfTest
         Check("重啟後也記得是哪些伺服器花的",
             reloaded.Usage.ByGuild.TryGetValue("42", out var reused) && reused == 200);
 
+        // ── 8b) 「重置這一週的額度」（`/ai status` 上那顆管理員按鈕做的事）──
+        //     為什麼要驗這一塊：這顆按鈕等於**把已經花掉的額度還回來**，
+        //     做錯的兩種方向都很糟 ——
+        //       * 按了沒效 → 額度照樣被擋，使用者以為「重置了」但其實沒有
+        //       * 沒寫進儲存區 → 重啟之後舊用量又回來（等於沒重置）
+        var resetStore = new FakeStateStore();
+        var resetBudget = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 5000 }, resetStore, t0);
+        resetBudget.Record(3000, 200, 7UL, t0);
+        resetBudget.RecordRefusal(t0);
+
+        var beforeReset = resetBudget.Usage.TotalTokens;
+        var blockedBefore = resetBudget.Check(4000, t0);
+
+        resetBudget.Reset(t0);
+
+        Check("★ 重置之前先確認「真的會被擋」（不然這一組驗證沒有意義）",
+            beforeReset == 3200 && !blockedBefore.Allowed, blockedBefore.Reason);
+
+        Check("★ 重置之後這一週的用量歸零（用量、次數、被擋次數、來源統計全清）",
+            resetBudget.Usage.TotalTokens == 0
+            && resetBudget.Usage.Calls == 0
+            && resetBudget.Usage.Refusals == 0
+            && resetBudget.Usage.ByGuild.Count == 0,
+            resetBudget.Describe());
+
+        Check("★ 重置之後額度立刻恢復（不必等到下週一）",
+            resetBudget.Check(4000, t0).Allowed && resetBudget.Check(4000, t0).Remaining == 5000);
+
+        Check("★ 重置要寫進儲存區（不然重啟後舊用量會回來）",
+            new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 5000 }, resetStore, t0)
+                .Usage.TotalTokens == 0);
+
+        // 額度用完時，訊息要告訴管理員「去哪裡按重置」
+        var exhausted = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 1000 }, store: null, now: t0);
+        exhausted.Record(1000, 0, 1UL, t0);
+        var exhaustedCheck = exhausted.Check(10, t0);
+
+        Check("★ 額度用完的訊息會告訴**管理員**去 /ai status 按重置",
+            !exhaustedCheck.Allowed
+            && ChatOrchestrator.RefusalText(exhaustedCheck, isAdmin: true)
+                .Contains("重置本週額度", StringComparison.Ordinal),
+            ChatOrchestrator.RefusalText(exhaustedCheck, isAdmin: true).Replace("\n", " ｜ "));
+
+        Check("一般使用者看到同樣的訊息時不會多出那句（他不知道那是什麼，也按不到）",
+            !ChatOrchestrator.RefusalText(exhaustedCheck).Contains("重置本週額度", StringComparison.Ordinal));
+
         // ── 9) 對話記憶會過期清掉 ────────────────────────
         var ttlStore = new ConversationStore(new LlmOptions { ChannelTtl = TimeSpan.FromHours(1) });
         var ttlTurn = Turn(1, "小明", "嗨", t0);

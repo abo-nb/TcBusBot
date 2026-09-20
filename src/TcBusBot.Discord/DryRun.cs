@@ -536,14 +536,20 @@ public static class DryRun
         // 空的 Select Menu 在 Build() 時丟例外 → Discord 顯示「無法提交」。
         Boundary(data);
 
-        // ── 元件與處理函式的雙向接線檢查 ────────────────────
-        AuditWiring();
-
         // ── 面板與 LLM 共用同一份站牌解析 ────────────────────
         AuditStopPicks(data);
 
         // ── 模型「幫使用者按按鈕」（UI 動作）──────────────────
         AuditUiTools(data);
+
+        // ── 「♻️ 重置本週額度」按鈕（會改到全機設定）──────────
+        AuditQuotaReset();
+
+        // ── 元件與處理函式的雙向接線檢查 ────────────────────
+        //    ⚠️ 一定要排在**所有會畫出元件的小節之後**：
+        //    它的作法是「畫面上出現的每個 custom_id ↔ 模組註冊的處理函式」雙向比對，
+        //    太早跑就會把「後面才畫出來的按鈕」全部誤判成「按了沒反應」。
+        AuditWiring();
 
         // ── LLM 公車工具的參數（模型看不看得懂怎麼填）──────────
         AuditBusToolSchema();
@@ -1140,6 +1146,114 @@ public static class DryRun
     }
 
     /// <summary>
+    /// `/ai status` 上「♻️ 重置本週額度」那顆按鈕的離線驗證。
+    ///
+    /// 為什麼這顆按鈕特別需要離線驗證：它動的是**全機**的東西（每週 token 額度
+    /// 是整個 Bot 共用一份），而且「重置」等於**把已經花掉的額度還回來** ——
+    /// 授權寫錯就是「任何人都能讓額度歸零」，那不只是功能問題，是**錢**的問題。
+    ///
+    /// 驗四件事：
+    ///   1. **畫面接得上**：把按鈕真的建出來（接線檢查會對照處理函式是否存在）
+    ///   2. **授權是純函式**：非管理員、以及別人的按鈕，一定被擋
+    ///   3. **按第一次不會重置**：第一次只顯示確認畫面（「按兩次」才有作用）
+    ///   4. **真的會重置而且留紀錄**：`WeeklyTokenBudget.Reset` ＋ 主人操作紀錄
+    /// </summary>
+    private static void AuditQuotaReset()
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 額度重置按鈕檢查  `/ai status` 上的「♻️ 重置本週額度」");
+
+        const ulong openedBy = 123456789012345678UL;
+        const ulong otherAdmin = 987654321098765432UL;
+        const ulong normalUser = 555UL;
+
+        // ── 1) 畫面（只有管理員看得到）──────────────────────
+        Print(new EmbedBuilder()
+                .WithColor(new Color(0x5A, 0x5A, 0x5A))
+                .WithTitle("（示意）/ai status 底部的按鈕 —— 只有 LLM_ADMIN_IDS 看得到")
+                .WithDescription("按下去**不會**直接重置，會先跳一次確認。")
+                .Build(),
+            QuotaResetButtons.StatusRow(openedBy).Build());
+
+        Print(new EmbedBuilder()
+                .WithColor(new Color(0xE6, 0x7E, 0x22))
+                .WithTitle("（示意）確認畫面 —— 要按第二次才會真的歸零")
+                .WithDescription("按鈕只認「開啟它的那個人」；換別人按會被拒絕。")
+                .Build(),
+            QuotaResetButtons.ConfirmRow(openedBy).Build());
+
+        // 跨伺服器授權通知是發到**別的**伺服器，本機驗證畫面上不會出現，
+        // 所以在這裡也建出來，讓接線檢查對得到它的處理函式。
+        Print(new EmbedBuilder()
+                .WithColor(new Color(0xE6, 0x7E, 0x22))
+                .WithTitle("（示意）跨伺服器授權通知上的按鈕（發到來源伺服器）")
+                .Build(),
+            PersonaGrantButtons.Notice("demo"));
+
+        // ── 2) 授權：各種身分餵給純函式 ─────────────────────
+        var options = new LlmOptions { AdminUserIds = [openedBy] };
+
+        var selfAdmin = QuotaResetPolicy.DenyReason(options, openedBy, openedBy);
+        var stranger = QuotaResetPolicy.DenyReason(options, openedBy, normalUser);
+        var otherAdminPress = QuotaResetPolicy.DenyReason(
+            new LlmOptions { AdminUserIds = [openedBy, otherAdmin] }, openedBy, otherAdmin);
+
+        if (selfAdmin is not null)
+            Problem("管理員按自己的「重置額度」按鈕竟然被擋下來 —— 這個功能等於不能用");
+        else if (stranger is null)
+            Problem("非管理員竟然可以重置額度 —— 額度是**全機**的，任何人都能讓它歸零");
+        else if (otherAdminPress is null)
+            Problem("另一個管理員可以按別人的確認按鈕 —— 「按兩次才生效」的確認形同虛設");
+        else if (QuotaResetPolicy.IsAdmin(new LlmOptions { AdminUserIds = [] }, openedBy))
+            Problem("沒有設定 LLM_ADMIN_IDS 時竟然有人是管理員（fail closed 被破壞）");
+        else
+            Console.WriteLine("  ✔ 只有名單上的本人能按：非管理員擋、別的管理員也擋、沒設名單時誰都不能按");
+
+        // custom_id 的解析要嚴格（不確定的東西不能用猜的）
+        if (QuotaResetCid.OpenedBy(QuotaResetCid.AskButton(openedBy), QuotaResetCid.Ask) != openedBy
+            || QuotaResetCid.OpenedBy("quota:reset:ask:abc", QuotaResetCid.Ask) is not null
+            || QuotaResetCid.OpenedBy(QuotaResetCid.ConfirmButton(openedBy), QuotaResetCid.Ask) is not null
+            || QuotaResetCid.OpenedBy(null, QuotaResetCid.Ask) is not null)
+        {
+            Problem("custom_id 解析不嚴格（前綴或數字不對時應該回 null，不能猜）");
+        }
+        else
+        {
+            Console.WriteLine("  ✔ custom_id 解析嚴格：前綴不對／不是數字／換一顆按鈕的 id 都不會被當成有效");
+        }
+
+        // ── 3) 真的會重置嗎（按第一次不該動到資料）───────────
+        var ask = typeof(QuotaResetModule).GetMethod("AskCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var confirm = typeof(QuotaResetModule).GetMethod("ConfirmCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var cancel = typeof(QuotaResetModule).GetMethod("CancelCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        var askCalls = ask is null ? [] : CollectCalls(ask, resolveAll: true);
+        var confirmCalls = confirm is null ? [] : CollectCalls(confirm, resolveAll: true);
+        var cancelCalls = cancel is null ? [] : CollectCalls(cancel, resolveAll: true);
+
+        if (ask is null || confirm is null || cancel is null)
+            Problem("找不到 QuotaResetModule 的處理函式（AskCoreAsync／ConfirmCoreAsync／CancelCoreAsync）");
+        else if (!askCalls.Contains("QuotaResetModule.Authorize"))
+            Problem("「重置額度」的確認畫面沒有先檢查授權");
+        else if (!confirmCalls.Contains("QuotaResetPolicy.DenyReason")
+                 && !confirmCalls.Contains("QuotaResetModule.Authorize"))
+            Problem("按下「確定重置」時沒有再檢查一次授權（只靠「看不到就按不到」是不夠的）");
+        else if (askCalls.Contains("WeeklyTokenBudget.Reset"))
+            Problem("按第一次就重置了 —— 應該只顯示確認畫面，要按第二次才生效");
+        else if (cancelCalls.Contains("WeeklyTokenBudget.Reset"))
+            Problem("按「取消」竟然也會重置");
+        else if (!confirmCalls.Contains("WeeklyTokenBudget.Reset"))
+            Problem("按了「確定重置」卻沒有真的重置（WeeklyTokenBudget.Reset）");
+        else if (!confirmCalls.Contains("GuildPersonaStore.AuditAdmin"))
+            Problem("重置沒有留下主人操作紀錄 —— 「額度怎麼突然變多」會查不出來是誰做的");
+        else
+            Console.WriteLine("  ✔ 第一次只顯示確認、取消不會動資料、確定才重置，而且會記進 /ai audit");
+    }
+
+    /// <summary>
     /// 這些 custom_id 不是由「訊息上的元件」觸發，所以不會出現在畫面上：
     /// Modal 是 <c>RespondWithModalAsync&lt;T&gt;(id)</c> 直接開的，
     /// 而 <c>bus:panel</c> 是「沒有任何訂閱時」的清單按鈕（本驗證一定有訂閱）。
@@ -1149,9 +1263,12 @@ public static class DryRun
            or Cid.GroupRenameModal or Cid.GroupMergeModal
            || Matches(Cid.Panel, id);
 
+    /// <summary>每個伺服器各自一份的按鈕／選單處理函式（給接線檢查用的清單）。</summary>
+    private static readonly Type[] ComponentModules = [.. BotModules.All.Select(m => m.Type)];
+
     private static string[] Handlers()
-        => _handlers ??= typeof(BusComponentModule)
-            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        => _handlers ??= ComponentModules
+            .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Instance))
             .SelectMany(m => m.GetCustomAttributes(inherit: true))
             .Select(a => a switch
             {
@@ -1208,12 +1325,10 @@ public static class DryRun
 
         try
         {
-            interactions.AddModuleAsync<BusModule>(services).GetAwaiter().GetResult();
-            interactions.AddModuleAsync<BusComponentModule>(services).GetAwaiter().GetResult();
-            interactions.AddModuleAsync<SayModule>(services).GetAwaiter().GetResult();
-            interactions.AddModuleAsync<ChatModule>(services).GetAwaiter().GetResult();
-            interactions.AddModuleAsync<PersonaGrantModule>(services).GetAwaiter().GetResult();
-            interactions.AddModuleAsync<ResetModule>(services).GetAwaiter().GetResult();
+            // 與 Program 用同一份清單（BotModules）：漏掉一個模組 ＝ 那組指令在線上不會出現，
+            // 而這種事只有在使用者說「指令不見了」的時候才會被發現。
+            foreach (var (module, _) in BotModules.All)
+                interactions.AddModuleAsync(module, services).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -2635,11 +2750,11 @@ public static class DryRun
             Console.WriteLine($"  ✔ 儲存後端：{store.Describe()}（訂閱組與 LLM 用量共用同一個實例）");
 
         // ── Discord 的模組一定要註冊成 transient ────────────
-        var moduleTypes = new[]
-        {
-            typeof(BusModule), typeof(BusComponentModule), typeof(SayModule),
-            typeof(ChatModule), typeof(ResetModule)
-        };
+        //
+        // 清單直接取自 BotModules（啟動註冊用的那一份）——
+        // 以前這裡是手寫的第二份清單，於是 PersonaGrantModule 默默地
+        // 「沒進 DI 也沒被檢查」，只靠 Discord.Net 現場建實例剛好能動。
+        var moduleTypes = BotModules.All.Select(m => m.Type).ToArray();
 
         var badLifetime = collection
             .Where(d => moduleTypes.Contains(d.ServiceType))

@@ -399,7 +399,7 @@ public sealed class ChatOrchestrator
             if (!detectCheck.Allowed)
             {
                 _budget.RecordRefusal(DateTimeOffset.UtcNow);
-                return Refusal(detectCheck, startedAt);
+                return Refusal(detectCheck, startedAt, admin.IsAdmin);
             }
 
             var detected = await _detector.DetectAsync(draft.Current.Turns, incoming, cancellationToken);
@@ -455,7 +455,7 @@ public sealed class ChatOrchestrator
             _conversations.RecordAssistant(decision, Notice(
                 "（這一週的 AI 額度用完了，因此沒有回覆）", DateTimeOffset.UtcNow));
 
-            return Refusal(check, startedAt) with
+            return Refusal(check, startedAt, admin.IsAdmin) with
             {
                 Decision = decision,
                 DecisionReason = reason,
@@ -670,15 +670,19 @@ public sealed class ChatOrchestrator
         };
 
     /// <summary>額度用完時要講的話（公車功能不受影響這件事一定要講）。</summary>
-    public static string RefusalText(BudgetCheck check)
+    public static string RefusalText(BudgetCheck check, bool isAdmin = false)
         => $"⛔ 這個星期的 AI 額度用完了（{check.Used:N0}／{check.Limit:N0} tokens）。\n" +
            $"會在 **{check.ResetAt.ToLocalTime():MM-dd HH:mm}**（UTC 週一 00:00）重置。\n" +
-           "公車功能不受影響 —— `/bus panel` 照樣可以用。";
+           "公車功能不受影響 —— `/bus panel` 照樣可以用。" +
+           // 管理員的即時解法：以前只能改環境變數重啟，或等到下週一
+           (isAdmin
+               ? "\n\n（你是管理員：打 `/ai status` 按「♻️ 重置本週額度」可以立刻把這一週的用量歸零。）"
+               : "");
 
-    private static ChatAnswer Refusal(BudgetCheck check, DateTimeOffset startedAt)
+    private static ChatAnswer Refusal(BudgetCheck check, DateTimeOffset startedAt, bool isAdmin)
         => new(
             Ok: false,
-            Text: RefusalText(check),
+            Text: RefusalText(check, isAdmin),
             Error: check.Reason,
             Refused: true,
             Decision: null,

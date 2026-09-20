@@ -283,11 +283,13 @@ public static class Program
         // 公車功能是主要功能，AI 聊天是額外的。
         // （容器已經開了 ValidateOnBuild，所以「參數解析不到」這種錯在 BuildServiceProvider
         //   就會先炸出來 —— 之前那個 ILlmClient 沒註冊導致整個 Bot 起不來的 bug 就屬於這類。）
-        async Task RegisterModuleAsync<TModule>(string label) where TModule : class
+        // 清單只有一份（BotModules）：DI、這裡、離線驗證都從同一份長出來。
+        // 以前三個地方各寫各的，結果 PersonaGrantModule 沒進 DI 也沒被驗證掃到。
+        foreach (var (module, label) in BotModules.All)
         {
             try
             {
-                await interactions.AddModuleAsync<TModule>(provider);
+                await interactions.AddModuleAsync(module, provider);
             }
             catch (Exception ex)
             {
@@ -295,13 +297,6 @@ public static class Program
                                   $"{ex.GetType().Name}: {ex.Message}");
             }
         }
-
-        await RegisterModuleAsync<BusModule>("bus");
-        await RegisterModuleAsync<BusComponentModule>("bus（按鈕／選單）");
-        await RegisterModuleAsync<SayModule>("say");
-        await RegisterModuleAsync<ChatModule>("ai");
-        await RegisterModuleAsync<PersonaGrantModule>("ai（授權按鈕）");
-        await RegisterModuleAsync<ResetModule>("rest");
 
         // ── AI 聊天：接上訊息事件 ───────────────────────────
         LlmChatService? chat = null;

@@ -146,11 +146,9 @@ internal static class BotServices
         }));
 
         // 指令模組（transient：每次互動都要新的實例）
-        services.AddTransient<BusModule>();
-        services.AddTransient<BusComponentModule>();
-        services.AddTransient<SayModule>();
-        services.AddTransient<ChatModule>();
-        services.AddTransient<ResetModule>();
+        // 清單集中在 BotModules（啟動註冊與離線驗證都從同一份長出來 —— 見那裡的說明）
+        foreach (var (type, _) in BotModules.All)
+            services.AddTransient(type);
 
         return services;
     }
