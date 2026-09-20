@@ -2756,6 +2756,25 @@ public static class DryRun
         // 「沒進 DI 也沒被檢查」，只靠 Discord.Net 現場建實例剛好能動。
         var moduleTypes = BotModules.All.Select(m => m.Type).ToArray();
 
+        // 而且**每個**模組類別都要在清單裡（不然同一種 bug 會再發生一次）。
+        // 這裡直接掃組件：任何 InteractionModuleBase 的子類別只要沒被列進 BotModules，
+        // 就是「寫好了但沒註冊」—— 症狀是「指令／按鈕在線上不存在」，而且不會報錯。
+        var declared = typeof(DryRun).Assembly.GetTypes()
+            .Where(t => !t.IsAbstract && t.IsPublic)
+            .Where(IsInteractionModule)
+            .Select(t => t.Name)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToList();
+
+        var missing = declared
+            .Where(n => !moduleTypes.Any(t => t.Name == n))
+            .ToList();
+
+        if (missing.Count > 0)
+            Problem($"這些模組沒有列進 BotModules（等於沒有註冊）：{string.Join("、", missing)}");
+        else
+            Console.WriteLine($"  ✔ 組件裡的 {declared.Count} 個模組全部都在 BotModules 清單裡：{string.Join("、", declared)}");
+
         var badLifetime = collection
             .Where(d => moduleTypes.Contains(d.ServiceType))
             .Where(d => d.Lifetime != ServiceLifetime.Transient)
@@ -2769,6 +2788,24 @@ public static class DryRun
             Console.WriteLine($"  ✔ {moduleTypes.Length} 個指令模組都註冊成 transient（每次互動都是新實例）");
 
         return provider;
+    }
+
+    /// <summary>
+    /// 這個型別是不是 Discord 的指令模組？
+    ///
+    /// 要往上找整條繼承鏈：大部分模組是繼承 <c>BusModuleBase</c>（為了 UpdateAsync），
+    /// 只看直接基底類別會漏掉它們 —— 第一版就是這樣，7 個只掃到 3 個。
+    /// </summary>
+    private static bool IsInteractionModule(Type type)
+    {
+        for (var t = type.BaseType; t is not null; t = t.BaseType)
+        {
+            if (t.IsGenericType
+                && t.GetGenericTypeDefinition().Name.StartsWith("InteractionModuleBase", StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>與 BotRuntime.DescribeStatus 相同邏輯（DryRun 無法直接呼叫 private 方法）。</summary>
