@@ -152,6 +152,8 @@ public sealed class ChannelDigestService
             Mentions: mentions,
             InputTokens: inputTokens,
             OutputTokens: outputTokens,
+            ReasoningTokens: final.ReasoningTokens,
+            Reasoning: Excerpt(final.Reasoning, ReasoningExcerptLength),
             Calls: calls,
             Manual: run.Manual,
             Truncated: run.Truncated,
@@ -174,12 +176,31 @@ public sealed class ChannelDigestService
             ? "（這一輪讀到安全上限，游標只推到讀到的地方，剩下的下次再處理）"
             : "";
 
+        // 「想很久」的常見後果：思考的 token 把輸出額度吃掉，摘要話講到一半就斷
+        var cut = string.Equals(final.FinishReason, "length", StringComparison.OrdinalIgnoreCase);
+
+        if (cut)
+            note += $"\n⚠️ 模型的輸出被截斷了（思考用掉 {final.ReasoningTokens:N0} tokens，上限 " +
+                    $"{_options.MaxOutputTokens:N0}）—— 可以調高 `LLM_DIGEST_MAX_TOKENS`。";
+
         return new DigestOutcome(
             true,
             $"✅ 已整理 {run.Messages.Count:N0} 則訊息（{run.Participants.Count} 人、{calls} 次呼叫、" +
-            $"{inputTokens + outputTokens:N0} tokens）{note}",
+            $"{inputTokens + outputTokens:N0} tokens" +
+            (final.ReasoningTokens > 0 ? $"、其中思考 {final.ReasoningTokens:N0}" : "") + $"）{note}",
             record,
-            Truncated: run.Truncated ? run.Messages.Count : 0);
+            Truncated: run.Truncated ? run.Messages.Count : 0,
+            OutputTruncated: cut);
+    }
+
+    /// <summary>思考原文要存幾個字（全文常常比摘要長好幾倍；看的人是為了知道它怎麼判斷的）。</summary>
+    public const int ReasoningExcerptLength = 2000;
+
+    private static string Excerpt(string? text, int max)
+    {
+        var trimmed = (text ?? "").Trim();
+
+        return trimmed.Length <= max ? trimmed : trimmed[..max] + "…";
     }
 
     /// <summary>

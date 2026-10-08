@@ -1393,9 +1393,36 @@ public static class DryRun
         if (digest.EffectiveMaxMessages <= 0)
             Problem("安全上限算出來是 0 —— 摘要什麼都讀不到");
 
+        // ── 5) 「他在想什麼」（/ai think）────────────────────
+        //    思考內容可能包含頻道裡的對話 → 一定要只有管理員看得到。
+        var think = typeof(ChatModule).GetMethod(nameof(ChatModule.ThinkAsync));
+        var thinkCalls = think is null ? [] : CollectCalls(think, resolveAll: true);
+
+        if (think is null)
+            Problem("找不到 ChatModule.ThinkAsync（/ai think 不見了 —— 沒辦法看模型在想什麼）");
+        else if (!thinkCalls.Contains("LlmOptions.get_AdminUserIds"))
+            Problem("/ai think 沒有擋管理員 —— 模型的思考可能包含頻道裡的對話，不該人人可看");
+        else if (!thinkCalls.Contains("ReasoningCapture.Recent")
+                 && !thinkCalls.Contains("ReasoningCapture.get_Latest"))
+            Problem("/ai think 沒有讀擷取器（那它會永遠說「沒有思考內容」）");
+
+        // 摘要的思考要留下來（重啟後還在）—— 這是「一週後想回頭看」的唯一來源。
+        // ⚠️ 這一條**不能用 IL 掃描**驗：`new DigestRecord(...)` 在 IL 裡是 `newobj`（0x73），
+        //    不是 call／callvirt，掃不到。所以它改成 `tcbus selftest` 的行為測試
+        //    （餵一個有思考的假 LLM，驗 record 裡真的有思考原文）。
+
+        // 思考原文的擷取一定要掛在 HTTP 層（SK 不保證會保留非標準欄位）
+        var skCreate = typeof(SemanticKernelLlmClient).GetMethod(nameof(SemanticKernelLlmClient.Create));
+        var skCalls = skCreate is null ? [] : CollectCalls(skCreate, resolveAll: true);
+
+        if (skCreate is null)
+            Problem("找不到 SemanticKernelLlmClient.Create");
+        else if (!skCalls.Contains("ReasoningHandler.Create"))
+            Problem("LLM 連線沒有掛 ReasoningHandler —— 思考原文抓不到，/ai think 會一直是空的");
+
         if (_problems == before)
             Console.WriteLine("  ✔ 只有 Bot 管理員能啟用／執行；@ 人只限核對過的那幾位；" +
-                              "游標會推進、花費會記進每週額度");
+                              "游標會推進、花費會記進每週額度；思考原文抓得到（/ai think）");
     }
 
     /// <summary>
@@ -1523,7 +1550,7 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "test" };
+            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "test", "think" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)

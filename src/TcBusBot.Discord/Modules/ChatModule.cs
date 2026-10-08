@@ -3,6 +3,7 @@ using Discord.Interactions;
 using Discord.WebSocket;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
+using TcBusBot.Core.Chat.Digest;
 
 namespace TcBusBot.Discord.Modules;
 
@@ -27,6 +28,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly PersonaGrantStore _grants;
     private readonly LlmDiagnostics _diagnostics;
     private readonly UserCityStore _cities;
+    private readonly ReasoningCapture _reasoning;
+    private readonly DigestStore _digests;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -41,8 +44,12 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         GuildPersonaStore personas,
         PersonaGrantStore grants,
         LlmDiagnostics diagnostics,
-        UserCityStore cities)
+        UserCityStore cities,
+        ReasoningCapture reasoning,
+        DigestStore digests)
     {
+        _reasoning = reasoning;
+        _digests = digests;
         _options = options;
         _conversations = conversations;
         _budget = budget;
@@ -130,6 +137,11 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .AddField("記憶容量（環境變數可調）",
                 _options.DescribeMemory(),
                 inline: false)
+            .AddField("他剛剛在想什麼",
+                _options.AdminUserIds.Contains(Context.User.Id)
+                    ? _reasoning.Describe()
+                    : "（只有管理員看得到 —— 用 `/ai think`）",
+                inline: false)
             .AddField("偷聽",
                 !_options.Eavesdrop || _options.EavesdropMaxMessages <= 0 || _options.EavesdropSeconds <= 0
                     ? "❌ 已關閉（只回 @ 它或回覆它的訊息）"
@@ -169,6 +181,88 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 ? QuotaResetButtons.StatusRow(Context.User.Id).Build()
                 : null,
             ephemeral: true);
+    }
+
+    [SlashCommand("think", "看他剛剛在想什麼（模型的思考內容；只有管理員看得到）")]
+    public async Task ThinkAsync(
+        [Summary("count", "要看幾筆（預設 1，最多 5）")] int count = 1,
+        [Summary("full", "顯示完整思考內容（不截斷）")] bool full = false,
+        [Summary("channel", "看某個頻道最近一次週報的思考（留空＝看最近的呼叫）")]
+        SocketTextChannel? channel = null)
+    {
+        // 思考內容可能包含頻道裡的對話 → 只有管理員看得到（而且只有他自己看得到回覆）
+        if (!_options.AdminUserIds.Contains(Context.User.Id))
+        {
+            await RespondAsync(
+                "這個指令只有管理員（`LLM_ADMIN_IDS` 名單）能看 —— 模型的思考內容可能包含頻道裡的對話。\n" +
+                "想看摘要為什麼長那樣，可以請管理員用 `/ai think channel:#頻道`。",
+                ephemeral: true);
+            return;
+        }
+
+        // ── 指定頻道 → 看那一份「每週摘要」當時的思考（從歸檔讀，重啟後還在）──
+        if (channel is not null)
+        {
+            var record = _digests.Latest(channel.Id);
+
+            if (record is null)
+            {
+                await RespondAsync($"#{channel.Name} 還沒有任何週報紀錄。", ephemeral: true);
+                return;
+            }
+
+            var body = record.Reasoning.Length > 0
+                ? record.Reasoning
+                : "（這一筆沒有留下思考原文 —— 可能是模型沒有回傳，或那次沒有開思考）";
+
+            await RespondAsync(
+                embed: new EmbedBuilder()
+                    .WithColor(new Color(0x6A, 0x5A, 0xC0))
+                    .WithTitle($"🧠 週報當時在想什麼　#{channel.Name}")
+                    .WithDescription(Truncate(body, full ? 3900 : 1500))
+                    .AddField("什麼時候",
+                        $"{record.At.ToLocalTime():yyyy-MM-dd HH:mm}（{record.MessageCount:N0} 則訊息）", inline: true)
+                    .AddField("思考用量",
+                        record.ReasoningTokens > 0 ? $"{record.ReasoningTokens:N0} tokens" : "（服務商沒回報）",
+                        inline: true)
+                    .AddField("模型", record.Model, inline: true)
+                    .WithFooter($"永久保存在歸檔裡（節錄 {ChannelDigestService.ReasoningExcerptLength:N0} 字）" +
+                                "｜/digest archive 看週報本身")
+                    .Build(),
+                ephemeral: true);
+            return;
+        }
+
+        // ── 沒指定 → 看最近幾次呼叫（記憶體裡的暫存，只有最近 20 筆）──
+        var recent = _reasoning.Recent(Math.Clamp(count, 1, 5));
+
+        if (recent.Count == 0)
+        {
+            await RespondAsync(
+                "還沒有抓到任何思考內容。\n" +
+                "• 預設**聊天是不思考的**（`LLM_REASONING=off`，為了省 token）—— 所以一般對話不會有思考\n" +
+                "• 會思考的是**每週摘要**那一次（`LLM_DIGEST_REASONING`，預設 `high`）\n" +
+                "• 想看聊天也思考：把 `LLM_REASONING` 設成 `high`（但每一句都會變貴）\n" +
+                $"目前累計：{_reasoning.TotalWithoutThinking} 次呼叫沒有思考內容",
+                ephemeral: true);
+            return;
+        }
+
+        var embed = new EmbedBuilder()
+            .WithColor(new Color(0x6A, 0x5A, 0xC0))
+            .WithTitle($"🧠 他剛剛在想什麼（最近 {recent.Count} 筆）")
+            .WithFooter(_reasoning.Describe());
+
+        foreach (var entry in recent)
+        {
+            var text = entry.HasText
+                ? Truncate(entry.Text, full ? 3000 : 800)
+                : "（服務商只回了思考 token 數，沒有原文）";
+
+            embed.AddField(entry.Describe(), text, inline: false);
+        }
+
+        await RespondAsync(embed: embed.Build(), ephemeral: true);
     }
 
     [SlashCommand("learned", "看我（這個伺服器）學到了哪些規矩與自訂表情的意思")]

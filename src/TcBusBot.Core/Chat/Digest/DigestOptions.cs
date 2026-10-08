@@ -16,8 +16,15 @@ public sealed class DigestOptions
     /// <summary>一次摘要最多 @ 幾個人（`0` = 完全不 @）。</summary>
     public int MaxMentions { get; set; } = 5;
 
-    /// <summary>摘要那一次呼叫最多回幾個 token（摘要＋重點＋跨週清單的 JSON 外框一起算）。</summary>
-    public int MaxOutputTokens { get; set; } = 3000;
+    /// <summary>
+    /// 摘要那一次呼叫最多回幾個 token（摘要＋重點＋跨週清單的 JSON 外框一起算）。
+    ///
+    /// ⚠️ **思考的 token 算在這個額度裡**（實測：`max_tokens=60` 搭配思考時，
+    ///    60 個 token 全被思考吃掉、回答是空的、`finish_reason=length`）。
+    ///    所以開了思考（預設 `high`）時這個值要留得夠大 —— 5000 大約是
+    ///    「一輪思考 ＋ 一份完整的週報」。
+    /// </summary>
+    public int MaxOutputTokens { get; set; } = 5000;
 
     /// <summary>單批訊息最多幾個 token；超過就分批（map）再彙整（reduce）。</summary>
     public int BatchTokens { get; set; } = 24_000;

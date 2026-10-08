@@ -145,6 +145,15 @@ public sealed record DigestRecord(
     [property: JsonPropertyName("mentions")] IReadOnlyList<DigestMention> Mentions,
     [property: JsonPropertyName("in_tokens")] int InputTokens,
     [property: JsonPropertyName("out_tokens")] int OutputTokens,
+    [property: JsonPropertyName("reasoning_tokens")] int ReasoningTokens,
+    /// <summary>
+    /// 模型在整理之前想的內容（**節錄**，最多 2000 字）。
+    ///
+    /// 為什麼要存：使用者的要求是「看他在想什麼」，而週報是**一週後才看**的東西 ——
+    /// 只在記憶體裡留著的思考，重啟或過幾天就沒了。存節錄（不是全文）
+    /// 是因為思考常常比摘要長好幾倍，而看的人是為了知道「它怎麼判斷的」。
+    /// </summary>
+    [property: JsonPropertyName("reasoning")] string Reasoning,
     [property: JsonPropertyName("calls")] int Calls,
     [property: JsonPropertyName("manual")] bool Manual,
     [property: JsonPropertyName("truncated")] bool Truncated,
@@ -166,7 +175,15 @@ public sealed record DigestOutcome(
     DigestRecord? Record = null,
     bool NoNewMessages = false,
     bool BudgetBlocked = false,
-    int Truncated = 0)
+    int Truncated = 0,
+    /// <summary>
+    /// 模型的輸出被 `max_tokens` 截斷（`finish_reason=length`）。
+    ///
+    /// ⚠️ 這個一定要講出來：思考的 token 也算在輸出額度裡，所以「太長」的實際症狀是
+    ///    **摘要話講到一半就斷掉**（甚至 JSON 不完整而退回「整段當摘要」）。
+    ///    不說的話，使用者只會覺得「摘要品質變差了」。
+    /// </summary>
+    bool OutputTruncated = false)
 {
     /// <summary>這一輪是不是真的產出了摘要（要發到頻道）。</summary>
     public bool HasDigest => Ok && Record is not null;

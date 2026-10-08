@@ -92,6 +92,12 @@ public sealed class DigestRunner
         var participants = Participants(messages);
         var run = new DigestRun(channel.Guild.Id, channelId, channel.Name, messages, participants, manual, truncated);
 
+        // ── 先放一則「正在整理」的訊息 ─────────────────────
+        //    為什麼要這個：摘要開著思考（預設 high），一次要跑 30～90 秒以上。
+        //    沒有這一則，使用者看到的是「打了 /digest now 之後什麼都沒發生」——
+        //    他會以為壞掉了，然後再打一次（於是又花一次錢）。
+        var placeholder = await PostPlaceholderAsync(channel, messages.Count, manual);
+
         DigestOutcome outcome;
 
         try
@@ -101,17 +107,24 @@ public sealed class DigestRunner
         catch (Exception ex)
         {
             var reason = ex is LlmException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}";
+            await DiscardPlaceholderAsync(placeholder, $"❌ 這次摘要失敗：{reason}");
             return Fail(channelId, manual, $"呼叫模型失敗：{reason}", retry: true);
         }
 
         if (outcome.BudgetBlocked)
+        {
+            await DiscardPlaceholderAsync(placeholder, $"⛔ 這次摘要沒有跑：{outcome.Message}");
             return Fail(channelId, manual, outcome.Message, retry: true);
+        }
 
         if (!outcome.HasDigest)
+        {
+            await DiscardPlaceholderAsync(placeholder, $"📭 {outcome.Message}");
             return Fail(channelId, manual, outcome.Message, retry: true);
+        }
 
-        // ── 發出去 ─────────────────────────────────────
-        await PostAsync(channel, outcome.Record!, ct);
+        // ── 發出去（把剛剛那一則改成成品，而不是多一則訊息）──
+        await PostAsync(channel, outcome.Record!, placeholder, ct);
 
         Console.WriteLine($"[摘要] #{channel.Name}（{channelId}）{(manual ? "手動" : "排程")}：" +
                           $"{outcome.Record!.MessageCount} 則訊息、{outcome.Record.Calls} 次呼叫、" +
@@ -298,7 +311,50 @@ public sealed class DigestRunner
     ///    不會觸發通知。而允許名單只放「核對過的本人」——
     ///    沒有 @everyone／@here／身分組這三種可能（見 <see cref="DigestPrompt.SanitizeMentions"/>）。
     /// </summary>
-    private async Task PostAsync(SocketTextChannel channel, DigestRecord record, CancellationToken ct)
+    /// <summary>
+    /// 先發一則「正在整理…」的訊息（之後會被改成成品）。
+    ///
+    /// 為什麼要「改」而不是「刪掉重發」：改同一則訊息不會讓頻道跳兩次通知，
+    /// 而且使用者回頭看時間軸時只會看到一份週報（不是「開始整理 + 週報」兩則）。
+    /// 失敗時也把這一則改成錯誤訊息 —— 至少留下一條線索，而不是消失。
+    /// </summary>
+    private async Task<IUserMessage?> PostPlaceholderAsync(
+        SocketTextChannel channel, int messageCount, bool manual)
+    {
+        try
+        {
+            var thinking = _options.Reasoning is "off" or "auto"
+                ? ""
+                : $"\n-# 模型正在思考（{_options.Reasoning}）—— 通常要 30～90 秒，思考內容可以用 `/ai think` 看";
+
+            return await channel.SendMessageAsync(
+                $"🔄 **正在整理這一週的訊息**（{messageCount:N0} 則{(manual ? "，手動觸發" : "")}）…{thinking}");
+        }
+        catch (Exception ex)
+        {
+            // 發不出來就照舊往下跑（成品會用新訊息發出去）
+            Console.WriteLine($"[摘要] 進度訊息發送失敗（{ex.Message}）—— 摘要照常進行");
+            return null;
+        }
+    }
+
+    /// <summary>失敗時把進度訊息改成錯誤說明（沒有進度訊息就只寫 log）。</summary>
+    private static async Task DiscardPlaceholderAsync(IUserMessage? placeholder, string text)
+    {
+        if (placeholder is null) return;
+
+        try
+        {
+            await placeholder.ModifyAsync(m => m.Content = text);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[摘要] 更新進度訊息失敗（{ex.Message}）");
+        }
+    }
+
+    private async Task PostAsync(
+        SocketTextChannel channel, DigestRecord record, IUserMessage? placeholder, CancellationToken ct)
     {
         var text = ChannelDigestService.RenderText(record, _options.ZoneOffset);
         var mentions = record.Mentions;
@@ -310,23 +366,45 @@ public sealed class DigestRunner
               "\n-# " + string.Join("　", mentions.Select(m =>
                   $"{m.Name}：{(m.Reason.Length > 0 ? m.Reason : "這一週的事跟你相關")}"));
 
+        var footer = $"{(record.Manual ? "手動觸發" : "每週自動整理")}｜{record.Model}｜" +
+                     $"{record.TotalTokens:N0} tokens／{record.Calls} 次呼叫" +
+                     (record.ReasoningTokens > 0 ? $"（思考 {record.ReasoningTokens:N0}）" : "") +
+                     $"｜下一份：{NextRunText(record.ChannelId)}";
+
         var embed = new EmbedBuilder()
             .WithColor(new Color(0x2B, 0x6C, 0xB0))
             .WithTitle($"📋 每週摘要（{record.MessageCount:N0} 則訊息）")
             .WithDescription(text.Length > 4000 ? text[..4000] + "…" : text)
-            .WithFooter($"{(record.Manual ? "手動觸發" : "每週自動整理")}｜{record.Model}｜" +
-                        $"{record.TotalTokens:N0} tokens／{record.Calls} 次呼叫｜" +
-                        $"下一份：{NextRunText(record.ChannelId)}")
+            .WithFooter(footer)
             .Build();
 
-        await channel.SendMessageAsync(
-            content,
-            embed: embed,
-            allowedMentions: new AllowedMentions
+        var allowed = new AllowedMentions
+        {
+            AllowedTypes = AllowedMentionTypes.Users,
+            UserIds = mentions.Select(m => m.UserId).ToList()
+        };
+
+        // 有進度訊息就把它改成成品（不刪不重發：頻道只跳一次通知、時間軸只有一份週報）
+        if (placeholder is not null)
+        {
+            try
             {
-                AllowedTypes = AllowedMentionTypes.Users,
-                UserIds = mentions.Select(m => m.UserId).ToList()
-            });
+                await placeholder.ModifyAsync(m =>
+                {
+                    m.Content = content;
+                    m.Embed = embed;
+                    m.AllowedMentions = allowed;
+                });
+
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[摘要] 改寫進度訊息失敗（{ex.Message}）—— 改成另外發一則");
+            }
+        }
+
+        await channel.SendMessageAsync(content, embed: embed, allowedMentions: allowed);
     }
 
     private string NextRunText(ulong channelId)

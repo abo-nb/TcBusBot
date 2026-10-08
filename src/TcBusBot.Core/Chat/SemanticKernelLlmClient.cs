@@ -31,15 +31,17 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
     private readonly LlmOptions _options;
     private readonly HttpClient _http;
     private readonly bool _ownsHttp;
+    private readonly ReasoningCapture? _capture;
 
     private SemanticKernelLlmClient(Kernel kernel, IChatCompletionService chat, LlmOptions options,
-                                    HttpClient http, bool ownsHttp)
+                                    HttpClient http, bool ownsHttp, ReasoningCapture? capture = null)
     {
         _kernel = kernel;
         _chat = chat;
         _options = options;
         _http = http;
         _ownsHttp = ownsHttp;
+        _capture = capture;
     }
 
     public bool IsConfigured => true;
@@ -49,8 +51,13 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
     /// <summary>
     /// 建立客戶端。**不丟例外**：設定有問題時回傳 (null, 原因)，
     /// 讓 Bot 可以「照常啟動、只是沒有 AI 功能」—— 額外的功能壞掉不該拖垮主要功能。
+    ///
+    /// <paramref name="innerHandler"/> 是**測試用的接縫**（正常情況傳 null，會用真的
+    /// <see cref="HttpClientHandler"/>）：這樣「思考原文有沒有被留下來」可以用一個假的
+    /// HTTP 回應驗整條管線，不必真的打 API、也不必開 socket。
     /// </summary>
-    public static (SemanticKernelLlmClient? Client, string Message) Create(LlmOptions options)
+    public static (SemanticKernelLlmClient? Client, string Message) Create(
+        LlmOptions options, ReasoningCapture? capture = null, HttpMessageHandler? innerHandler = null)
     {
         if (!options.IsConfigured)
             return (null, "沒有設定 LLM_API_KEY／LLM_MODEL，AI 聊天未啟用");
@@ -65,19 +72,15 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
         {
             // 自己管 HttpClient：逾時要能控制（預設 100 秒太久，使用者會以為當掉）
             //
-            // ⚠️ 這裡多掛一層 ReasoningOffHandler：SK 這個版本**送不出**
-            //    「不要思考」的欄位（詳見該類別的說明，有三個實驗的結果），
-            //    所以在 HTTP 這一層把它補進 JSON。任何意外都原樣送出，不影響對話。
-            HttpMessageHandler inner = new HttpClientHandler();
-            var pipeline = ReasoningOffHandler.CreateIfNeeded(options);
+            // ⚠️ 這裡一定掛一層 ReasoningHandler，它做兩件事：
+            //    1. 把「不要思考」的欄位補進**送出的** JSON（SK 這個版本送不出去，
+            //       詳見該類別的說明，有三個實驗的結果）
+            //    2. 把回應裡的思考原文留下來（`/ai think` 的來源 —— SK 也不保證會映射它）
+            //    任何意外都原樣進出，不影響對話。
+            var pipeline = ReasoningHandler.Create(options);
+            pipeline.InnerHandler = innerHandler ?? new HttpClientHandler();
 
-            if (pipeline is not null)
-            {
-                pipeline.InnerHandler = inner;
-                inner = pipeline;
-            }
-
-            var http = new HttpClient(inner)
+            var http = new HttpClient(pipeline)
             {
                 Timeout = TimeSpan.FromSeconds(Math.Max(5, options.RequestTimeoutSeconds))
             };
@@ -92,7 +95,7 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
             var kernel = builder.Build();
             var chat = kernel.GetRequiredService<IChatCompletionService>();
 
-            return (new SemanticKernelLlmClient(kernel, chat, options, http, ownsHttp: true),
+            return (new SemanticKernelLlmClient(kernel, chat, options, http, ownsHttp: true, capture: capture),
                     $"✅ AI 聊天已啟用：{options.Describe()}");
         }
         catch (Exception ex)
@@ -142,6 +145,12 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
 
         var sw = Stopwatch.StartNew();
 
+        // 把「這一輪的思考」綁進目前的非同步脈絡 —— HTTP 層的 ReasoningHandler
+        // 就是靠這個位置把思考原文放進來（多個頻道同時聊天也不會互相蓋掉）。
+        using var scope = ReasoningCapture.Begin();
+
+        var answerChars = 0;
+
         try
         {
             var result = await _chat.GetChatMessageContentsAsync(
@@ -155,6 +164,8 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
             var message = result[0];
             var text = (message.Content ?? "").Trim();
 
+            answerChars = text.Length;
+
             var (input, output, reported) = ExtractUsage(message, request, text);
 
             if (text.Length == 0)
@@ -166,6 +177,8 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
                     : "模型回覆了空白內容");
             }
 
+            var (reasoning, reasoningTokens) = scope.Snapshot();
+
             return new LlmReply(
                 Text: text,
                 InputTokens: input,
@@ -173,7 +186,9 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
                 UsageReported: reported,
                 Model: message.ModelId ?? _options.Model,
                 Elapsed: sw.Elapsed,
-                FinishReason: ReadFinishReason(message));
+                FinishReason: ReadFinishReason(message),
+                Reasoning: reasoning,
+                ReasoningTokens: reasoningTokens);
         }
         catch (LlmException)
         {
@@ -193,6 +208,12 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
         {
             sw.Stop();
             throw new LlmException(Friendly(ex), retryable: IsRetryable(ex), ex);
+        }
+        finally
+        {
+            // 成功、失敗都留一筆 —— 「想很久然後失敗」正是最需要看它想了什麼的時候。
+            // （沒有思考內容時 Commit 自己會跳過，不會把清單塞滿一般回覆。）
+            _capture?.Commit(request.Tag ?? "chat", _options.Model, sw.Elapsed, answerChars);
         }
     }
 

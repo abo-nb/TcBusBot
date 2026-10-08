@@ -26,7 +26,7 @@ public sealed record LlmRequest(
     /// 這次是**每週頻道摘要的最後一次彙整**。
     ///
     /// 為什麼它需要自己一條路：思考（reasoning）是在**建立連線**時決定的
-    /// （<c>ReasoningOffHandler</c> 掛在 HttpClient 上），不能在單一請求裡切換
+    /// （<c>ReasoningHandler</c> 掛在 HttpClient 上），不能在單一請求裡切換
     /// （理由與 <see cref="JudgeCall"/> 完全相同：SK 這個版本會忽略請求層級的設定）。
     /// 而「一週只跑一次、要讀一整週內容」的彙整正好是值得多想一下的呼叫 ——
     /// 所以它走一條「開了思考」的連線，聊天其餘的呼叫維持不思考。
@@ -58,12 +58,25 @@ public sealed record LlmReply(
     bool UsageReported,
     string Model,
     TimeSpan Elapsed,
-    string? FinishReason = null)
+    string? FinishReason = null,
+    /// <summary>
+    /// 模型在回答之前想的內容（`reasoning_content`）。
+    ///
+    /// 為什麼放在回覆裡而不是讓上層自己去問擷取器：
+    /// 「哪一筆思考屬於哪一次呼叫」是**這通呼叫自己的事**（HTTP 層用非同步脈絡綁的），
+    /// 讓上層事後去猜，在多個頻道同時呼叫時就會猜錯。
+    /// </summary>
+    string Reasoning = "",
+    /// <summary>思考用掉幾個 token（服務商有區分時才有；`0` ＝ 沒回報）。</summary>
+    int ReasoningTokens = 0)
 {
     public int TotalTokens => InputTokens + OutputTokens;
 
     /// <summary>用量是 API 給的還是我們自己估的（`/ai status` 與 log 會標示）。</summary>
     public string UsageSource => UsageReported ? "API 回報" : "估算";
+
+    /// <summary>有思考內容嗎（有些服務商只回 token 數、不回原文）。</summary>
+    public bool HasReasoning => Reasoning.Length > 0 || ReasoningTokens > 0;
 }
 
 /// <summary>呼叫 LLM 失敗（訊息一定是「人看得懂」的那種，不會把金鑰印出來）。</summary>

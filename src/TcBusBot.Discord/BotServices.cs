@@ -84,8 +84,14 @@ internal static class BotServices
         // LlmDiagnostics 是「LLM 有沒有接上」的可觀測性：最後幾次呼叫的結果
         // （成功、錯誤訊息、耗時）會留著，`/ai status` 與 `/ai test` 直接講給使用者聽。
         services.AddSingleton<LlmDiagnostics>();
+
+        // 「他在想什麼」的暫存區：HTTP 層把思考原文寫進來、`/ai think` 讀出去。
+        // 一定要是**同一個實例**（`/ai think` 才看得到剛剛那次呼叫的思考）。
+        services.AddSingleton<ReasoningCapture>();
+
         services.AddSingleton<ILlmClient>(sp =>
-            CreateLlmClient(cfg.Llm, log, sp.GetRequiredService<LlmDiagnostics>()));
+            CreateLlmClient(cfg.Llm, log, sp.GetRequiredService<LlmDiagnostics>(),
+                sp.GetRequiredService<ReasoningCapture>()));
 
         // ── 公車資料目錄：**「哪個使用者要用哪一份資料」的唯一入口** ──
         //     `/bus city` 讓訂公車的人自己選城市；沒選過的人用預設（BUS_CITY 的第一個）。
@@ -179,7 +185,8 @@ internal static class BotServices
     /// 再用 <see cref="RoutingLlmClient"/> 把短判斷導過去 ——
     /// 為什麼不共用一個客戶端、在請求裡換模型名稱：SK 這個版本會忽略 `ModelId`（實測）。
     /// </summary>
-    private static ILlmClient CreateLlmClient(LlmOptions options, Action<string> log, LlmDiagnostics diag)
+    private static ILlmClient CreateLlmClient(
+        LlmOptions options, Action<string> log, LlmDiagnostics diag, ReasoningCapture? capture = null)
     {
         if (!options.IsConfigured)
         {
@@ -193,7 +200,7 @@ internal static class BotServices
         if (judgeOptions is not null) judgeOptions.Model = options.JudgeModel!;
 
         // 每週摘要那條連線：換思考強度（預設 high）與可選的模型。
-        // 為什麼要另建一條：思考是在**建立連線**時決定的（ReasoningOffHandler 掛在 HttpClient 上），
+        // 為什麼要另建一條：思考是在**建立連線**時決定的（ReasoningHandler 掛在 HttpClient 上），
         // 不能在單一請求裡切換 —— 理由跟「換模型」完全一樣（見 RoutingLlmClient 的說明）。
         var digestOptions = options.Clone();
         digestOptions.Reasoning = options.Digest.Reasoning;
@@ -205,7 +212,7 @@ internal static class BotServices
 
         var (client, message) = RoutingLlmClient.Create(options, judgeOptions, opts =>
         {
-            var (created, createdMessage) = SemanticKernelLlmClient.Create(opts);
+            var (created, createdMessage) = SemanticKernelLlmClient.Create(opts, capture);
             return ((ILlmClient?)created, createdMessage);
         }, diag, needsDigestConnection ? digestOptions : null);
 

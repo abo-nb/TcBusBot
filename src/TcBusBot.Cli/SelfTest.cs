@@ -1761,7 +1761,7 @@ public static class SelfTest
     }
 
     /// <summary>
-    /// 模型思考開關（<see cref="ReasoningOffHandler"/>）。
+    /// 模型思考開關（<see cref="ReasoningHandler"/>）。
     ///
     /// 為什麼要這麼「繞」：SK 這個版本送不出「不要思考」的欄位
     /// （`ExtensionData` 被忽略、型別化的 `ReasoningEffort` 拒絕 `none`），
@@ -1802,7 +1802,7 @@ public static class SelfTest
             sent = null;
             sentPath = null;
 
-            var handler = new ReasoningOffHandler(options) { InnerHandler = new CaptureHandler(body, captured => sent = captured) };
+            var handler = new ReasoningHandler(options) { InnerHandler = new CaptureHandler(body, captured => sent = captured) };
             using var http = new HttpClient(handler);
 
             await http.PostAsync(url, new StringContent(body, Encoding.UTF8, "application/json"));
@@ -1849,10 +1849,132 @@ public static class SelfTest
 
         // ── 4) 不會誤判形狀 ──────────────────────────────
         Check("JSON 不是物件（例如陣列）→ 不改",
-            ReasoningOffHandler.Patch("[1,2,3]", LlmOptions.ReasoningFields("off")) is null);
+            ReasoningHandler.Patch("[1,2,3]", LlmOptions.ReasoningFields("off")) is null);
         Check("不需要改時回傳 null（呼叫端就知道不用換 Content）",
-            ReasoningOffHandler.Patch("""{"reasoning_effort":"x"}""",
+            ReasoningHandler.Patch("""{"reasoning_effort":"x"}""",
                                       new Dictionary<string, object?> { ["reasoning_effort"] = "none" }) is null);
+
+        // ── 5) 「他在想什麼」：從回應裡把思考原文與 token 數抓出來 ────
+        //     實際問過 API 的形狀（deepseek-flash，reasoning_effort=high）：
+        //     choices[0].message.reasoning_content ＋ usage.completion_tokens_details.reasoning_tokens
+        var deepseek = """
+            {"choices":[{"index":0,"message":{"role":"assistant","content":"答案","reasoning_content":"我先想：使用者問的是…"}}],
+             "usage":{"prompt_tokens":43,"completion_tokens":60,"completion_tokens_details":{"reasoning_tokens":60}}}
+            """;
+
+        var extracted = ReasoningHandler.ExtractReasoning(deepseek);
+
+        Check("★ 抓到思考原文（DeepSeek 的 reasoning_content）",
+            extracted.Text.Contains("我先想", StringComparison.Ordinal), extracted.Text);
+
+        Check("★ 抓到思考 token 數（completion_tokens_details.reasoning_tokens）",
+            extracted.Tokens == 60, extracted.Tokens.ToString());
+
+        Check("★ 別的服務商的欄位名稱也認得（reasoning／thinking）",
+            ReasoningHandler.ExtractReasoning(
+                """{"choices":[{"message":{"content":"x","reasoning":"想了 A"}}]}""").Text == "想了 A"
+            && ReasoningHandler.ExtractReasoning(
+                """{"choices":[{"message":{"content":"x","thinking":"想了 B"}}]}""").Text == "想了 B");
+
+        Check("沒有思考的回應 → 空的（不會亂認欄位）",
+            ReasoningHandler.ExtractReasoning("""{"choices":[{"message":{"content":"答案"}}]}""") is ("", 0));
+
+        Check("★ 壞掉／空的回應不會丟例外（看思考不該讓對話壞掉）",
+            ReasoningHandler.ExtractReasoning("{壞掉") is ("", 0)
+            && ReasoningHandler.ExtractReasoning("") is ("", 0)
+            && ReasoningHandler.ExtractReasoning(null) is ("", 0));
+
+        // ── 6) 整條管線：SK 客戶端 → HTTP handler → 擷取器 ────────
+        //     ★ 這一段才是「/ai think 到底有沒有東西可以看」的證明：
+        //       中間經過 Semantic Kernel 的解析，而它**不保證**會保留非標準欄位。
+        var capture = new ReasoningCapture();
+
+        var llmOptions = new LlmOptions
+        {
+            ApiKey = "test-key",
+            Model = "fake-model",
+            BaseUrl = "https://api.example.com/v1",
+            Reasoning = "high"
+        };
+
+        var (client, createMessage) = SemanticKernelLlmClient.Create(
+            llmOptions, capture, new ReasoningResponseHandler(deepseek));
+
+        Check("測試用的假客戶端建得起來", client is not null, createMessage);
+
+        var reply = client!.CompleteAsync(new LlmRequest(
+            SystemPrompt: "sys",
+            History: [],
+            Incoming: new ChatTurn(ChatRole.User, "小明", 1UL, 2UL, "這一週大家在聊什麼", DateTimeOffset.UtcNow),
+            MaxTokens: 100,
+            Temperature: 0.2,
+            Tag: "digest"), CancellationToken.None).GetAwaiter().GetResult();
+
+        Check("★ 整條管線抓得到思考原文（SK 沒有把它吃掉）",
+            reply.HasReasoning && reply.Reasoning.Contains("我先想", StringComparison.Ordinal),
+            reply.Reasoning);
+
+        Check("★ 思考 token 數也跟著回覆一起回來", reply.ReasoningTokens == 60);
+
+        Check("★ 回應 body 沒有被「讀走」——SK 還是拿得到回答",
+            reply.Text == "答案", reply.Text);
+
+        var latest = capture.Latest;
+
+        Check("★ 擷取器留了一筆（`/ai think` 看得到），而且標籤是這一次的用途",
+            latest is not null && latest.Tag == "digest" && latest.ReasoningTokens == 60,
+            latest?.Describe());
+
+        // 沒有思考的呼叫**不該**塞進清單（不然 20 筆都被一般回覆佔滿，看不到摘要那筆）
+        var (plainClient, _) = SemanticKernelLlmClient.Create(
+            llmOptions, capture,
+            new ReasoningResponseHandler("""{"choices":[{"message":{"content":"普通回答"}}]}"""));
+
+        var plain = plainClient!.CompleteAsync(new LlmRequest(
+            "sys", [], new ChatTurn(ChatRole.User, "小明", 1UL, 3UL, "嗨", DateTimeOffset.UtcNow),
+            50, 0.2, Tag: "chat"), CancellationToken.None).GetAwaiter().GetResult();
+
+        Check("★ 沒有思考的一般回覆不會佔用 `/ai think` 的清單",
+            capture.Recent(5).Count == 1 && capture.TotalWithoutThinking == 1,
+            capture.Describe());
+
+        Check("一般回覆本身還是正常的（只是沒有思考可以看）",
+            plain.Text == "普通回答" && !plain.HasReasoning);
+
+        // 巢狀呼叫：內層的思考不可以寫到外層的格子（多個頻道同時呼叫時的隔離）
+        var nested = new ReasoningCapture();
+        string outerText;
+
+        using (var outer = ReasoningCapture.Begin())
+        {
+            ReasoningCapture.Add("外層的想法", 5);
+
+            using (var inner = ReasoningCapture.Begin())
+            {
+                ReasoningCapture.Add("內層的想法", 7);
+
+                Check("★ 巢狀呼叫：內層拿到自己的思考（不會混到外層）",
+                    inner.Snapshot().Text == "內層的想法", inner.Snapshot().Text);
+            }
+
+            outerText = outer.Snapshot().Text;
+        }
+
+        Check("★ 巢狀呼叫：外層的思考沒有被內層蓋掉", outerText == "外層的想法", outerText);
+
+        Check("★ 擷取器有上限（不會無限長大）",
+            ReasoningCapture.Capacity == 20 && ReasoningCapture.MaxTextLength == 4000);
+    }
+
+    /// <summary>回一個「含思考內容」的固定回應（模擬服務商的 HTTP 回應）。</summary>
+    private sealed class ReasoningResponseHandler(string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            });
     }
 
     /// <summary>攔下送出的 body（模擬 HTTP 層，不需要網路）。</summary>
@@ -3727,6 +3849,74 @@ public static class SelfTest
             && rendered.Contains("還在進行中", StringComparison.Ordinal)
             && rendered.Contains("<@111>", StringComparison.Ordinal),
             rendered.Split('\n')[0]);
+
+        // ── 14) 「他在想什麼」要留在歸檔裡（一週後還看得到）────────
+        //     為什麼要存：思考只留在記憶體的話，重啟或過幾天就沒了；
+        //     而週報是**一週後**才會回頭看的東西。
+        var thinkState = new FakeStateStore();
+        var thinkStore = new DigestStore(thinkState);
+        thinkStore.Enable(1UL, 2UL, 3UL, DigestSchedule.Default, now, tw);
+
+        var thinkLlm = new CountingLlmClient("""{"summary":"有思考的摘要","highlights":[],"open_items":[],"mentions":[]}""")
+        {
+            Reasoning = new string('想', 2600),      // 故意超過節錄上限（2000 字）
+            ReasoningTokens = 448
+        };
+
+        var think = new ChannelDigestService(
+                thinkLlm, thinkStore,
+                new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 100_000 }, new FakeStateStore(), now),
+                new DigestOptions { BatchTokens = 100_000 })
+            .RunAsync(new DigestRun(
+                1UL, 2UL, "測試頻道",
+                [Msg(6, 111UL, "小明", "304 有到嗎", now)], participants, Manual: true))
+            .GetAwaiter().GetResult();
+
+        Check("★ 思考 token 數會存進歸檔（看得到「想了多久」）",
+            think.Record?.ReasoningTokens == 448, think.Record?.ReasoningTokens.ToString());
+
+        Check("★ 思考原文也存了節錄（永久保留，重啟後還看得到）",
+            think.Record?.Reasoning.Length == ChannelDigestService.ReasoningExcerptLength + 1
+            && think.Record.Reasoning.EndsWith('…'),
+            $"{think.Record?.Reasoning.Length} 字");
+
+        Check("★ 重啟之後那一筆思考還在（`/ai think channel:` 的來源）",
+            new DigestStore(thinkState).Latest(2UL)?.ReasoningTokens == 448
+            && new DigestStore(thinkState).Latest(2UL)!.Reasoning.Length > 0);
+
+        // ── 15) 「想很久」的後果：思考把輸出額度吃掉 → 要講出來 ────
+        //     實測：max_tokens=60 搭配思考時，60 個 token 全被思考吃掉、回答是空的。
+        var cutStore = new DigestStore(new FakeStateStore());
+        cutStore.Enable(1UL, 2UL, 3UL, DigestSchedule.Default, now, tw);
+
+        var cutLlm = new CountingLlmClient("""{"summary":"被截斷的摘要""")
+        {
+            Reasoning = "想了很久…",
+            ReasoningTokens = 4800,
+            FinishReason = "length"
+        };
+
+        var cut = new ChannelDigestService(
+                cutLlm, cutStore,
+                new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 100_000 }, new FakeStateStore(), now),
+                new DigestOptions { BatchTokens = 100_000, MaxOutputTokens = 5000 })
+            .RunAsync(new DigestRun(
+                1UL, 2UL, "測試頻道",
+                [Msg(6, 111UL, "小明", "304 有到嗎", now)], participants, Manual: false))
+            .GetAwaiter().GetResult();
+
+        Check("★ 模型輸出被截斷時會明講（思考吃掉了輸出額度）",
+            cut.OutputTruncated
+            && cut.Message.Contains("截斷", StringComparison.Ordinal)
+            && cut.Message.Contains("LLM_DIGEST_MAX_TOKENS", StringComparison.Ordinal),
+            cut.Message.Replace("\n", " ｜ "));
+
+        Check("★ JSON 被截斷也不會整個失敗（退回「整段當摘要」）",
+            cut.HasDigest && cut.Record!.Summary.Contains("被截斷的摘要", StringComparison.Ordinal));
+
+        Check("思考的額度要留給「思考 ＋ 回答」（預設值不可以太小）",
+            new DigestOptions().MaxOutputTokens >= 4000,
+            new DigestOptions().MaxOutputTokens.ToString());
     }
 
     /// <summary>DigestMessage 的測試建構子（少打很多字）。</summary>
@@ -3751,6 +3941,15 @@ public static class SelfTest
         /// <summary>全部的請求（用來驗「分批有沒有漏」與「哪一次是彙整」）。</summary>
         public List<LlmRequest> Requests { get; } = [];
 
+        /// <summary>假裝模型「想了什麼」（驗思考內容有沒有被留下來）。</summary>
+        public string Reasoning { get; set; } = "";
+
+        /// <summary>假裝的思考 token 數。</summary>
+        public int ReasoningTokens { get; set; }
+
+        /// <summary>假裝的結束原因（驗「輸出被截斷」那條路徑時設成 length）。</summary>
+        public string? FinishReason { get; set; }
+
         public bool IsConfigured => true;
 
         public string Describe() => "（測試用假 LLM）";
@@ -3763,7 +3962,10 @@ public static class SelfTest
 
             return Task.FromResult(new LlmReply(
                 Reply, InputTokens: 10, OutputTokens: 2, UsageReported: true,
-                Model: "fake", Elapsed: TimeSpan.FromMilliseconds(1)));
+                Model: "fake", Elapsed: TimeSpan.FromMilliseconds(1),
+                FinishReason: FinishReason,
+                Reasoning: Reasoning,
+                ReasoningTokens: ReasoningTokens));
         }
     }
 

@@ -7,7 +7,7 @@ namespace TcBusBot.Core.Chat;
 /// 直覺做法是設定 <c>OpenAIPromptExecutionSettings.ModelId</c>，但
 /// **Semantic Kernel 這個版本會忽略它** —— 實測（用一個故意不存在的模型名稱：
 /// `definitely-not-a-real-model-xyz`）請求**照樣成功**，回來的 `model` 還是主模型。
-/// 這跟 `ExtensionData` 被忽略是同一類問題（見 <c>ReasoningOffHandler</c> 的註解）：
+/// 這跟 `ExtensionData` 被忽略是同一類問題（見 <c>ReasoningHandler</c> 的註解）：
 /// **「設定了某個屬性」不等於「送出去了」**。
 ///
 /// 所以「換模型」只能在**建立連線**時決定 —— 也就是建兩個客戶端，由這一層分流：

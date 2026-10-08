@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 724 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 745 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 724 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 745 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -4215,6 +4215,106 @@ Discord.Net 會用 `ActivatorUtilities` 現場建實例 —— 但那就代表�
 
 `/health` 多了 `digest` 欄位（幾個頻道啟用、排程器活著嗎）——
 背景自己跑的功能如果沒有觀察點，要等到某一週沒收到摘要才會發現它早就停了。
+
+### 20.28 「他在想什麼」（`/ai think`：把模型的思考內容留下來）
+
+使用者的回饋很直接：**「哇他想好久，给个功能能看他在想什么」**。
+摘要開了思考之後一次要跑幾十秒，而使用者手上只有「等」和「猜」兩個選項。
+
+#### 20.28.1 思考內容在哪裡（先問 API，再寫程式）
+
+實際打一次 API 才確定形狀（`reasoning_effort=high`）：
+
+```json
+{"choices":[{"message":{"role":"assistant","content":"…","reasoning_content":"We need answer in Chinese…"}}],
+ "usage":{"prompt_tokens":82,"completion_tokens":477,
+          "completion_tokens_details":{"reasoning_tokens":448}}}
+```
+
+| 觀察 | 結論 |
+| --- | --- |
+| 思考原文在 `choices[0].message.reasoning_content` | 這是「有沒有東西可看」的唯一來源 |
+| 思考 token 數在 `usage.completion_tokens_details.reasoning_tokens` | 順便可以顯示「想了多少」 |
+| **思考是英文、回答是中文** | 那是模型的草稿本，不是給人讀的 —— 說明文字要先講清楚 |
+| `max_tokens=60` 搭配思考 → **60 個 token 全被思考吃掉**、`finish_reason=length`、回答是空的 | 思考與回答**共用**輸出額度 → 摘要的 `LLM_DIGEST_MAX_TOKENS` 預設從 3000 調到 **5000**，而且**被截斷時要明講** |
+
+#### 20.28.2 為什麼在 HTTP 層抓（跟「關不掉思考」是同一個坑的鏡像）
+
+`reasoning_content` 是**非標準欄位**，而這個專案已經吃過 Semantic Kernel「默默忽略非標準欄位」
+的虧（`ExtensionData`、`ModelId` 都是 —— 見 §20.14）。所以「SK 會不會保留它」不能靠猜。
+
+作法：**不猜**。既然「送出的 JSON」已經在 HTTP 層補欄位（`ReasoningHandler`），
+就讓同一層也把**回應的 JSON** 讀一遍：
+
+1. 讀出 body → 取出 `reasoning_content`（也認得 `reasoning`／`thinking`／`reasoning_text`）
+   與 `reasoning_tokens`
+2. **一定把 body 放回去**（讀過之後 stream 就沒了 —— 症狀會是「模型回空話」而且沒有錯誤訊息）
+3. 任何意外（不是 JSON、讀不到）都原樣交給 SK，只是沒有思考可以看
+
+真實 API 驗證（開發時用真的金鑰跑過一次）：`reply.Reasoning` 1199 字、`ReasoningTokens` 448、
+回答照樣是完整的 JSON —— SK 沒有被我們動到。
+
+#### 20.28.3 哪一筆思考屬於哪一通呼叫（`AsyncLocal`）
+
+HTTP handler 不知道這次呼叫是「聊天」還是「摘要」，也不知道是哪個頻道 ——
+但它跑在**同一個非同步脈絡**裡。所以：
+
+* `SemanticKernelLlmClient.CompleteAsync` 一開始 `ReasoningCapture.Begin()`（設定目前格子）
+* handler 抓到思考就 `ReasoningCapture.Add(...)`（寫進目前格子）
+* 呼叫結束（**成功或失敗都算**）`Commit(...)` 記進清單
+
+這樣「A 頻道聊天、B 頻道摘要同時跑」也不會互相蓋掉（`Begin` 支援巢狀，`Dispose` 只還原自己那一格）。
+失敗也留一筆 —— 「想很久然後失敗」正是最需要看它想了什麼的時候。
+
+只留**最近 20 筆、每筆 4000 字**：思考是觀察資料，不該無限長大；
+沒有思考的呼叫**不記**（不然清單會被一般回覆佔滿，看不到真正想看的那幾筆）。
+
+#### 20.28.4 兩種來源：記憶體 ＋ 歸檔
+
+| 指令 | 來源 | 為什麼 |
+| --- | --- | --- |
+| `/ai think` | 記憶體裡的最近 20 筆（任何呼叫） | 「剛剛那次到底在想什麼」—— 即時、不限摘要 |
+| `/ai think channel:#頻道` | **歸檔裡那一份週報的思考** | 週報是**一週後**才回頭看的東西，只留在記憶體的話重啟就沒了 |
+
+所以 `DigestRecord` 多存 `reasoning_tokens` 與 `reasoning`（節錄 2000 字）。
+
+`/ai think` **只有管理員**能用：思考內容可能包含頻道裡的對話，而 `/ai status`、`/digest status`
+那種看設定的是任何人都能看的 —— 這兩種資訊的敏感度不一樣。
+
+#### 20.28.5 順手解決「等很久」的體感
+
+「想很久」還有一個純 UX 的問題：打了 `/digest now` 之後**幾十秒什麼都沒有**，
+使用者會以為壞掉、再打一次（於是又花一次錢）。所以摘要開始時先發一則
+「🔄 正在整理這一週的訊息（N 則）…模型正在思考」的進度訊息，跑完**改寫成週報本身**：
+
+* 不刪不重發 → 頻道只跳一次通知、時間軸只有一份週報
+* 失敗時那一則被改成錯誤說明（留下一條線索，而不是憑空消失）
+* 改寫時**一樣**帶 `AllowedMentions`（@ 的權限不會因為「用改的」而放寬）
+
+#### 20.28.6 驗收
+
+`tcbus selftest` 新增 **21 項**（在原有的第 23、30 節裡）：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| `ExtractReasoning` 認得 `reasoning_content`／`reasoning`／`thinking`／`reasoning_tokens` | 欄位名寫錯＝功能看起來沒作用 |
+| 壞掉／空的回應不丟例外 | 看思考不該讓對話壞掉 |
+| **整條管線**：SK 客戶端 → HTTP handler → 擷取器（餵假的 HTTP 回應） | SK 有沒有把非標準欄位吃掉，只有這樣驗得出來 |
+| 回應 body 沒有被讀走（回答照樣拿得到） | 讀了 body 忘了放回去＝模型回空話 |
+| 一般回覆（沒有思考）不會塞滿 `/ai think` 的清單 | 不然 20 筆都看不到真正想看的那筆 |
+| 巢狀呼叫的思考不會互相蓋掉 | 多個頻道同時問 |
+| 思考 token 數與原文節錄存進歸檔、**重啟後還在** | 一週後還看得到 |
+| **輸出被截斷時明講**（`finish_reason=length` → 建議調高 `LLM_DIGEST_MAX_TOKENS`） | 不講的話使用者只會覺得「摘要品質變差」 |
+| 摘要預設輸出額度 ≥ 4000（思考與回答共用） | 實測踩過的坑 |
+
+`--dryrun`：「每週摘要檢查」多了 `/ai think` 的授權（必須擋管理員）、
+擷取器真的被讀、`SemanticKernelLlmClient.Create` 真的掛了 `ReasoningHandler`；
+`/ai` 的子指令清單多了 `think`。
+（「摘要有沒有把思考寫進歸檔」**不能**用 IL 掃描驗 —— `new DigestRecord(...)` 在 IL 裡是
+`newobj` 不是 `call`，掃不到；所以它改成 selftest 的行為測試，程式裡也留了這段說明。）
+
+真實 API 驗證（用有效金鑰跑過一次）：思考 1199 字／448 tokens、
+`finish_reason=Stop`、回答完整 —— 抓取與補欄位都沒有影響正常對話。
 
 ---
 
