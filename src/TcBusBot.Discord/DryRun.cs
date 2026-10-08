@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.SemanticKernel;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
+using TcBusBot.Core.Chat.Digest;
 using TcBusBot.Core.Configuration;
 using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Models;
@@ -553,6 +554,9 @@ public static class DryRun
 
         // ── LLM 公車工具的參數（模型看不看得懂怎麼填）──────────
         AuditBusToolSchema();
+
+        // ── 每週摘要（/digest）：授權、@ 人的範圍、游標、額度 ─────
+        AuditDigest();
 
         // ── 偷聽模式的入口（「後面的訊息全被忽略」的那個 bug）────
         AuditEavesdropWiring();
@@ -1251,6 +1255,147 @@ public static class DryRun
             Problem("重置沒有留下主人操作紀錄 —— 「額度怎麼突然變多」會查不出來是誰做的");
         else
             Console.WriteLine("  ✔ 第一次只顯示確認、取消不會動資料、確定才重置，而且會記進 /ai audit");
+    }
+
+    /// <summary>
+    /// **每週頻道摘要**（`/digest`）的離線驗證。
+    ///
+    /// 這個功能的風險跟別的都不一樣：
+    ///   * 它**每週自己花一次錢**（沒有人在旁邊看）→ 花的錢一定要算進額度
+    ///   * 它會**@ 人** → @ 錯人是「打擾到別人」，比講錯話嚴重得多
+    ///   * 它靠**游標**決定「算過哪些」→ 推進太多會漏訊息、太少會重複花錢
+    /// 所以這裡驗四件事：誰能啟用、@ 的範圍、游標真的被用、錢真的被記。
+    /// （摘要本身的邏輯 —— 分批、解析、跨週帶下去 —— 在 `tcbus selftest` 第 30 節。）
+    /// </summary>
+    private static void AuditDigest()
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 每週摘要檢查  `/digest`：誰能啟用、@ 誰、游標、花錢");
+
+        var before = _problems;
+
+        // ── 1) 只有 Bot 管理員能啟用／執行 ──────────────────
+        var adminGate = new (string Method, string Label)[]
+        {
+            ("EnableAsync", "啟用"),
+            ("DisableAsync", "停用"),
+            ("ScheduleAsync", "改時間"),
+            ("NowAsync", "手動觸發")
+        };
+
+        foreach (var (method, label) in adminGate)
+        {
+            var info = typeof(DigestModule).GetMethod(method);
+
+            if (info is null)
+            {
+                Problem($"找不到 DigestModule.{method}（/{label} 的功能不見了）");
+                continue;
+            }
+
+            var calls = CollectCalls(info, resolveAll: true);
+
+            // 授權判斷在 `IsAdmin` 這個屬性裡（讀 LLM_ADMIN_IDS）——
+            // 所以這裡驗「有沒有走那道門」，門本身另外驗（見下面）。
+            if (!calls.Contains("DigestModule.get_IsAdmin"))
+                Problem($"/digest {label} 沒有先問 IsAdmin —— 任何人都能讓 Bot 每週花錢");
+        }
+
+        var isAdmin = typeof(DigestModule).GetProperty("IsAdmin",
+            BindingFlags.Instance | BindingFlags.NonPublic)?.GetMethod;
+
+        var isAdminCalls = isAdmin is null ? [] : CollectCalls(isAdmin, resolveAll: true);
+
+        if (isAdmin is null)
+            Problem("找不到 DigestModule.IsAdmin —— 無法確認 /digest 的授權來源");
+        else if (!isAdminCalls.Contains("LlmOptions.get_AdminUserIds"))
+            Problem("/digest 的 IsAdmin 不是看 LLM_ADMIN_IDS —— 授權名單會失效");
+        else if (!isAdminCalls.Any(c => c.EndsWith(".get_Id", StringComparison.Ordinal)))
+            Problem("/digest 的 IsAdmin 沒有比對發話者 ID");
+
+        var reads = typeof(DigestModule).GetMethod("StatusAsync");
+        var readCalls = reads is null ? [] : CollectCalls(reads, resolveAll: true);
+
+        if (reads is not null && readCalls.Contains("ChatModule.CanSetPersona"))
+            Problem("/digest status 不該要求管理員（看設定本來就該給任何人看）");
+
+        // ── 2) @ 人的範圍（讀摘要的人被 @ 到才是重點）──────────
+        var runAsync = typeof(ChannelDigestService).GetMethod("RunAsync");
+        var runCalls = runAsync is null ? [] : CollectCalls(runAsync, resolveAll: true);
+
+        if (runAsync is null)
+        {
+            Problem("找不到 ChannelDigestService.RunAsync");
+        }
+        else
+        {
+            // ★ 模型給的 ID 一定要核對過才可能被 @（模型很會照格式編 ID）
+            if (!runCalls.Contains("DigestPrompt.SanitizeMentions"))
+                Problem("摘要流程沒有核對模型給的 @ 名單 —— 可能 @ 到不存在或別的伺服器的人");
+
+            // ★ 成功之後才推進游標（少了這一行，下週會重複整理同一段）
+            if (!runCalls.Contains("DigestStore.MarkRun"))
+                Problem("摘要沒有推進游標 —— 下一週會重複整理同一段內容（重複花錢）");
+
+            if (!runCalls.Contains("DigestStore.Append"))
+                Problem("摘要沒有寫進永久歸檔");
+        }
+
+        // 花錢與額度在 CallAsync（每一次呼叫都經過它）
+        var callAsync = typeof(ChannelDigestService).GetMethod("CallAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var callCalls = callAsync is null ? [] : CollectCalls(callAsync, resolveAll: true);
+
+        if (callAsync is null)
+            Problem("找不到 ChannelDigestService.CallAsync");
+        else if (!callCalls.Contains("WeeklyTokenBudget.Check"))
+            Problem("摘要送出前沒有先檢查額度");
+        else if (!callCalls.Contains("WeeklyTokenBudget.Record"))
+            Problem("摘要沒有把用量記進每週額度 —— 它就變成繞過上限的後門");
+        else if (!callCalls.Contains("WeeklyTokenBudget.RecordRefusal"))
+            Problem("摘要被額度擋下時沒有記錄（/ai status 看不到）");
+
+        var post = typeof(DigestRunner).GetMethod("PostAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var postCalls = post is null ? [] : CollectCalls(post, resolveAll: true);
+
+        if (post is null)
+            Problem("找不到 DigestRunner.PostAsync");
+        else if (!postCalls.Contains("AllowedMentions.set_AllowedTypes")
+                 || !postCalls.Contains("AllowedMentions.set_UserIds"))
+            Problem("發週報時沒有把允許 @ 的對象限制成「那幾個使用者」—— @everyone／身分組會漏出去");
+
+        var fetch = typeof(DigestRunner).GetMethod("FetchAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var fetchCalls = fetch is null ? [] : CollectCalls(fetch, resolveAll: true);
+
+        if (fetch is null)
+            Problem("找不到 DigestRunner.FetchAsync");
+        else if (!fetchCalls.Contains("DigestCursor.IsAfter"))
+            Problem("讀歷史訊息時沒有比對游標 —— 會重複整理或漏訊息");
+
+        // ── 3) 排程器：失敗不可以讓它停掉 ────────────────────
+        var loop = typeof(DigestScheduler).GetMethod("RunAsync");
+        var loopCalls = loop is null ? [] : CollectCalls(loop, resolveAll: true);
+
+        if (loop is null)
+            Problem("找不到 DigestScheduler.RunAsync（每週摘要不會自動跑）");
+        else if (!loopCalls.Contains("DigestScheduler.TickAsync"))
+            Problem("排程迴圈沒有呼叫 TickAsync");
+
+        // ── 4) 設定本身合不合理 ─────────────────────────────
+        var digest = new Core.Chat.Digest.DigestOptions();
+        Console.WriteLine($"  ℹ {digest.Describe()}");
+
+        if (digest.MaxMentions > 10)
+            Problem($"預設最多 @ {digest.MaxMentions} 個人太多了（一次 @ 十幾個等於洗頻）");
+
+        if (digest.EffectiveMaxMessages <= 0)
+            Problem("安全上限算出來是 0 —— 摘要什麼都讀不到");
+
+        if (_problems == before)
+            Console.WriteLine("  ✔ 只有 Bot 管理員能啟用／執行；@ 人只限核對過的那幾位；" +
+                              "游標會推進、花費會記進每週額度");
     }
 
     /// <summary>

@@ -295,6 +295,15 @@ public sealed class LlmOptions
         => string.IsNullOrWhiteSpace(CityDisplay) ? "" : CityNoteFor(CityDisplay, MultiCity);
 
     /// <summary>
+    /// 每週頻道摘要的設定（見 <see cref="Digest.DigestOptions"/>）。
+    ///
+    /// 為什麼掛在這裡而不是另一個獨立的設定物件：摘要就是 LLM 的一種用法，
+    /// 排程器、指令、摘要流程都要看**同一份**設定；分成兩份反而要處理
+    /// 「哪一份才是真的」這種問題。
+    /// </summary>
+    public Digest.DigestOptions Digest { get; set; } = new();
+
+    /// <summary>
     /// 產生「服務範圍」那一段。
     ///
     /// ⚠️ 城市是**按使用者**選的（`/bus city`），所以實際內容是「問的人選的那個城市」——

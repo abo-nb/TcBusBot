@@ -24,28 +24,44 @@ public sealed class RoutingLlmClient : ILlmClient
 {
     private readonly ILlmClient _main;
     private readonly ILlmClient? _judge;
+    private readonly ILlmClient? _digest;
     private readonly LlmDiagnostics? _diagnostics;
 
-    public RoutingLlmClient(ILlmClient main, ILlmClient? judge, LlmDiagnostics? diagnostics = null)
+    public RoutingLlmClient(
+        ILlmClient main,
+        ILlmClient? judge,
+        LlmDiagnostics? diagnostics = null,
+        ILlmClient? digest = null)
     {
         _main = main;
         _judge = judge;
+        _digest = digest;
         _diagnostics = diagnostics;
     }
 
     /// <summary>有幾個模型可以用（1 = 只有主模型）。</summary>
-    public int ModelCount => _judge is null ? 1 : 2;
+    public int ModelCount => 1 + (_judge is null ? 0 : 1) + (_digest is null ? 0 : 1);
 
     public bool IsConfigured => _main.IsConfigured;
 
     /// <summary>這次會用哪一個客戶端（測試與 log 用）。</summary>
     public ILlmClient For(LlmRequest request)
-        => request.JudgeCall && _judge is not null ? _judge : _main;
+    {
+        // 摘要的彙整優先：它一定要走「開了思考」那條連線
+        if (request.DigestCall && _digest is not null) return _digest;
+
+        return request.JudgeCall && _judge is not null ? _judge : _main;
+    }
 
     public string Describe()
-        => _judge is null
-            ? _main.Describe()
-            : $"{_main.Describe()}｜短判斷走：{_judge.Describe()}";
+    {
+        var parts = new List<string> { _main.Describe() };
+
+        if (_judge is not null) parts.Add($"短判斷走：{_judge.Describe()}");
+        if (_digest is not null) parts.Add($"每週摘要走：{_digest.Describe()}");
+
+        return string.Join("｜", parts);
+    }
 
     public Task<LlmReply> CompleteAsync(LlmRequest request, CancellationToken cancellationToken)
         => CompleteAndRecordAsync(request, cancellationToken);
@@ -88,26 +104,44 @@ public sealed class RoutingLlmClient : ILlmClient
     /// </summary>
     public static (RoutingLlmClient Client, string Message) Create(
         LlmOptions mainOptions, LlmOptions? judgeOptions, Func<LlmOptions, (ILlmClient?, string)> factory,
-        LlmDiagnostics? diagnostics = null)
+        LlmDiagnostics? diagnostics = null,
+        LlmOptions? digestOptions = null)
     {
         var (main, mainMessage) = factory(mainOptions);
 
         if (main is null) return (new RoutingLlmClient(DisabledLlmClient.Instance, null, diagnostics), mainMessage);
 
+        // ── 摘要那條連線（開了思考；見 LlmRequest.DigestCall）──────
+        ILlmClient? digest = null;
+        var digestMessage = "";
+
+        if (digestOptions is not null)
+        {
+            var (created, message) = factory(digestOptions);
+
+            if (created is null)
+                digestMessage = $"\n⚠️  每週摘要的連線建立失敗 → 摘要改用一般連線（不會思考）：{message}";
+            else
+            {
+                digest = created;
+                digestMessage = $"\n✅ 每週摘要走另一個連線：{created.Describe()}";
+            }
+        }
+
         if (judgeOptions is null || !mainOptions.HasSeparateJudgeModel)
-            return (new RoutingLlmClient(main, null, diagnostics), mainMessage);
+            return (new RoutingLlmClient(main, null, diagnostics, digest), mainMessage + digestMessage);
 
         var (judge, judgeMessage) = factory(judgeOptions);
 
         if (judge is null)
         {
             // 判斷模型建不起來**不可以**拖垮整個 AI 功能 —— 退回只有主模型
-            return (new RoutingLlmClient(main, null, diagnostics),
-                $"{mainMessage}\n⚠️  判斷用的模型（{judgeOptions.JudgeModel}）建立失敗 → 短判斷改用主模型：" +
+            return (new RoutingLlmClient(main, null, diagnostics, digest),
+                $"{mainMessage}{digestMessage}\n⚠️  判斷用的模型（{judgeOptions.JudgeModel}）建立失敗 → 短判斷改用主模型：" +
                 judgeMessage);
         }
 
-        return (new RoutingLlmClient(main, judge, diagnostics),
-            $"{mainMessage}\n✅ 短判斷（是在跟我說話嗎／換話題了沒）走另一個模型：{judge.Describe()}");
+        return (new RoutingLlmClient(main, judge, diagnostics, digest),
+            $"{mainMessage}{digestMessage}\n✅ 短判斷（是在跟我說話嗎／換話題了沒）走另一個模型：{judge.Describe()}");
     }
 }

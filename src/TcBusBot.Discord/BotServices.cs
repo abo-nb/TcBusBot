@@ -138,6 +138,24 @@ internal static class BotServices
 
         services.AddSingleton<LlmChatService>();
 
+        // ── 每週頻道摘要（/digest）────────────────────────────
+        //
+        // 儲存：設定（含游標）與歷次摘要的歸檔各是一份**獨立**的 blob（永久保留）。
+        // 為什麼跟聊天記憶分開：生命週期不一樣（記憶是暫存的、歸檔是永久的）。
+        services.AddSingleton(sp => new Core.Chat.Digest.DigestStore(sp.GetRequiredService<ILlmStateStore>()));
+
+        // 摘要設定本身也是服務（排程器、指令、摘要流程共用同一份）
+        services.AddSingleton(cfg.Llm.Digest);
+
+        services.AddSingleton(sp => new Core.Chat.Digest.ChannelDigestService(
+            sp.GetRequiredService<ILlmClient>(),
+            sp.GetRequiredService<Core.Chat.Digest.DigestStore>(),
+            sp.GetRequiredService<WeeklyTokenBudget>(),
+            cfg.Llm.Digest));
+
+        services.AddSingleton<DigestRunner>();
+        services.AddSingleton<DigestScheduler>();
+
         // ── Discord 互動 ──────────────────────────────────
         services.AddSingleton(_ => new InteractionService(client.Rest, new InteractionServiceConfig
         {
@@ -174,13 +192,27 @@ internal static class BotServices
 
         if (judgeOptions is not null) judgeOptions.Model = options.JudgeModel!;
 
+        // 每週摘要那條連線：換思考強度（預設 high）與可選的模型。
+        // 為什麼要另建一條：思考是在**建立連線**時決定的（ReasoningOffHandler 掛在 HttpClient 上），
+        // 不能在單一請求裡切換 —— 理由跟「換模型」完全一樣（見 RoutingLlmClient 的說明）。
+        var digestOptions = options.Clone();
+        digestOptions.Reasoning = options.Digest.Reasoning;
+
+        if (!string.IsNullOrWhiteSpace(options.Digest.Model)) digestOptions.Model = options.Digest.Model!;
+
+        // 設定跟主連線一模一樣時就不必多建一條（設 `LLM_DIGEST_REASONING` 跟 `LLM_REASONING` 相同）
+        var needsDigestConnection = options.Digest.Enabled && options.Digest.NeedsOwnConnection(options);
+
         var (client, message) = RoutingLlmClient.Create(options, judgeOptions, opts =>
         {
             var (created, createdMessage) = SemanticKernelLlmClient.Create(opts);
             return ((ILlmClient?)created, createdMessage);
-        }, diag);
+        }, diag, needsDigestConnection ? digestOptions : null);
 
         log(message);
+
+        if (options.Digest.Enabled && !needsDigestConnection)
+            log($"ℹ️  每週摘要與聊天共用同一條連線（思考設定相同：{options.Digest.Reasoning}）");
 
         return client;
     }

@@ -49,6 +49,15 @@ internal static class BotStatus
     /// <summary>AI 聊天狀態（模型、每週用量）——由 Program 在建立 LLM 後填入。</summary>
     public static Func<string>? Llm { get; set; }
 
+    /// <summary>
+    /// 每週摘要狀態（幾個頻道啟用、排程器活著嗎）——由 Program 在啟動排程器後填入。
+    ///
+    /// 為什麼要放進 `/health`：這個功能是**背景自己跑**的，
+    /// 使用者唯一能確認「它還活著嗎」的方式就是看這裡 ——
+    /// 不然要等到某一週沒收到摘要才會發現它早就停了。
+    /// </summary>
+    public static Func<string>? Digest { get; set; }
+
     private static readonly JsonSerializerOptions Json = new()
     {
         WriteIndented = false,
@@ -76,7 +85,8 @@ internal static class BotStatus
                 subscriptionGroups = groups,
                 subscriptions = subs,
                 cachedEtas = CachedEtas?.Invoke() ?? 0,
-                llm = Llm?.Invoke() ?? "未啟用"
+                llm = Llm?.Invoke() ?? "未啟用",
+                digest = Digest?.Invoke() ?? "未啟用"
             }, Json);
         }
         catch (Exception ex)

@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Chat;
+using TcBusBot.Core.Chat.Digest;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Tdx;
 using TcBusBot.Core.Configuration;
@@ -123,6 +124,9 @@ public static class SelfTest
 
         Section("29. 服務城市（BUS_CITY）：預設臺中，可換臺南等其他縣市");
         TestBusCity();
+
+        Section("30. 每週頻道摘要（/digest）：排程、游標、分批、@ 人的核對、永久歸檔");
+        TestDigest();
 
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
@@ -3423,7 +3427,318 @@ public static class SelfTest
             !angry.Ignored && angry.Text.Length > 0, $"ok={angry.Ok}");
     }
 
-    /// <summary>測試用的假 LLM：固定回一句話，並記住被呼叫幾次（用來驗證「該不該花錢」）。</summary>
+    /// <summary>
+    /// 每週頻道摘要（`/digest`）。
+    ///
+    /// 這裡驗的都是「錯了不會拋例外、只會默默產生一份看起來很正常的爛摘要」的地方：
+    ///   * 排程算錯 → 摘要在錯的時間出現（或每小時都出現一次）
+    ///   * 游標沒推進 → 每週重複整理同一段（浪費錢、內容重複）
+    ///   * 游標推太快 → **漏掉訊息**（更糟：沒人會發現少了什麼）
+    ///   * 模型編了一個 ID → @ 到不存在的人，甚至 @ 到別的伺服器的人
+    ///   * 跨週事項沒帶下去 → 每週都重新開始，「還在進行中」永遠是空的
+    /// </summary>
+    private static void TestDigest()
+    {
+        var tw = TimeSpan.FromHours(8);   // 台灣時間
+
+        // ── 1) 排程的寫法 ────────────────────────────────
+        Check("★ 排程寫法：週一 09:00",
+            DigestSchedule.TryParse("週一 09:00", out var monday, out _)
+            && monday == new DigestSchedule(DayOfWeek.Monday, 9, 0));
+
+        Check("★ 各種寫法都通（星期三／禮拜三／wed／3 2000）",
+            DigestSchedule.TryParse("星期三 20:00", out var d1, out _) && d1 == new DigestSchedule(DayOfWeek.Wednesday, 20, 0)
+            && DigestSchedule.TryParse("禮拜三 20:00", out var d2, out _) && d2 == d1
+            && DigestSchedule.TryParse("wed 20:00", out var d3, out _) && d3 == d1
+            && DigestSchedule.TryParse("3 2000", out var d4, out _) && d4 == d1);
+
+        Check("只寫時間 → 每週一那個時間",
+            DigestSchedule.TryParse("09:30", out var only, out _)
+            && only == new DigestSchedule(DayOfWeek.Monday, 9, 30));
+
+        Check("沒給 → 預設每週一 09:00",
+            DigestSchedule.TryParse(null, out var fallback, out _)
+            && fallback == DigestSchedule.Default
+            && DigestSchedule.Default.Describe() == "每週一 09:00");
+
+        Check("★ 看不懂的時間要回錯誤（不可以偷偷用預設值，那會讓人以為設好了）",
+            !DigestSchedule.TryParse("下午三點", out _, out var badError) && badError.Length > 0,
+            badError);
+
+        // ── 2) 「下一次什麼時候」（主機在 UTC，排程講的是台灣時間）──
+        var mondayNineTw = new DateTimeOffset(2026, 9, 21, 1, 0, 0, TimeSpan.Zero);   // 台灣 09:00
+
+        Check("★ 台灣週一 09:00 ＝ UTC 週一 01:00（主機時區不影響）",
+            monday.NextRun(mondayNineTw.AddMinutes(-1), tw) == mondayNineTw);
+
+        Check("★ 時間剛過 → 順延一週（不會同一分鐘重複跑）",
+            monday.NextRun(mondayNineTw.AddMinutes(1), tw) == mondayNineTw.AddDays(7));
+
+        Check("台灣週日深夜問 → 隔天早上（跨週算得對）",
+            monday.NextRun(new DateTimeOffset(2026, 9, 20, 15, 0, 0, TimeSpan.Zero), tw) == mondayNineTw);
+
+        // ── 3) 游標：有沒有比上次新 ───────────────────────
+        Check("★ 游標比較用數字（字串比大小會錯：\"9\" > \"10\"）",
+            DigestCursor.IsAfter("10", "9") && !DigestCursor.IsAfter("9", "10"));
+
+        Check("游標那一則自己不算新（不然會重複整理）", !DigestCursor.IsAfter("10", "10"));
+
+        Check("沒有游標 → 全部都是新的",
+            DigestCursor.IsAfter("1", null) && DigestCursor.IsAfter("1", ""));
+
+        Check("★ 讀不出來的當成「新」（寧可重複一則，也不要默默漏掉）",
+            DigestCursor.IsAfter("abc", "99") && DigestCursor.IsAfter("100", "xyz"));
+
+        // ── 4) 模型回來的東西怎麼解析 ─────────────────────
+        var participants = new List<(ulong Id, string Name)>
+        {
+            (111UL, "小明"), (222UL, "小華"), (333UL, "阿珍")
+        };
+
+        var wrapped = """
+            好的，這是這一週的摘要：
+            ```json
+            { "summary": "這週決定了週六出遊。",
+              "highlights": ["週六 10:00 朝馬站集合", "公車改搭 304"],
+              "open_items": [ { "text": "訂餐廳", "owner_id": "111", "owner_name": "小明" } ],
+              "mentions": [ { "id": "111", "name": "小明", "reason": "他要訂餐廳" } ] }
+            ```
+            """;
+
+        var parsed = DigestPrompt.Parse(wrapped, maxMentions: 5);
+
+        Check("★ 模型用 markdown 包起來、前後多一段話也解析得出來",
+            parsed.Summary == "這週決定了週六出遊。"
+            && parsed.Highlights.Count == 2
+            && parsed.OpenItems.Count == 1
+            && parsed.Mentions.Count == 1,
+            parsed.Summary);
+
+        var camel = DigestPrompt.Parse(
+            """{"Summary":"camelCase 也要通","Highlights":["a"],"OpenItems":[{"text":"x","OwnerId":"222"}],"Mentions":[{"Id":"222"}]}""",
+            maxMentions: 5);
+
+        Check("★ 欄位大小寫不同也通（模型常常自己換寫法）",
+            camel.Summary == "camelCase 也要通" && camel.OpenItems.Count == 1);
+
+        var messy = DigestPrompt.Parse("這不是 JSON，是一段普通文字。", maxMentions: 5);
+
+        Check("★ 完全不是 JSON → 整段當摘要（寧可有摘要也不要整份失敗）",
+            messy.Summary.Contains("普通文字", StringComparison.Ordinal) && messy.Highlights.Count == 0);
+
+        Check("空白回覆也不會壞",
+            DigestPrompt.Parse("", maxMentions: 5).Summary.Length > 0
+            && DigestPrompt.Parse(null, maxMentions: 5).Summary.Length > 0);
+
+        // ── 5) @ 的人一定要核對（模型會照格式編 ID）────────
+        var rawMentions = new List<DigestMention>
+        {
+            new(111UL, "小明", "他要處理"),
+            new(999UL, "不存在的人", "模型編的"),
+            new(111UL, "小明", "重複"),
+            new(QuotaBotId, "我自己", "不該 @ Bot"),
+            new(222UL, "小華", "他也在等"),
+            new(333UL, "阿珍", "順便")
+        };
+
+        var safe = DigestPrompt.SanitizeMentions(rawMentions, participants, maxMentions: 2, botId: QuotaBotId);
+
+        Check("★ @ 人只留「真的在這個頻道出現過」的（模型編的 ID 一律丟掉）",
+            safe.Count == 2 && safe.All(m => participants.Any(p => p.Id == m.UserId)),
+            string.Join("、", safe.Select(m => $"{m.Name}({m.UserId})")));
+
+        Check("★ 不會 @ Bot 自己、也不會重複 @ 同一個人",
+            safe.All(m => m.UserId != QuotaBotId) && safe.Select(m => m.UserId).Distinct().Count() == safe.Count);
+
+        Check("LLM_DIGEST_MENTIONS=0 → 完全不 @（但摘要照做）",
+            DigestPrompt.SanitizeMentions(rawMentions, participants, maxMentions: 0).Count == 0);
+
+        var items = DigestPrompt.SanitizeItems(
+            [new DigestItem("訂餐廳", 111UL), new DigestItem("亂編的人", 999UL), new DigestItem("  ", 222UL)],
+            participants);
+
+        Check("★ 跨週事項的負責人也要核對（認不出來的就只留文字）",
+            items.Count == 2 && items[0].OwnerId == 111UL && items[1].OwnerId == 0);
+
+        // ── 6) 一次執行：游標、歸檔、分批、額度 ─────────────
+        var store = new FakeStateStore();
+        var digests = new DigestStore(store);
+        var now = new DateTimeOffset(2026, 9, 21, 1, 0, 0, TimeSpan.Zero);
+
+        var config = digests.Enable(
+            guildId: 1UL, channelId: 2UL, by: 3UL, schedule: DigestSchedule.Default,
+            now: now, zoneOffset: tw, cursorMessageId: "5", cursorAt: now.AddMinutes(-1));
+
+        Check("★ 啟用之後「下一次」是台灣時間的下一個排程點",
+            config.Enabled && config.NextRunAt == mondayNineTw.AddDays(7), config.NextRunAt?.ToString("u"));
+
+        Check("★ 還沒到時間 → 不該跑；到了 → 該跑",
+            digests.Due(now).Count == 0 && digests.Due(mondayNineTw.AddDays(7)).Count == 1);
+
+        var llm = new CountingLlmClient("""
+            {"summary":"這週把公車路線查清楚了。","highlights":["決定搭 304"],
+             "open_items":[{"text":"訂餐廳","owner_id":"111","owner_name":"小明"}],
+             "mentions":[{"id":"111","name":"小明","reason":"他要訂餐廳"},{"id":"999","name":"亂編","reason":"x"}]}
+            """);
+
+        var budget = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 100_000 }, store, now);
+        var options = new DigestOptions { MaxMentions = 3, BatchTokens = 100_000 };
+        var service = new ChannelDigestService(llm, digests, budget, options);
+
+        var messages = new List<DigestMessage>
+        {
+            Msg(6, 111UL, "小明", "304 有到嗎", now),
+            Msg(7, 222UL, "小華", "有，我都是搭 304", now.AddMinutes(1)),
+            Msg(8, 111UL, "小明", "那我週六訂餐廳", now.AddMinutes(2))
+        };
+
+        var outcome = service.RunAsync(new DigestRun(1UL, 2UL, "測試頻道", messages, participants, Manual: false))
+            .GetAwaiter().GetResult();
+
+        Check("★ 摘要成功：有內容、有歸檔、游標推進到最後一則（下次不會重跑）",
+            outcome.HasDigest
+            && digests.Latest(2UL) is not null
+            && digests.Config(2UL)!.CursorMessageId == "8",
+            outcome.Message);
+
+        Check("★ 摘要花的錢要算進每週額度（不然它會變成繞過上限的後門）",
+            budget.Usage.TotalTokens > 0 && budget.Usage.Calls == 1,
+            budget.Describe());
+
+        Check("★ 模型編的 @ 不會進到結果（只留核對過的）",
+            outcome.Record!.Mentions.Count == 1 && outcome.Record.Mentions[0].UserId == 111UL);
+
+        Check("整批塞得下時只呼叫一次（不多花錢）", llm.Calls == 1, $"{llm.Calls} 次");
+
+        Check("★ 摘要那一次要被標成 DigestCall（才會走「開了思考」那條連線）",
+            llm.Last?.DigestCall == true, $"DigestCall={llm.Last?.DigestCall}");
+
+        // 第二次執行：上一週的「還在進行中」要被帶下去
+        var before = llm.Calls;
+        var second = service.RunAsync(new DigestRun(
+                1UL, 2UL, "測試頻道",
+                [Msg(9, 222UL, "小華", "餐廳訂好了", now.AddDays(7))],
+                participants, Manual: true))
+            .GetAwaiter().GetResult();
+
+        Check("★ 第二輪成功（手動觸發也算一次）",
+            second.HasDigest && llm.Calls == before + 1);
+
+        var finalPrompt = llm.Requests.LastOrDefault(r => r.DigestCall)?.Incoming.Content ?? "";
+
+        Check("★ 跨週事項會帶進下一輪的提示詞（不然每週都重新開始）",
+            finalPrompt.Contains("訂餐廳", StringComparison.Ordinal)
+            && finalPrompt.Contains("上一週還沒完成的事", StringComparison.Ordinal));
+
+        Check("兩筆歸檔都在（永久保留）",
+            digests.ArchiveCount(2UL) == 2 && digests.Archive(2UL).Count == 2);
+
+        // ── 7) 沒有新訊息就不花錢、也不發 ──────────────────
+        var callsBefore = llm.Calls;
+
+        var empty = service.RunAsync(new DigestRun(1UL, 2UL, "測試頻道", [], participants, Manual: false))
+            .GetAwaiter().GetResult();
+
+        Check("★ 沒有新訊息 → 不呼叫模型、不算失敗",
+            empty.NoNewMessages && llm.Calls == callsBefore);
+
+        // ── 8) 額度不足：**游標絕對不可以推進** ──────────────
+        var tight = new DigestStore(new FakeStateStore());
+        tight.Enable(1UL, 2UL, 3UL, DigestSchedule.Default, now, tw, cursorMessageId: "5", cursorAt: now);
+
+        var poorBudget = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 1 }, new FakeStateStore(), now);
+        var poorLlm = new CountingLlmClient("""{"summary":"x"}""");
+        var poor = new ChannelDigestService(poorLlm, tight, poorBudget, options);
+
+        var refused = poor.RunAsync(new DigestRun(1UL, 2UL, "測試頻道", messages, participants, Manual: false))
+            .GetAwaiter().GetResult();
+
+        Check("★ 額度不足時：不呼叫模型、明講是額度問題",
+            refused.BudgetBlocked && poorLlm.Calls == 0,
+            refused.Message);
+
+        Check("★ 額度不足時游標**沒有**推進（下次會重新整理同一段，不會漏訊息）",
+            tight.Config(2UL)!.CursorMessageId == "5" && tight.ArchiveCount(2UL) == 0);
+
+        // ── 9) 分批：一週的量太大時要 map-reduce，不能截斷 ────
+        var bigStore = new DigestStore(new FakeStateStore());
+        bigStore.Enable(1UL, 2UL, 3UL, DigestSchedule.Default, now, tw);
+
+        var bigLlM = new CountingLlmClient(
+            """{"summary":"分批彙整後的摘要","highlights":["重點"],"open_items":[],"mentions":[]}""");
+
+        var bigBudget = new WeeklyTokenBudget(new LlmOptions { WeeklyTokenLimit = 1_000_000 }, new FakeStateStore(), now);
+
+        var bigService = new ChannelDigestService(
+            bigLlM, bigStore, bigBudget, new DigestOptions { BatchTokens = 1000, MaxMentions = 3 });
+
+        var many = Enumerable.Range(0, 40)
+            .Select(i => Msg((ulong)(100 + i), 111UL, "小明", new string('字', 60) + i, now.AddMinutes(i)))
+            .ToList();
+
+        var batched = bigService.RunAsync(new DigestRun(1UL, 2UL, "很吵的頻道", many, participants, Manual: false))
+            .GetAwaiter().GetResult();
+
+        Check("★ 訊息超過一批 → 分成多次呼叫（先抽取、再彙整），不是截斷",
+            batched.HasDigest && bigLlM.Calls > 2, $"{bigLlM.Calls} 次呼叫／{many.Count} 則訊息");
+
+        Check("★ 只有最後那次彙整開思考（分批抽取不必思考，省錢）",
+            bigLlM.Requests.Count(r => r.DigestCall) == 1
+            && bigLlM.Requests.Last().DigestCall,
+            $"思考的呼叫 {bigLlM.Requests.Count(r => r.DigestCall)} 次／共 {bigLlM.Requests.Count} 次");
+
+        Check("★ 所有訊息都真的進到提示詞（分批沒有漏掉任何一則）",
+            batched.Record!.MessageCount == many.Count);
+
+        // ── 10) 失敗之後：游標不動、下一次往後推 ──────────────
+        var failStore = new DigestStore(new FakeStateStore());
+        var failConfig = failStore.Enable(1UL, 2UL, 3UL, DigestSchedule.Default, now, tw, cursorMessageId: "5");
+
+        var failed = failStore.MarkFailed(2UL, "呼叫模型失敗", now, TimeSpan.FromMinutes(15));
+
+        Check("★ 失敗：游標不動、下一次延後（不會每分鐘重試＋每分鐘發一次錯誤）",
+            failed!.CursorMessageId == "5"
+            && failed.LastError is not null
+            && failed.NextRunAt > now,
+            failed.LastError);
+
+        // ── 11) 存檔要跨重啟（重開一個 store 讀同一份儲存）────
+        var reloaded = new DigestStore(store);
+
+        Check("★ 重啟之後設定、游標、歸檔都還在（游標不見 ＝ 會重複整理一整個頻道）",
+            reloaded.Config(2UL)?.CursorMessageId == "9"
+            && reloaded.ArchiveCount(2UL) == 2,
+            $"cursor={reloaded.Config(2UL)?.CursorMessageId}｜歸檔 {reloaded.ArchiveCount(2UL)} 筆");
+
+        // ── 12) 停用不等於清掉 ─────────────────────────────
+        reloaded.Disable(2UL);
+
+        Check("★ 停用之後不再排程，但游標與歸檔保留（再啟用會接著跑）",
+            reloaded.Config(2UL)!.Enabled == false
+            && reloaded.Due(now.AddYears(1)).Count == 0
+            && reloaded.Config(2UL)!.CursorMessageId == "9"
+            && reloaded.ArchiveCount(2UL) == 2);
+
+        // ── 13) 要發出去的內容 ─────────────────────────────
+        var rendered = ChannelDigestService.RenderText(digests.Archive(2UL)[0], tw);
+
+        Check("★ 發出去的週報含摘要、重點與「還在進行中」＋ @ 負責的人",
+            rendered.Contains("重點", StringComparison.Ordinal)
+            && rendered.Contains("還在進行中", StringComparison.Ordinal)
+            && rendered.Contains("<@111>", StringComparison.Ordinal),
+            rendered.Split('\n')[0]);
+    }
+
+    /// <summary>DigestMessage 的測試建構子（少打很多字）。</summary>
+    private static DigestMessage Msg(ulong id, ulong author, string name, string text, DateTimeOffset at)
+        => new(id.ToString(), author, name, $"{name}({author})", at, text);
+
+    /// <summary>「@ Bot 自己」用的假 ID（與其他測試的 Bot ID 一致）。</summary>
+    private const ulong QuotaBotId = 999UL;
+
+    /// <summary>
+    /// 測試用的假 LLM：固定回一句話，並記住被呼叫幾次（用來驗證「該不該花錢」）。
+    /// </summary>
     private sealed class CountingLlmClient(string reply) : ILlmClient
     {
         public string Reply { get; set; } = reply;
@@ -3433,6 +3748,9 @@ public static class SelfTest
         /// <summary>最後一次的請求（用來驗「這次用了哪個模型」）。</summary>
         public LlmRequest? Last { get; private set; }
 
+        /// <summary>全部的請求（用來驗「分批有沒有漏」與「哪一次是彙整」）。</summary>
+        public List<LlmRequest> Requests { get; } = [];
+
         public bool IsConfigured => true;
 
         public string Describe() => "（測試用假 LLM）";
@@ -3441,6 +3759,7 @@ public static class SelfTest
         {
             Calls++;
             Last = request;
+            Requests.Add(request);
 
             return Task.FromResult(new LlmReply(
                 Reply, InputTokens: 10, OutputTokens: 2, UsageReported: true,

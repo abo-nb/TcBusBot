@@ -335,6 +335,34 @@ public static class Program
         var startPollerOnReady = false;
         var pollerStarted = false;
 
+        // ── 每週頻道摘要的排程器 ─────────────────────────────
+        //    跟輪詢一樣「連上 Discord 之後才啟動」：沒連上時它找不到頻道、也發不出摘要。
+        //    只啟動一次（重連不該產生第二個排程器 —— 那會讓同一個頻道被整理兩次）。
+        var digestStarted = false;
+
+        void StartDigestScheduler()
+        {
+            if (digestStarted || !cfg.Llm.Digest.Enabled) return;
+
+            if (!llm.IsConfigured)
+            {
+                Console.WriteLine("[摘要] 沒有 LLM 金鑰 → 每週摘要不會自動跑（設定金鑰後重啟即可）");
+                return;
+            }
+
+            digestStarted = true;
+
+            var token = _stop?.Token ?? CancellationToken.None;
+            var scheduler = provider.GetRequiredService<DigestScheduler>();
+            _ = Task.Run(() => scheduler.RunAsync(token), token);
+
+            // /health 看得到它還活著（這個功能是背景自己跑的，沒有別的觀察點）
+            var digestStore = provider.GetRequiredService<Core.Chat.Digest.DigestStore>();
+            BotStatus.Digest = () => $"{digestStore.Describe()}｜排程器{scheduler.Describe()}";
+
+            Console.WriteLine($"🗓  每週摘要排程已啟動（{cfg.Llm.Digest.Describe()}）");
+        }
+
         client.Ready += async () =>
         {
             readyTcs.TrySetResult(true);
@@ -358,6 +386,8 @@ public static class Program
 
                 Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
             }
+
+            StartDigestScheduler();
 
             if (registered) return;
             registered = true;
@@ -502,6 +532,9 @@ public static class Program
                 _ = Task.Run(() => poller.RunAsync(cts.Token), cts.Token);
                 pollerStarted = true;
                 Console.WriteLine($"▶️  即時輪詢已啟動（每 {cfg.PollIntervalSeconds} 秒）");
+
+                // 每週頻道摘要的排程器（跟輪詢一樣：要連上 Discord 才有意義）
+                StartDigestScheduler();
             }
             else
             {

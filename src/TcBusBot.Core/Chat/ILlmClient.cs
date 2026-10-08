@@ -23,6 +23,17 @@ public sealed record LlmRequest(
     public bool JudgeCall { get; init; }
 
     /// <summary>
+    /// 這次是**每週頻道摘要的最後一次彙整**。
+    ///
+    /// 為什麼它需要自己一條路：思考（reasoning）是在**建立連線**時決定的
+    /// （<c>ReasoningOffHandler</c> 掛在 HttpClient 上），不能在單一請求裡切換
+    /// （理由與 <see cref="JudgeCall"/> 完全相同：SK 這個版本會忽略請求層級的設定）。
+    /// 而「一週只跑一次、要讀一整週內容」的彙整正好是值得多想一下的呼叫 ——
+    /// 所以它走一條「開了思考」的連線，聊天其餘的呼叫維持不思考。
+    /// </summary>
+    public bool DigestCall { get; init; }
+
+    /// <summary>
     /// 這次可以用的工具（Semantic Kernel 的 plugin）。
     ///
     /// 為什麼放在 request 而不是 kernel：工具需要**這一次互動的上下文**

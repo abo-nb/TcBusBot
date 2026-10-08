@@ -394,6 +394,56 @@ public sealed class BotConfig
                 ["LLM_VISION_MAX_IMAGES"]).Value, out var visionMax) && visionMax is >= 0 and <= 10)
             cfg.Llm.VisionMaxImages = visionMax;
 
+        // ── 每週頻道摘要（/digest）────────────────────────────
+        //    這一組是「每週自動花一次錢」的功能，所以每個數字都給環境變數控制。
+        var digest = SettingResolver.Resolve(args, "--llm-digest", file, ["LLM_DIGEST"]).Value;
+        if (!string.IsNullOrWhiteSpace(digest)) cfg.Llm.Digest.Enabled = !IsFalsy(digest!);
+        if (args.Contains("--no-digest")) cfg.Llm.Digest.Enabled = false;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-mentions", file,
+                ["LLM_DIGEST_MENTIONS"]).Value, out var digestMentions) && digestMentions is >= 0 and <= 20)
+            cfg.Llm.Digest.MaxMentions = digestMentions;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-max-tokens", file,
+                ["LLM_DIGEST_MAX_TOKENS"]).Value, out var digestTokens) && digestTokens is >= 200 and <= 16_000)
+            cfg.Llm.Digest.MaxOutputTokens = digestTokens;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-batch-tokens", file,
+                ["LLM_DIGEST_BATCH_TOKENS"]).Value, out var digestBatch) && digestBatch is >= 1000 and <= 200_000)
+            cfg.Llm.Digest.BatchTokens = digestBatch;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-max-messages", file,
+                ["LLM_DIGEST_MAX_MESSAGES"]).Value, out var digestMax) && digestMax >= 0)
+            cfg.Llm.Digest.MaxMessagesPerRun = digestMax;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-safety-messages", file,
+                ["LLM_DIGEST_SAFETY_MESSAGES"]).Value, out var digestSafety) && digestSafety is >= 100 and <= 200_000)
+            cfg.Llm.Digest.SafetyMaxMessages = digestSafety;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-interval", file,
+                ["LLM_DIGEST_INTERVAL_SECONDS"]).Value, out var digestInterval) && digestInterval is >= 15 and <= 3600)
+            cfg.Llm.Digest.SchedulerIntervalSeconds = digestInterval;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-tz-offset", file,
+                ["LLM_DIGEST_TZ_OFFSET_MINUTES"]).Value, out var digestTz) && digestTz is >= -720 and <= 840)
+            cfg.Llm.Digest.TimeZoneOffsetMinutes = digestTz;
+
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-digest-retry-minutes", file,
+                ["LLM_DIGEST_RETRY_MINUTES"]).Value, out var digestRetry) && digestRetry is >= 1 and <= 1440)
+            cfg.Llm.Digest.RetryMinutes = digestRetry;
+
+        var digestPostEmpty = SettingResolver.Resolve(args, "--llm-digest-post-empty", file,
+            ["LLM_DIGEST_POST_EMPTY"]).Value;
+        if (!string.IsNullOrWhiteSpace(digestPostEmpty)) cfg.Llm.Digest.PostEmpty = !IsFalsy(digestPostEmpty!);
+
+        var digestReasoning = SettingResolver.Resolve(args, "--llm-digest-reasoning", file,
+            ["LLM_DIGEST_REASONING"]).Value;
+        if (!string.IsNullOrWhiteSpace(digestReasoning)) cfg.Llm.Digest.Reasoning = digestReasoning!.Trim();
+
+        var digestModel = SettingResolver.Resolve(args, "--llm-digest-model", file,
+            ["LLM_DIGEST_MODEL"]).Value;
+        if (!string.IsNullOrWhiteSpace(digestModel)) cfg.Llm.Digest.Model = digestModel!.Trim();
+
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖
         cfg.EnableMessageContentIntent = cfg.Llm.IsConfigured;
         if (args.Contains("--no-message-intent")) cfg.EnableMessageContentIntent = false;
