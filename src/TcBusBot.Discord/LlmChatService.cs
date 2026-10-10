@@ -160,6 +160,13 @@ public sealed class LlmChatService : IDisposable
             }
         }
 
+        // 回覆了我們的訊息、回覆提到我們的訊息、或回覆任何一則**我們記得過的**訊息
+        // （= 想把那段話題拉回來）—— 這幾種都算「在對我們說話」。
+        var repliesToBot = referenced is not null
+                           && (referenced.Author.Id == botId
+                               || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
+                               || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id));
+
         var facts = new MessageFacts(
             FromApp: userMessage.Author.IsBot || userMessage.Author.IsWebhook,
             DirectMessage: guildId == 0,
@@ -170,10 +177,8 @@ public sealed class LlmChatService : IDisposable
             // ⚠️ Discord.Net 的 SocketUserMessage 沒有 MentionEveryone 這個屬性，
             //    @everyone／@here 在 `Tags` 裡（TagType.EveryoneMention／HereMention）。
             MentionsEveryone: userMessage.Tags.Any(t => t.Type is TagType.EveryoneMention or TagType.HereMention),
-            RepliesToBot: referenced is not null
-                          && (referenced.Author.Id == botId
-                              || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
-                              || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id)));
+            RepliesToBot: repliesToBot,
+            RepliesToOther: referenced is not null && !repliesToBot);
 
         // 這個頻道要用哪一種模式：管理員用 `/chat enable` 在這個頻道啟用過 → 跟它對話；
         // 沒啟用 → 用主機的預設值（`LLM_APP_MESSAGES`，預設「看得到但不回話」）。
@@ -290,11 +295,11 @@ public sealed class LlmChatService : IDisposable
         text = ExpandMentions(message, botId);
 
         // ── 偷聽模式：這一則沒有 @ 它、也不是回覆它 ──────────
-        // 訊息 @ 了**別人**（真人／別的 App／身分組／@everyone）→ 那是在跟那個人說話，這是鐵證。
+        // 訊息 @ 了**別人**、或**回覆別人**的訊息 → 那是在跟那個人說話，這是鐵證。
         // 交給 Core 處理：不插話、**不花錢判斷**，但**繼續偷聽**
         // （以前的版本在這裡直接停止偷聽 —— 一群人聊天時只要有人 @ 別人，
         //   之後的訊息就全部被忽略了）。
-        var mentionsOther = facts.MentionsSomeoneElse;
+        var mentionsOther = facts.TargetsSomeoneElse;
 
         if (!addressed)
         {

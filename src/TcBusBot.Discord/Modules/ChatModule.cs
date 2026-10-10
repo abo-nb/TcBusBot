@@ -30,6 +30,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly UserCityStore _cities;
     private readonly ReasoningCapture _reasoning;
     private readonly DigestStore _digests;
+    private readonly AddresseeLog _addressee;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -46,10 +47,12 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         LlmDiagnostics diagnostics,
         UserCityStore cities,
         ReasoningCapture reasoning,
-        DigestStore digests)
+        DigestStore digests,
+        AddresseeLog addressee)
     {
         _reasoning = reasoning;
         _digests = digests;
+        _addressee = addressee;
         _options = options;
         _conversations = conversations;
         _budget = budget;
@@ -145,6 +148,10 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .AddField("別的 App 的訊息",
                 MessageAddress.DescribeAppMode(_options.AppMessages) +
                 $"（`LLM_APP_MESSAGES`；每一段最多留 {_options.MaxAppTurnsPerSegment} 則）",
+                inline: false)
+            .AddField("誰在對誰說話（最近幾次判斷）",
+                $"{_addressee.Stats()}\n{_addressee.Describe(3)}\n" +
+                "-# 「規則」＝@ 了別人／回覆別人（機械鐵證，不花錢）；「模型」＝偷聽時問模型的判斷",
                 inline: false)
             .AddField("偷聽",
                 !_options.Eavesdrop || _options.EavesdropMaxMessages <= 0 || _options.EavesdropSeconds <= 0

@@ -31,11 +31,27 @@ public sealed record MessageFacts(
     /// <summary>@everyone／@here。</summary>
     bool MentionsEveryone,
     /// <summary>回覆了我們的訊息（或我們記得過的訊息）。</summary>
-    bool RepliesToBot)
+    bool RepliesToBot,
+    /// <summary>
+    /// 回覆了**別人**的訊息（不是我們）。
+    ///
+    /// 為什麼這是一條機械鐵證：Discord 的「回覆」就是把箭頭指向那個人 ——
+    /// 那是「我在跟這個人講話」最明確的訊號，比任何模型判斷都可靠。
+    /// 使用者回報的「A 和 B 在聊天、完全沒提到它，它卻被喚醒」，
+    /// 很大一部分就是 A 回覆 B 的訊息時被當成「在跟它說話」。
+    /// </summary>
+    bool RepliesToOther = false)
 {
     /// <summary>@ 了**別人** —— 真人、別的 App、身分組、@everyone 都算。</summary>
     public bool MentionsSomeoneElse
         => OtherHumans > 0 || OtherApps > 0 || Roles > 0 || MentionsEveryone;
+
+    /// <summary>
+    /// 這一則**明確指向別人**（@ 了別人，或回覆別人的訊息）。
+    ///
+    /// 偷聽時只要這個是 true，就**不必問模型**：這句是在跟那個人說話。
+    /// </summary>
+    public bool TargetsSomeoneElse => MentionsSomeoneElse || RepliesToOther;
 
     /// <summary>
     /// 有沒有明確對 Bot 說話。
@@ -57,7 +73,7 @@ public sealed record MessageFacts(
            (OtherApps > 0 ? $"／@了{OtherApps}個App" : "") +
            (Roles > 0 ? $"／@了{Roles}個身分組" : "") +
            (MentionsEveryone ? "／@everyone" : "") +
-           (RepliesToBot ? "／回覆我" : "");
+           (RepliesToBot ? "／回覆我" : RepliesToOther ? "／回覆別人" : "");
 }
 
 /// <summary>

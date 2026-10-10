@@ -1522,6 +1522,10 @@ public static class DryRun
         else if (!handleCalls.Contains("AppChatGuard.Resume"))
             Problem("訊息入口沒有在真人找他時解除 /stop —— 停了就再也不會恢復");
 
+        // 「回覆別人」也要算機械鐵證（使用者回報：A 和 B 在聊天，它卻被喚醒）
+        if (!handleCalls.Contains("MessageFacts.get_TargetsSomeoneElse"))
+            Problem("入口沒有把「回覆別人」當成在跟別人說話 —— A 回 B 的訊息會被它當成在叫它");
+
         // 入口要照「**那個頻道**的設定」決定，不是照主機的全域設定
         // （`/chat enable` 是每個頻道各自啟用的唯一入口）
         if (handle is not null && !handleCalls.Contains("AppChatGuard.ModeFor"))
@@ -3004,6 +3008,10 @@ public static class DryRun
             Problem("ChatOrchestrator.RecordAmbient 沒有看 LLM_EAVESDROP_CONTEXT 設定 —— 關不掉會很花 token");
 
         Console.WriteLine("  ✔ 核心真的會：TouchListen（@ 別人）／ConsumeListen（判斷）／RecordAmbient（留下上下文）");
+
+        // 「誰在對誰說話」的判斷紀錄（使用者要確認它分不分得出來）
+        if (!coreCalls.Contains("AddresseeLog.Record"))
+            Problem("AskAsync 沒有把判斷結果記進 AddresseeLog —— /ai status 看不到它是怎麼判斷的");
 
         // ── 4) 「誰在對它說話」的規則（兩個真實回報的 bug）──────────
         //    1. 別的 App @ 它 → 吃不到（以前整段丟掉）

@@ -4151,6 +4151,72 @@ public static class SelfTest
             && ChatOrchestrator.ExtraNoteText(null).Length == 0
             && ChatOrchestrator.ExtraNoteText("  ").Length == 0);
 
+        // ── 1f) 「A 和 B 在聊天卻被喚醒」：回覆別人也是機械鐵證 ──────────
+        //      使用者的回報：完全沒提到它、A 跟 B 在聊，它卻插話。
+        //      除了「@ 別人」，**回覆別人的訊息**同樣明確指向那個人 ——
+        //      而且這一條不必問模型（省錢又不會誤判）。
+        var replyToOther = new MessageFacts(false, false, false, 0, 0, 0, false, false, RepliesToOther: true);
+        var replyToOtherAndMention = replyToOther with { OtherHumans = 1 };
+
+        Check("★ 回覆別人的訊息 → 算「指向別人」（偷聽時不必問模型就不插話）",
+            replyToOther.TargetsSomeoneElse && !replyToOther.AddressedToBot);
+
+        Check("★ 回覆別人 ＋ @ 別人 → 一樣是指向別人",
+            replyToOtherAndMention.TargetsSomeoneElse);
+
+        Check("★ 回覆**我們**的訊息不算「指向別人」（那是在對它說話）",
+            !new MessageFacts(false, false, false, 0, 0, 0, false, RepliesToBot: true).TargetsSomeoneElse
+            && new MessageFacts(false, false, false, 0, 0, 0, false, RepliesToBot: true).AddressedToBot);
+
+        Check("什麼都沒有 → 不算指向別人（那是可以讓模型判斷的閒聊）",
+            !new MessageFacts(false, false, false, 0, 0, 0, false, false).TargetsSomeoneElse);
+
+        Check("說明文字看得出「回覆別人」（出事時 log 直接講原因）",
+            replyToOther.Describe().Contains("回覆別人", StringComparison.Ordinal)
+            && new MessageFacts(false, false, false, 0, 0, 0, false, true).Describe()
+                .Contains("回覆我", StringComparison.Ordinal));
+
+        // ── 1g) 判斷紀錄：讓「它分不分得出誰跟誰說話」看得到 ──────────────
+        var addrLog = new AddresseeLog();
+        var talker = new ChatTurn(ChatRole.User, "阿美", 88UL, 1UL, "@小華 你幾點到？", guardStart,
+            PromptLabel: "阿美(88)");
+
+        Check("還沒判斷過時，說明文字講清楚（不是空白）",
+            addrLog.Describe().Contains("還沒有判斷過", StringComparison.Ordinal)
+            && addrLog.Stats().Contains("還沒有", StringComparison.Ordinal));
+
+        addrLog.Record(1UL, 2UL, talker, Addressee.Skip, "規則", "@ 了別人", guardStart);
+        addrLog.Record(1UL, 2UL, talker with { Content = "我大概七點", MessageId = 2UL },
+            Addressee.Skip, "模型", "SKIP：在跟別人說話", guardStart.AddSeconds(30));
+        addrLog.Record(1UL, 2UL, talker with { Content = "那 304 有到嗎", MessageId = 3UL },
+            Addressee.Reply, "模型", "REPLY：在問它", guardStart.AddSeconds(60));
+
+        Check("★ 判斷紀錄：新的在前，而且看得出「規則／模型」與結論",
+            addrLog.Recent(3)[0].Verdict == Addressee.Reply
+            && addrLog.Recent(3)[0].Source == "模型"
+            && addrLog.Recent(3)[^1].Source == "規則",
+            addrLog.Describe(3).Replace("\n", " ｜ "));
+
+        Check("★ 判斷紀錄：接話／不出聲／退出各幾次（看得出它是不是常常亂回）",
+            addrLog.Replies == 1 && addrLog.Skips == 2 && addrLog.Stops == 0
+            && addrLog.Stats().Contains("接話 1", StringComparison.Ordinal),
+            addrLog.Stats());
+
+        Check("判斷紀錄有上限（不會無限長大）", AddresseeLog.Capacity == 20);
+
+        for (var i = 0; i < 30; i++)
+        {
+            addrLog.Record(1UL, 2UL, talker with { MessageId = 100UL + (ulong)i }, Addressee.Skip, "模型", "x",
+                guardStart.AddMinutes(i));
+        }
+
+        Check("★ 超過上限時只留最近幾筆（記憶體不會被灌爆）",
+            addrLog.Recent(50).Count == AddresseeLog.Capacity);
+
+        Check("★ 判斷器的提示詞明確講「A 和 B 在聊，即使主題有關也不是在叫你」",
+            AddresseeDetector.SystemPrompt.Contains("A 和 B", StringComparison.Ordinal)
+            && AddresseeDetector.SystemPrompt.Contains("對象是別人", StringComparison.Ordinal));
+
         // ── 1c) 那一段真的會被送進提示詞（不是只寫在常數裡）─────────
         //      為什麼要驗行為：`AppChatNote` 是 const，編譯器會內嵌 ——
         //      `--dryrun` 的 IL 掃描看不到它，只有「真的送出去的那一份 prompt」能證明。

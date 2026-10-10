@@ -132,6 +132,7 @@ public sealed class ChatOrchestrator
     }
 
     private readonly Bus.UserCityStore? _cities;
+    private readonly AddresseeLog? _addressee;
 
     public ChatOrchestrator(
         ILlmClient llm,
@@ -140,7 +141,8 @@ public sealed class ChatOrchestrator
         WeeklyTokenBudget budget,
         IChatToolProvider? tools = null,
         GuildPersonaStore? personas = null,
-        Bus.UserCityStore? cities = null)
+        Bus.UserCityStore? cities = null,
+        AddresseeLog? addresseeLog = null)
     {
         _llm = llm;
         _options = options;
@@ -149,6 +151,7 @@ public sealed class ChatOrchestrator
         _tools = tools ?? NoChatTools.Instance;
         _personas = personas ?? new GuildPersonaStore();
         _cities = cities;
+        _addressee = addresseeLog;
         _detector = new TopicSwitchDetector(llm, options);
     }
 
@@ -358,9 +361,13 @@ public sealed class ChatOrchestrator
             if (mentionsOther)
             {
                 RecordAmbient(guildId, channelId, incoming, "偷聽到的訊息（@ 了別人）");
+
+                _addressee?.Record(guildId, channelId, incoming, Addressee.Skip, "規則",
+                    "@ 了別人／回覆別人 → 這句在跟那個人說話", now);
+
                 _conversations.TouchListen(guildId, channelId, now);
 
-                return Ignored(startedAt, "訊息 @ 了別人 → 這句不插話（繼續偷聽）");
+                return Ignored(startedAt, "訊息 @ 了別人或回覆別人 → 這句不插話（繼續偷聽）");
             }
 
             var draftForCheck = _conversations.Draft(guildId, channelId, incoming, replyTarget);
@@ -402,6 +409,8 @@ public sealed class ChatOrchestrator
                 RecordAmbient(guildId, channelId, incoming,
                     verdict.Verdict == Addressee.Stop ? "偷聽結束前聽到的對話" : "偷聽到的閒聊");
 
+                _addressee?.Record(guildId, channelId, incoming, verdict.Verdict, "模型", verdict.Detail, now);
+
                 if (verdict.Verdict == Addressee.Stop)
                 {
                     _conversations.StopListening(guildId, channelId);
@@ -411,6 +420,8 @@ public sealed class ChatOrchestrator
                 // SKIP：不出聲，但留在頻道裡繼續聽（下一次才接得上）
                 return Ignored(startedAt, verdict.Detail);
             }
+
+            _addressee?.Record(guildId, channelId, incoming, Addressee.Reply, "模型", verdict.Detail, now);
 
             if (!stillListening)
                 Console.WriteLine("[llm] 👂 判斷額度用完 → 這一則回完就回到「等 @」");

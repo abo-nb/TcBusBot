@@ -129,6 +129,10 @@ internal static class BotServices
                     sp.GetRequiredService<UserCityStore>())   // set_city 工具（使用者自己選城市）
                 : NoChatTools.Instance);
 
+        // 「誰在對誰說話」的判斷紀錄（`/ai status` 看得到）——同一個實例，
+        // 這樣使用者問「它分不分得出誰跟誰在說話」時有東西可以看。
+        services.AddSingleton<AddresseeLog>();
+
         services.AddSingleton(sp => new ChatOrchestrator(
             sp.GetRequiredService<ILlmClient>(),
             cfg.Llm,
@@ -136,7 +140,8 @@ internal static class BotServices
             sp.GetRequiredService<WeeklyTokenBudget>(),
             sp.GetRequiredService<IChatToolProvider>(),
             sp.GetRequiredService<GuildPersonaStore>(),
-            userCities)      // 城市是「問的人」自己選的（/bus city），提示詞要跟著他
+            userCities,      // 城市是「問的人」自己選的（/bus city），提示詞要跟著他
+            sp.GetRequiredService<AddresseeLog>())   // 「誰在對誰說話」的判斷紀錄
         {
             // 偷聽判斷的提示詞要用 Bot 自己的名字
             BotName = client.CurrentUser?.Username ?? "Bot"
