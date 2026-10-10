@@ -2846,6 +2846,38 @@ public static class DryRun
         else if (!calls.Contains("MessageFacts.Describe"))
             Problem("入口沒有記下「這一則在對誰說話」的事實 —— 出事時 log 看不出來為什麼不理它");
 
+        // 「看得到別的 App 說的話」：不是只有「要不要回」，還要真的記進上下文
+        if (!calls.Contains("MessageAddress.Decide"))
+            Problem("入口沒有用 MessageAddress.Decide —— 「看得到但不回話」那條路會失效");
+
+        if (!calls.Contains("LlmChatService.RecordAppContext"))
+            Problem("入口沒有把別的 App 的訊息記進上下文 —— 使用者要的「看得到其他 App 說的話」會沒生效");
+
+        var recordApp = typeof(LlmChatService).GetMethod("RecordAppContext",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var recordAppCalls = recordApp is null ? [] : CollectCalls(recordApp, resolveAll: true);
+
+        if (recordApp is null)
+            Problem("找不到 LlmChatService.RecordAppContext");
+        else if (!recordAppCalls.Contains("ConversationStore.RecordAmbient"))
+            Problem("RecordAppContext 沒有真的寫進對話記憶（那它就只是寫 log）");
+        else if (!recordAppCalls.Contains("LlmChatService.ExpandMentions"))
+            Problem("RecordAppContext 沒有用共用的「@ 展開」規則（App 訊息裡的名字會跟其他地方不一致）");
+
+        // 共用的「@ 展開」要三個地方一致：真人的入口、App 的訊息、（摘要那邊自己一份）
+        var expand = typeof(LlmChatService).GetMethod("ExpandMentions",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var expandCalls = expand is null ? [] : CollectCalls(expand, resolveAll: true);
+
+        if (expand is null)
+            Problem("找不到 LlmChatService.ExpandMentions");
+        else if (!expandCalls.Contains("MentionFormatter.SpeakerName"))
+            Problem("ExpandMentions 沒有用 SpeakerName（暱稱／帳號的規則會不一致）");
+        else if (!expandCalls.Contains("LlmOptions.get_ShowNicknames"))
+            Problem("ExpandMentions 沒有看 LLM_SHOW_NICKNAMES（名字會跟其他地方不一樣）");
+        else if (!expandCalls.Contains("MentionFormatter.Expand"))
+            Problem("ExpandMentions 沒有真的把 @ 展開成看得懂的名字");
+
         // @everyone 要從 Tags 讀（SocketUserMessage 沒有 MentionEveryone 這個屬性）
         if (!calls.Any(c => c.EndsWith("get_Tags", StringComparison.Ordinal)))
             Problem("入口沒有檢查 @everyone／@here（它們在訊息 Tags 裡，不是 MentionedUsers）");
@@ -2863,22 +2895,22 @@ public static class DryRun
 
         var appRules = new[]
         {
-            (Facts: new MessageFacts(true, false, false, 0, 0, 0, false, false), Expected: false, Why: "別的 App 沒 @ 它（要忽略）"),
-            (Facts: new MessageFacts(true, false, true, 0, 0, 0, false, false), Expected: true, Why: "別的 App @ 它（一定要回）"),
-            (Facts: new MessageFacts(true, false, false, 0, 0, 0, false, true), Expected: false, Why: "別的 App「回覆」它（不可以開鏈）"),
-            (Facts: new MessageFacts(true, true, true, 0, 0, 0, false, false), Expected: false, Why: "別的 App 在私訊裡"),
-            (Facts: new MessageFacts(false, false, true, 0, 0, 0, false, false), Expected: true, Why: "真人 @ 它")
+            (Facts: new MessageFacts(true, false, true, 0, 0, 0, false, false), Expected: MessageHandling.ReplyToApp, Why: "別的 App @ 它（一定要回）"),
+            (Facts: new MessageFacts(true, false, false, 0, 0, 0, false, false), Expected: MessageHandling.ContextOnly, Why: "別的 App 沒 @ 它（看得到但不回話）"),
+            (Facts: new MessageFacts(true, false, false, 0, 0, 0, false, true), Expected: MessageHandling.ContextOnly, Why: "別的 App「回覆」它（不可以開鏈）"),
+            (Facts: new MessageFacts(true, true, true, 0, 0, 0, false, false), Expected: MessageHandling.Ignore, Why: "別的 App 在私訊裡"),
+            (Facts: new MessageFacts(false, false, true, 0, 0, 0, false, false), Expected: MessageHandling.Normal, Why: "真人 @ 它")
         };
 
         foreach (var (facts, expected, why) in appRules)
         {
-            var handles = MessageAddress.IgnoreReason(facts) is null;
+            var actual = MessageAddress.Decide(facts, Core.Chat.AppMessageMode.Context);
 
-            if (handles != expected)
-                Problem($"入口規則錯了（{why}）：IgnoreReason 說 {(handles ? "處理" : "忽略")}");
+            if (actual != expected)
+                Problem($"入口規則錯了（{why}）：Decide 回 {actual}，預期 {expected}");
         }
 
-        Console.WriteLine("  ✔ 別的 App 只有「明確 @ 它」才會被處理，回覆／私訊／沒 @ 都不理；" +
+        Console.WriteLine("  ✔ 別的 App 只有「明確 @ 它」才會被回話；沒 @ 的**看得到（記進上下文、標成 [App]）但不回話**；" +
                           "回覆 App 時不發任何 ping");
     }
 

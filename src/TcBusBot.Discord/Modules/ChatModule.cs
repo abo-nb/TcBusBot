@@ -142,6 +142,10 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                     ? _reasoning.Describe()
                     : "（只有管理員看得到 —— 用 `/ai think`）",
                 inline: false)
+            .AddField("別的 App 的訊息",
+                MessageAddress.DescribeAppMode(_options.AppMessages) +
+                $"（`LLM_APP_MESSAGES`；每一段最多留 {_options.MaxAppTurnsPerSegment} 則）",
+                inline: false)
             .AddField("偷聽",
                 !_options.Eavesdrop || _options.EavesdropMaxMessages <= 0 || _options.EavesdropSeconds <= 0
                     ? "❌ 已關閉（只回 @ 它或回覆它的訊息）"

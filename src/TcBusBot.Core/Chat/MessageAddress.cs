@@ -61,17 +61,83 @@ public sealed record MessageFacts(
 }
 
 /// <summary>
+/// 別的 App 的訊息要怎麼對待。
+///
+/// 需求原文是「他似乎看不到其他 App 說的話」——
+/// 「看不到」與「不回話」是兩件事：使用者要它**知道**別的 App 講了什麼
+/// （例如另一個機器人貼的班次通知），但不希望它對著機器人回話。
+/// </summary>
+public enum AppMessageMode
+{
+    /// <summary>
+    /// （預設）**看得到，但不回話**：記進對話上下文（提示詞裡標成 `[App]`），
+    /// 不問模型、不花錢、不發訊息。之後有人問「剛剛那個通知說什麼」它就答得出來。
+    /// </summary>
+    Context,
+
+    /// <summary>沒 @ 它也回話（還是有冷卻與「不發 ping」兩道煞車）。</summary>
+    Reply,
+
+    /// <summary>完全忽略（連記都不記）—— 以前的舊行為。</summary>
+    Off
+}
+
+/// <summary>這一則訊息要怎麼處理。</summary>
+public enum MessageHandling
+{
+    /// <summary>照一般流程（真人：@ 它／回覆它／偷聽判斷）。</summary>
+    Normal,
+
+    /// <summary>別的 App 明確叫我們 → 回話。</summary>
+    ReplyToApp,
+
+    /// <summary>別的 App 在講話 → **只記下來當上下文**（看得到、不回話、不花錢）。</summary>
+    ContextOnly,
+
+    /// <summary>不理，而且不記（連上下文都不留）。</summary>
+    Ignore
+}
+
+/// <summary>
 /// 從 <see cref="MessageFacts"/> 算出「要不要處理這一則」。
 ///
 /// 規則集中成一個純函式，是因為這裡的每一條都是**安全與禮貌**問題：
 ///   * 太寬 → 機器人互相回話（燒錢、洗頻）、@ 別人時亂插話
-///   * 太嚴 → 「別的 App @ 它，它卻完全沒反應」（使用者實際回報的那個）
+///   * 太嚴 → 「別的 App @ 它，它卻完全沒反應」或「別的 App 說的話它完全不知道」
 /// </summary>
 public static class MessageAddress
 {
     /// <summary>
+    /// 這一則要怎麼處理。
+    ///
+    /// 別的 App 的門檻刻意比真人高：
+    ///   * 真人回一句話可以算「在對我說話」
+    ///   * 兩個機器人之間只要有「回覆也算」就會互相觸發到天荒地老
+    /// </summary>
+    public static MessageHandling Decide(MessageFacts facts, AppMessageMode appMode = AppMessageMode.Context)
+    {
+        if (!facts.FromApp) return MessageHandling.Normal;
+
+        // 別的 App 在私訊裡：連記都不記（機器人私訊沒有對話的意義）
+        if (facts.DirectMessage) return MessageHandling.Ignore;
+
+        // 明確 @ 我們 → 一定要回（三種模式都一樣：被叫了就要答）
+        if (facts.MentionsBot) return MessageHandling.ReplyToApp;
+
+        return appMode switch
+        {
+            AppMessageMode.Reply => MessageHandling.ReplyToApp,
+            AppMessageMode.Off => MessageHandling.Ignore,
+            _ => MessageHandling.ContextOnly
+        };
+    }
+
+    /// <summary>
     /// 回傳 null ＝ 要處理；回傳字串 ＝ **忽略的原因**（會寫進 console，
     /// 這樣「它為什麼不理我」在 log 裡就有答案）。
+    ///
+    /// ⚠️ 只給「連記都不記」的情況用；「看得到但不回話」請看 <see cref="Decide"/>
+    ///    （它會回 <see cref="MessageHandling.ContextOnly"/>）。
     /// </summary>
     public static string? IgnoreReason(MessageFacts facts)
     {
@@ -88,8 +154,26 @@ public static class MessageAddress
             : "別的 App／webhook 的訊息（沒有 @ 我們）→ 不理（機器人互相回話會無限循環）";
     }
 
-    /// <summary>要不要套用「App 專屬冷卻」（同一個 App 在同一個頻道連續 @ 我們的煞車）。</summary>
-    public static bool NeedsAppCooldown(MessageFacts facts) => facts.FromApp && facts.MentionsBot;
+    /// <summary>要不要套用「App 專屬冷卻」（同一個 App 在同一個頻道連續叫我們的煞車）。</summary>
+    public static bool NeedsAppCooldown(MessageFacts facts, AppMessageMode appMode = AppMessageMode.Context)
+        => facts.FromApp && (facts.MentionsBot || appMode == AppMessageMode.Reply);
+
+    /// <summary>把使用者設定的字串轉成模式（看不懂就用預設的「看得到但不回話」）。</summary>
+    public static AppMessageMode ParseAppMode(string? value)
+        => (value ?? "").Trim().ToLowerInvariant() switch
+        {
+            "reply" or "回" or "回話" => AppMessageMode.Reply,
+            "off" or "false" or "0" or "ignore" or "忽略" => AppMessageMode.Off,
+            _ => AppMessageMode.Context
+        };
+
+    /// <summary>給 `/ai status` 與啟動訊息看的一行說明。</summary>
+    public static string DescribeAppMode(AppMessageMode mode) => mode switch
+    {
+        AppMessageMode.Reply => "別的 App 的訊息：沒 @ 也會回（有冷卻、不發 ping）",
+        AppMessageMode.Off => "別的 App 的訊息：完全忽略（連上下文都不記）",
+        _ => "別的 App 的訊息：看得到（記進上下文並標成 [App]），但不會回話"
+    };
 
     /// <summary>
     /// 這個被 @ 的身分組是「**我們這個 App 自己的**身分組」嗎？

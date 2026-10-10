@@ -46,7 +46,16 @@ public sealed record ChatTurn(
     ///    只有「這一次的訊息」與「它回覆的那一則」會被 <c>SemanticKernelLlmClient</c> 當成圖片內容。
     ///    歷史裡的圖片只留文字記號（見 <see cref="ToPromptText"/>）。
     /// </summary>
-    IReadOnlyList<ImageRef>? Images = null)
+    IReadOnlyList<ImageRef>? Images = null,
+    /// <summary>
+    /// 這一則是**別的 App（機器人／webhook）**發的。
+    ///
+    /// 為什麼要標：使用者要它「看得到其他 App 說的話」（例如另一個機器人貼的班次通知），
+    /// 但它**不可以**把那些內容當成人類說的 ——
+    /// 那會讓它用「你說…」去回一個機器人的公告，也會把公告當成使用者承諾的事。
+    /// 所以提示詞裡會標成 `[App]`（見 <see cref="ToPromptText"/>）。
+    /// </summary>
+    bool FromApp = false)
 {
     public bool IsBot => Role == ChatRole.Assistant;
 
@@ -56,9 +65,14 @@ public sealed record ChatTurn(
     /// <summary>這一則在提示詞裡要長什麼樣（多人頻道要分得出誰在說話）。</summary>
     public string ToPromptText()
     {
+        // ⚠️ 順序有意義：App 的訊息即使同時是「偷聽到的閒聊」，也要先標成 `[App]` ——
+        //    對模型來說「這是別人的對話」與「這是機器的公告」是兩件不同的事。
+        var label = PromptLabel ?? AuthorName;
+
         var body = IsBot ? Content
-                 : Ambient ? $"[閒聊] {PromptLabel ?? AuthorName}：{Content}"
-                 : $"{PromptLabel ?? AuthorName}：{Content}";
+                 : FromApp ? $"[App] {label}：{Content}"
+                 : Ambient ? $"[閒聊] {label}：{Content}"
+                 : $"{label}：{Content}";
 
         // 圖片只用文字記號帶過：模型知道「這裡有一張圖」，
         // 但只有被指定的那一則才會真的附上圖片內容（成本考量）。
@@ -66,7 +80,7 @@ public sealed record ChatTurn(
     }
 
     public string Describe()
-        => $"[{(IsBot ? "Bot" : AuthorName)} @ {At.ToLocalTime():HH:mm:ss}] {Preview(Content)}";
+        => $"[{(IsBot ? "Bot" : FromApp ? "App" : AuthorName)} @ {At.ToLocalTime():HH:mm:ss}] {Preview(Content)}";
 
     private static string Preview(string text)
         => text.Length <= 40 ? text : text[..40] + "…";

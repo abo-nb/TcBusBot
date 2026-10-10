@@ -242,7 +242,7 @@ public sealed class ConversationStore
     /// <see cref="LlmOptions.SegmentGap"/> 就接在目前這一段後面，否則開新的一段。
     /// </summary>
     public ConversationSegment RecordAmbient(
-        ulong guildId, ulong channelId, ChatTurn turn, string reason)
+        ulong guildId, ulong channelId, ChatTurn turn, string reason, bool fromApp = false)
     {
         var conv = _map.GetOrAdd((guildId, channelId), key => new ChannelConversation
         {
@@ -265,11 +265,16 @@ public sealed class ConversationStore
 
         if (!ReferenceEquals(segment, current)) conv.Segments.Add(segment);
 
-        var ambient = turn with { Ambient = true, Role = ChatRole.User };
+        var ambient = turn with { Ambient = true, Role = ChatRole.User, FromApp = fromApp || turn.FromApp };
 
         // 同一則不要記兩次（MessageId = 0 的是合成訊息，不去重）
         if (ambient.MessageId == 0 || segment.Turns.All(t => t.MessageId != ambient.MessageId))
             segment.Turns.Add(ambient);
+
+        // ★ 別的 App 的訊息要限量：有些 App 是「每分鐘貼一次」的（班次通知、狀態看板），
+        //   照單全收會把人類說的話擠出上下文（每一段的容量是固定的）。
+        //   留最近幾則就夠「知道剛剛機器人講了什麼」。
+        if (ambient.FromApp) TrimAppTurns(segment);
 
         segment.LastActivityAt = turn.At;
         conv.LastActivityAt = turn.At;
@@ -279,6 +284,26 @@ public sealed class ConversationStore
         TrimChannels();
 
         return segment;
+    }
+
+    /// <summary>
+    /// 每一段最多留幾則「別的 App 的訊息」（超過就把最舊的那一則拿掉）。
+    ///
+    /// 為什麼不靠一般的 TrimSegment：那是「留最近 N 則」——
+    /// 一個每分鐘貼通知的 App 會把人類的對話整段洗掉。
+    /// 這裡只針對 App 的訊息限量，人類說的照原本的規則留下來。
+    /// </summary>
+    private void TrimAppTurns(ConversationSegment segment)
+    {
+        var limit = Math.Max(1, _options.MaxAppTurnsPerSegment);
+
+        while (segment.Turns.Count(t => t.FromApp) > limit)
+        {
+            var oldest = segment.Turns.FirstOrDefault(t => t.FromApp);
+            if (oldest is null) break;
+
+            segment.Turns.Remove(oldest);
+        }
     }
 
     /// <summary>`/ai forget`：忘掉這個頻道的全部對話。</summary>

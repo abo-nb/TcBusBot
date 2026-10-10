@@ -3942,30 +3942,59 @@ public static class SelfTest
     {
         // ── 1) 別的 App：只有「明確 @ 我們」才處理 ──────────────
         Check("★ 別的 App @ 我們 → 要處理（這是以前吃不到的那一種）",
-            MessageAddress.IgnoreReason(new MessageFacts(
+            MessageAddress.Decide(new MessageFacts(
                 FromApp: true, DirectMessage: false, MentionsBot: true,
-                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false)) is null);
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false))
+            == MessageHandling.ReplyToApp);
 
-        Check("★ 別的 App 沒 @ 我們 → 忽略（不然兩個機器人會互相回話到天荒地老）",
-            MessageAddress.IgnoreReason(new MessageFacts(
+        Check("★ 別的 App 沒 @ 我們 → **看得到但不回話**（預設；使用者要的「看得到其他 App 說的話」）",
+            MessageAddress.Decide(new MessageFacts(
                 FromApp: true, DirectMessage: false, MentionsBot: false,
                 OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false))
-            is { } appReason && appReason.Contains("App", StringComparison.Ordinal));
+            == MessageHandling.ContextOnly);
+
+        Check("★ 別的 App 沒 @，但設 reply → 會回話（明確選擇要它回）",
+            MessageAddress.Decide(new MessageFacts(
+                FromApp: true, DirectMessage: false, MentionsBot: false,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false),
+                AppMessageMode.Reply) == MessageHandling.ReplyToApp);
+
+        Check("★ 別的 App 沒 @，但設 off → 完全不記（舊行為）",
+            MessageAddress.Decide(new MessageFacts(
+                FromApp: true, DirectMessage: false, MentionsBot: false,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false),
+                AppMessageMode.Off) == MessageHandling.Ignore);
+
+        Check("★ 被 @ 的話三種模式都一定要回（被叫了就要答）",
+            MessageAddress.Decide(new MessageFacts(
+                true, false, true, 0, 0, 0, false, false), AppMessageMode.Off) == MessageHandling.ReplyToApp
+            && MessageAddress.Decide(new MessageFacts(
+                true, false, true, 0, 0, 0, false, false), AppMessageMode.Context) == MessageHandling.ReplyToApp);
 
         Check("★ 別的 App「回覆」我們不算（否則 A 回我、我回 A 就是一條鏈）",
-            MessageAddress.IgnoreReason(new MessageFacts(
+            MessageAddress.Decide(new MessageFacts(
                 FromApp: true, DirectMessage: false, MentionsBot: false,
-                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: true)) is not null);
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: true))
+            == MessageHandling.ContextOnly);
 
-        Check("★ 別的 App 在私訊裡 @ 我們 → 也不理（機器人私訊沒有對話的意義）",
-            MessageAddress.IgnoreReason(new MessageFacts(
+        Check("★ 別的 App 在私訊裡 → 連記都不記（機器人私訊沒有對話的意義）",
+            MessageAddress.Decide(new MessageFacts(
                 FromApp: true, DirectMessage: true, MentionsBot: true,
-                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false)) is not null);
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false))
+            == MessageHandling.Ignore);
 
-        Check("真人 @ 我們 → 一定要處理",
-            MessageAddress.IgnoreReason(new MessageFacts(
+        Check("真人 @ 我們 → 照一般流程（不是 App 那條路）",
+            MessageAddress.Decide(new MessageFacts(
                 FromApp: false, DirectMessage: false, MentionsBot: true,
-                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false)) is null);
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false))
+            == MessageHandling.Normal);
+
+        Check("設定的字串解析得出來（看不懂就用預設的 context）",
+            MessageAddress.ParseAppMode("reply") == AppMessageMode.Reply
+            && MessageAddress.ParseAppMode("OFF") == AppMessageMode.Off
+            && MessageAddress.ParseAppMode("忽略") == AppMessageMode.Off
+            && MessageAddress.ParseAppMode("亂打") == AppMessageMode.Context
+            && MessageAddress.ParseAppMode(null) == AppMessageMode.Context);
 
         // ── 2)「@ 了別人」的鐵證（不插話、也不花錢判斷）──────────
         Check("★ @ 別的 App 也算「@ 了別人」（以前只算真人 → 它會插話）",
@@ -4021,6 +4050,56 @@ public static class SelfTest
             && !MessageAddress.IsOwnAppRole(isManaged: false, roleBotId: 999UL, botId: 999UL)
             && !MessageAddress.IsOwnAppRole(isManaged: true, roleBotId: null, botId: 999UL)
             && !MessageAddress.IsOwnAppRole(isManaged: true, roleBotId: 999UL, botId: 0));
+
+        // ── 6) 「看得到 App 說的話」真的進得了上下文 ──────────────
+        //     只判斷「要不要處理」還不夠：使用者要的是「它知道剛剛機器人講了什麼」，
+        //     所以要驗記憶層真的收下了、而且標成 [App]。
+        var appStore = new ConversationStore(new LlmOptions { MaxAppTurnsPerSegment = 3 });
+        var appGuild = 7UL;
+        var appChannel = 8UL;
+        var baseAt = new DateTimeOffset(2026, 10, 10, 12, 0, 0, TimeSpan.Zero);
+
+        var appTurn = new ChatTurn(ChatRole.User, "班次通知", 555UL, 900UL, "300 往靜宜 5 分鐘後到",
+            baseAt, PromptLabel: "班次通知(555)", FromApp: true);
+
+        appStore.RecordAmbient(appGuild, appChannel, appTurn, "別的 App 的訊息", fromApp: true);
+
+        var appSnapshot = appStore.Snapshot(appGuild, appChannel, baseAt);
+
+        Check("★ 別的 App 的訊息會記進上下文（以前整段被丟掉 → 「看不到」）",
+            appSnapshot is not null && appSnapshot.CurrentTurnCount == 1);
+
+        Check("★ 提示詞裡標成 [App]（模型才不會把它當成人類說的話）",
+            appTurn.ToPromptText().StartsWith("[App] ", StringComparison.Ordinal),
+            appTurn.ToPromptText());
+
+        Check("App 的訊息即使同時是「偷聽到的閒聊」，一樣先標 [App]",
+            (appTurn with { Ambient = true }).ToPromptText().StartsWith("[App] ", StringComparison.Ordinal));
+
+        Check("真人的閒聊還是標 [閒聊]（兩種標記不會混淆）",
+            (appTurn with { FromApp = false, Ambient = true }).ToPromptText().StartsWith("[閒聊] ", StringComparison.Ordinal));
+
+        // 每分鐘貼一次的 App 不可以把人類的對話擠掉
+        for (var i = 1; i <= 6; i++)
+        {
+            appStore.RecordAmbient(appGuild, appChannel,
+                appTurn with { MessageId = 900UL + (ulong)i, Content = $"第 {i} 則通知", At = baseAt.AddMinutes(i) },
+                "別的 App 的訊息", fromApp: true);
+        }
+
+        var capped = appStore.Snapshot(appGuild, appChannel, baseAt.AddMinutes(6));
+
+        Check("★ App 的訊息有上限（每分鐘貼通知的 App 不會洗掉人類的對話）",
+            capped is not null && capped.CurrentTurnCount == 3, $"目前 {capped?.CurrentTurnCount} 則");
+
+        var humanTurn = new ChatTurn(ChatRole.User, "小明", 111UL, 999UL, "我要搭 304", baseAt.AddMinutes(7));
+
+        appStore.RecordAmbient(appGuild, appChannel, humanTurn, "偷聽到的訊息");
+
+        var mixed = appStore.Snapshot(appGuild, appChannel, baseAt.AddMinutes(7));
+
+        Check("★ 人類的訊息不會被 App 的上限影響（上限只算 App 的）",
+            mixed is not null && mixed.CurrentTurnCount == 4, $"目前 {mixed?.CurrentTurnCount} 則");
     }
 
     /// <summary>

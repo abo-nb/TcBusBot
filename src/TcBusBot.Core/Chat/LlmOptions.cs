@@ -401,6 +401,21 @@ public sealed class LlmOptions
     /// </summary>
     public int AppCooldownSeconds { get; set; } = 30;
 
+    /// <summary>
+    /// 別的 App 的訊息要怎麼對待（`LLM_APP_MESSAGES`）：
+    /// `context`（預設）＝看得到但不回話、`reply`＝沒 @ 也回、`off`＝完全忽略。
+    /// </summary>
+    public AppMessageMode AppMessages { get; set; } = AppMessageMode.Context;
+
+    /// <summary>
+    /// 每一段對話最多留幾則「別的 App 的訊息」。
+    ///
+    /// 為什麼要限量：有些 App 是「每分鐘貼一次」的（班次通知、狀態看板），
+    /// 照單全收會把人類說的話擠出上下文（每一段的容量是固定的）。
+    /// 留最近幾則就夠「知道剛剛機器人講了什麼」。
+    /// </summary>
+    public int MaxAppTurnsPerSegment { get; set; } = 6;
+
     /// <summary>單次呼叫的逾時。</summary>
     public int RequestTimeoutSeconds { get; set; } = 90;
 

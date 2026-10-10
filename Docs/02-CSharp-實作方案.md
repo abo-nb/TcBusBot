@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 762 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 772 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 762 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 772 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -4378,6 +4378,66 @@ MessageAddress.IgnoreReason(facts);   // null ＝ 要處理；字串 ＝ 忽略�
 | --- | --- |
 | `tcbus selftest` 第 31 節（新增 17 項） | 別的 App @ 它要處理／沒 @ 要忽略／回覆不算／私訊不算；@ 別的 App、@身分組、@everyone 都算「@ 了別人」；同時 @ 它與別人時以「明確 @ 我」優先；App 不偷聽；App 冷卻只套用在 App；@ 自己的 App 身分組算 @ 我們（別人的不算） |
 | `--dryrun` 偷聽入口檢查 | 入口真的用 `MessageAddress.IgnoreReason`、真的讀 `Tags`（@everyone）、真的呼叫 `IsOwnAppRole`；回覆路徑真的關掉 ping（`MentionRepliedUser`）；五種事實組合的真值表 |
+
+### 20.30 「看得到其他 App 說的話」（看得到 ≠ 回話）
+
+使用者接著回報：**「他似乎看不到其他 App 說的話」**。上一節只放行了「被 @」的情況，
+其餘的 App 訊息還是整段丟掉 —— 所以它確實「看不到」。
+
+這裡刻意把兩件事分開：
+
+| | 行為 | 為什麼 |
+| --- | --- | --- |
+| **看得到** | 記進對話上下文（提示詞裡標成 `[App] 名稱(123)：內容`） | 之後有人問「剛剛那個通知說什麼」它才答得出來 |
+| **不回話** | 不問模型（不花錢）、不發訊息、不進回覆鏈 | 那些是機器人的訊息，回話只會變成兩個機器人互相觸發 |
+
+#### 20.30.1 決策從「要不要處理」變成「怎麼處理」
+
+```csharp
+public enum MessageHandling { Normal, ReplyToApp, ContextOnly, Ignore }
+
+MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply／Off
+```
+
+* `ReplyToApp`：被 @ 到（任何模式都回），或模式是 `Reply`
+* `ContextOnly`：App 沒 @ 我們（**預設**）→ 只記上下文
+* `Ignore`：App 私訊、或模式是 `Off`
+
+`LLM_APP_MESSAGES` 讓使用者自己選（`context`／`reply`／`off`）——
+「要不要回機器人」是偏好問題，「看不看得到」不是，所以預設給了看得到。
+
+#### 20.30.2 標成 `[App]`：那是機器的公告，不是人類說的話
+
+`ChatTurn.FromApp` 讓提示詞長成 `[App] 班次通知(123)：300 往靜宜 5 分鐘後到`。
+沒有這個標記，模型會用「你說…」去回一個機器人，也會把公告當成使用者承諾的事。
+
+⚠️ 標記順序有意義：App 的訊息即使同時是「偷聽到的閒聊」，也**先標 `[App]`** ——
+對模型來說「這是別人的對話」與「這是機器的公告」是兩件事。
+
+#### 20.30.3 防止機器人洗掉人類的對話
+
+有些 App 是**每分鐘貼一次**的（班次通知、狀態看板）。照單全收的話，
+它們會把人類說的話擠出上下文（每一段的容量是固定的 24 則）。
+所以 `RecordAmbient(..., fromApp: true)` 會套用 `LLM_MAX_APP_TURNS`（預設 6）：
+**只限制 App 的訊息則數**，人類說的照原本規則留下來（`TrimAppTurns`）。
+
+#### 20.30.4 順手：把「@ 展開」抽成一份
+
+真人的入口、App 的訊息、摘要那一條路都需要「把 `<@123>` 展開成 `@暱稱(ID)`」。
+本來是三份各寫一份（遲早會出現「某一條路的名字跟別人不一樣」），現在是
+`LlmChatService.ExpandMentions`。
+
+⚠️ 它用 `foreach` 而不是 LINQ：`ToDictionary(..., g => …)` 會把呼叫藏進閉包方法，
+`--dryrun` 的 IL 掃描就看不到「這條規則真的接上了」—— 這是同一個坑第二次踩到
+（第一次是 `IsOwnAppRole`），兩處都在程式裡留了註解。
+
+#### 20.30.5 驗收
+
+| 在哪 | 驗什麼 |
+| --- | --- |
+| `tcbus selftest` 第 31 節（新增 10 項） | `Decide` 的真值表（被 @ 一定回、沒 @ 預設只記上下文、`reply`／`off` 模式、私訊不記、真人走一般流程）；設定的字串解析；**真的寫進記憶**（`Snapshot` 看得到）、標成 `[App]`、`[閒聊]` 不混淆；App 訊息有則數上限**而且不影響人類的訊息** |
+| `--dryrun` 偷聽入口檢查 | 入口真的用 `Decide`、真的呼叫 `RecordAppContext`；`RecordAppContext` 真的寫進 `RecordAmbient`；`ExpandMentions` 真的用 `SpeakerName` ＋ 看 `LLM_SHOW_NICKNAMES`；`Decide` 的五種組合真值表 |
+| `/ai status` | 多一欄「別的 App 的訊息」，直接顯示目前是哪一種模式（`context`／`reply`／`off`） |
 
 ---
 

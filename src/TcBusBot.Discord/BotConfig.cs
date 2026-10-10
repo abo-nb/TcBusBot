@@ -305,6 +305,17 @@ public sealed class BotConfig
                 ["LLM_APP_COOLDOWN_SECONDS"]).Value, out var appCooldown) && appCooldown is >= 0 and <= 3600)
             cfg.Llm.AppCooldownSeconds = appCooldown;
 
+        // 別的 App 的訊息要怎麼對待：context（預設，看得到但不回話）／reply／off
+        var appMessages = SettingResolver.Resolve(args, "--llm-app-messages", file,
+            ["LLM_APP_MESSAGES"]).Value;
+        if (!string.IsNullOrWhiteSpace(appMessages))
+            cfg.Llm.AppMessages = MessageAddress.ParseAppMode(appMessages);
+
+        // 每一段對話最多留幾則 App 的訊息（避免機器人洗掉人類的對話）
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-max-app-turns", file,
+                ["LLM_MAX_APP_TURNS"]).Value, out var maxAppTurns) && maxAppTurns is >= 1 and <= 48)
+            cfg.Llm.MaxAppTurnsPerSegment = maxAppTurns;
+
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-timeout", file,
                 ["LLM_TIMEOUT_SECONDS"]).Value, out var llmTimeout) && llmTimeout is >= 5 and <= 600)
             cfg.Llm.RequestTimeoutSeconds = llmTimeout;

@@ -48,6 +48,9 @@ public sealed class LlmChatService : IDisposable
     /// </summary>
     private readonly ConcurrentDictionary<(ulong Channel, ulong App), DateTimeOffset> _lastAppAt = new();
 
+    /// <summary>「記下別的 App 訊息」的 log 只印前幾則（有些 App 每分鐘貼一次，會洗版）。</summary>
+    private int _appContextLogged;
+
     /// <summary>「訊息內容是空的」只提醒一次（那幾乎一定是沒開 Message Content 意圖）。</summary>
     private static int _emptyContentWarned;
 
@@ -166,10 +169,23 @@ public sealed class LlmChatService : IDisposable
                               || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
                               || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id)));
 
-        if (MessageAddress.IgnoreReason(facts) is { } why)
+        var handling = MessageAddress.Decide(facts, _options.AppMessages);
+
+        // ── 別的 App 的訊息：**看得到，但不回話** ──────────────
+        //    使用者回報「他似乎看不到其他 App 說的話」——
+        //    「看不到」與「不回話」是兩件事：記進上下文它才知道剛剛機器人講了什麼，
+        //    但不問模型（不花錢）、不發訊息、也不參與回覆鏈。
+        if (handling == MessageHandling.ContextOnly)
+        {
+            RecordAppContext(facts, userMessage, guildId, now);
+            return;
+        }
+
+        if (handling == MessageHandling.Ignore)
         {
             if (facts.FromApp)
-                Console.WriteLine($"[llm] 🤖 忽略一則 App 訊息（{facts.Describe()}）：{why}");
+                Console.WriteLine($"[llm] 🤖 忽略一則 App 訊息（{facts.Describe()}）：" +
+                                  $"{MessageAddress.IgnoreReason(facts) ?? "（App 訊息模式：off）"}");
 
             return;
         }
@@ -186,7 +202,11 @@ public sealed class LlmChatService : IDisposable
         var raw = message.Content ?? "";
 
         var mentioned = facts.MentionsBot;
-        var addressed = facts.AddressedToBot;
+
+        // 「Reply 模式」下，別的 App 的訊息也算在對我們說話（沒 @ 也回）
+        var appReply = handling == MessageHandling.ReplyToApp && !facts.MentionsBot;
+
+        var addressed = facts.AddressedToBot || appReply;
 
         // ── 偷聽中的訊息也要進來處理 ─────────────────────────
         //    ⚠️ 這裡出過大包：原本的判斷只有「@ 它」與「回覆它」，
@@ -200,7 +220,7 @@ public sealed class LlmChatService : IDisposable
         // ── App 專屬冷卻（機器人互相回話的煞車）────────────────
         //    真人回一句話可以算「在對我說話」，但兩個機器人之間只要有一邊失控，
         //    就會變成「A @ 我、我 @ A」的無限循環 —— 每一輪都真的花錢。
-        if (MessageAddress.NeedsAppCooldown(facts) && _options.AppCooldownSeconds > 0)
+        if (MessageAddress.NeedsAppCooldown(facts, _options.AppMessages) && _options.AppCooldownSeconds > 0)
         {
             var key = (message.Channel.Id, userMessage.Author.Id);
 
@@ -227,14 +247,8 @@ public sealed class LlmChatService : IDisposable
 
         var text = StripMention(raw, botId).Trim();
 
-        // 把「@某人」展開成「@暱稱(ID)」：模型原本只看到 <@123456789>，不知道那是誰。
-        // （Discord 的 mention 有 <@id>、<@!id> 兩種寫法，純函式在 Core 裡可測）
-        var mentions = userMessage.MentionedUsers
-            .Where(u => u.Id != botId)
-            .GroupBy(u => u.Id)
-            .ToDictionary(g => g.Key, g => NameOf(g.First()));
-
-        text = MentionFormatter.Expand(text, mentions, _options.ExposeUserIds);
+        // 把「@某人」展開成「@暱稱(ID)」（與 App 訊息、摘要共用同一套規則）
+        text = ExpandMentions(message, botId);
 
         // ── 偷聽模式：這一則沒有 @ 它、也不是回覆它 ──────────
         // 訊息 @ 了**別人**（真人／別的 App／身分組／@everyone）→ 那是在跟那個人說話，這是鐵證。
@@ -281,6 +295,82 @@ public sealed class LlmChatService : IDisposable
         //   使用者什麼都看不到）。使用者要的是「盡量每個人都回」，
         //   所以改成排隊，只有佇列真的滿了才丟（而且先丟閒聊、不丟 @ 它的）。
         Enqueue(new QueuedMessage(userMessage, text, addressed, mentionsOther), now);
+    }
+
+    /// <summary>
+    /// 把訊息裡的「@某人」展開成「@暱稱(ID)」：模型原本只看到 `<@123456789>`，不知道那是誰。
+    ///
+    /// 為什麼抽成一個方法：**三個地方**都要同一套規則（真人訊息的入口、別的 App 的訊息、
+    /// 以及摘要那一條路），各寫一份就會出現「某一條路的名字跟別人不一樣」。
+    ///
+    /// ⚠️ 這裡刻意用 `foreach` 而不是 LINQ：`ToDictionary(..., g => …)` 會把呼叫藏進
+    ///    編譯器生成的閉包方法裡，`--dryrun` 的 IL 掃描就看不到「這條規則真的接上了」。
+    /// </summary>
+    private string ExpandMentions(SocketMessage message, ulong botId)
+    {
+        var known = new Dictionary<ulong, string>();
+
+        if ((message as SocketMessage)?.MentionedUsers is { } mentioned)
+        {
+            foreach (var user in mentioned)
+            {
+                if (user.Id == botId) continue;
+                if (known.ContainsKey(user.Id)) continue;
+
+                known[user.Id] = MentionFormatter.SpeakerName(
+                    (user as SocketGuildUser)?.DisplayName, user.Username, user.Id, _options.ShowNicknames);
+            }
+        }
+
+        return MentionFormatter.Expand(message.Content, known, _options.ExposeUserIds);
+    }
+
+    /// <summary>
+    /// 把「別的 App 說的話」記進這個頻道的上下文（**看得到，但不回話**）。
+    ///
+    /// 為什麼要記：使用者要它知道別的 App 講了什麼（例如另一個機器人貼的班次通知），
+    /// 這樣之後有人問「剛剛那個通知說什麼」它才答得出來。
+    /// 為什麼不回話也不問模型：那些是機器人的訊息，回話只會變成兩個機器人互相觸發。
+    ///
+    /// ⚠️ 這裡刻意**不查偷聽窗口、也不啟動偷聽**：
+    ///    App 的訊息不是「有人在跟我說話」，所以不該消耗偷聽額度，
+    ///    也不該讓它之後對著機器人的訊息插話。
+    /// </summary>
+    private void RecordAppContext(MessageFacts facts, SocketUserMessage message, ulong guildId, DateTimeOffset now)
+    {
+        if (guildId == 0) return;
+
+        var author = message.Author as SocketGuildUser;
+        var id = message.Author.Id;
+
+        var label = MentionFormatter.Label(
+            author?.DisplayName, author?.Username ?? message.Author.Username, id, _options.ExposeUserIds);
+
+        var text = ExpandMentions(message, botId: 0).Trim();
+
+        // 純貼圖／只附件的 App 訊息：留一句「它貼了東西」，不然整則被丟掉
+        if (text.Length == 0)
+        {
+            var images = message.Attachments.Count + message.Stickers.Count
+                         + message.Embeds.Count(e => e.Image is not null || e.Thumbnail is not null);
+
+            text = images > 0 ? "（貼了圖片／貼圖）" : "";
+        }
+
+        if (text.Length == 0) return;   // 系統訊息之類的：不記
+
+        var turn = new ChatTurn(
+            ChatRole.User, label, id, message.Id, text, message.Timestamp,
+            Images: null, FromApp: true);
+
+        _chat.Conversations.RecordAmbient(guildId, message.Channel.Id, turn, "別的 App 的訊息", fromApp: true);
+
+        // 每一則都寫 log 會洗版（有些 App 每分鐘貼一次）→ 只寫前幾則
+        if (Interlocked.Increment(ref _appContextLogged) <= 3)
+            Console.WriteLine($"[llm] 👀 記下別的 App 的訊息當上下文（不會回話）：" +
+                              $"{MentionFormatter.SpeakerName(author?.DisplayName, message.Author.Username, id, false)}：" +
+                              $"{Preview(text)}" +
+                              (facts.MentionsSomeoneElse ? "（它 @ 了別人）" : ""));
     }
 
     /// <summary>排隊中的一則（保留原訊息，回覆時要用它的頻道／訊息 ID）。</summary>
