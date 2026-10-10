@@ -391,6 +391,16 @@ public sealed class LlmOptions
     /// <summary>同一個使用者連續問的冷卻秒數（避免有人連點把額度燒掉）。</summary>
     public int UserCooldownSeconds { get; set; } = 3;
 
+    /// <summary>
+    /// 同一個 App 在同一個頻道連續 @ 我們時的煞車（秒；`0` ＝ 不限制）。
+    ///
+    /// 為什麼需要這個：真人回一句話可以算「在對我說話」，但**兩個機器人之間**
+    /// 只要有一邊失控，就會變成「A @ 我、我 @ A」的無限循環 —— 每一輪都真的花錢。
+    /// 預設 30 秒：正常使用感覺不到（沒有哪個 App 需要每 30 秒叫我們一次），
+    /// 但足以把失控的迴圈壓成「每 30 秒一次」，讓人有機會發現並切掉。
+    /// </summary>
+    public int AppCooldownSeconds { get; set; } = 30;
+
     /// <summary>單次呼叫的逾時。</summary>
     public int RequestTimeoutSeconds { get; set; } = 90;
 

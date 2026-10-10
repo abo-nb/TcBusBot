@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 745 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 762 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 745 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 762 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -4315,6 +4315,69 @@ HTTP handler 不知道這次呼叫是「聊天」還是「摘要」，也不知�
 
 真實 API 驗證（用有效金鑰跑過一次）：思考 1199 字／448 tokens、
 `finish_reason=Stop`、回答完整 —— 抓取與補欄位都沒有影響正常對話。
+
+### 20.29 「誰在對它說話」（別的 App @ 它吃不到、@ 別人被當成 @ 它）
+
+使用者一次回報兩個症狀，查下來是**同一段判斷**寫得太粗：
+
+| 症狀 | 根因 | 修法 |
+| --- | --- | --- |
+| **別的 App @ 它，它吃不到** | `HandleCoreAsync` 第一行就把 `Author.IsBot`／`Author.IsWebhook` 的訊息**整段丟掉**（防止機器人互相回話）—— 連明確 @ 它也一起丟 | 別的 App **只有明確 @ 我們**才處理（門檻刻意比真人高） |
+| **@ 別人被當成在對它說話** | 「@ 了別人」只算**真人**（`!u.IsBot`）→ @ 別的 App／@身分組／@everyone 都不算「在跟別人說話」，於是交去問模型 → 它插話 | 「@ 了別人」改成真人／**別的 App**／**身分組**／**@everyone** 都算（`Tags` 的 `EveryoneMention`／`HereMention`） |
+| （順手）**@ 它自己的 App 身分組** | Discord 幫每個 App 建**同名身分組**；從成員清單 @ 它時送出的可能是**身分組** mention（`<@&roleId>`），只認使用者 mention 就會「明明 @ 了卻不理」 | 用 `RoleTags.BotId` 認出「這是我們自己的 App 身分組」→ 算 @ 我們 |
+
+#### 20.29.1 為什麼把規則抽成 Core 的純函式
+
+這三條規則錯了**都不會拋例外**：只會「它不回我」或「它亂插話」，而且很難重現
+（要剛好有人 @ 別人、剛好另一個機器人在講話）。所以把它變成資料 ＋ 純函式：
+
+```csharp
+var facts = new MessageFacts(FromApp, DirectMessage, MentionsBot, OtherHumans, OtherApps,
+                             Roles, MentionsEveryone, RepliesToBot);
+
+MessageAddress.IgnoreReason(facts);   // null ＝ 要處理；字串 ＝ 忽略的原因（寫進 log）
+```
+
+* `AddressedToBot` ＝ `MentionsBot || (!FromApp && RepliesToBot)` —— **回覆那條路不給 App**
+  （兩個機器人都把「回覆」當成在對自己說話就是一條無限鏈）
+* `MentionsSomeoneElse` ＝ 真人／別的 App／身分組／@everyone 任一
+* `CanEavesdrop` ＝ 不是 App **且** 還沒在對它說話
+* Discord 那一層只負責「把客觀事實填進去」，**判斷全部在 Core** →
+  `tcbus selftest` 可以直接餵各種組合（第 31 節，新增 **17 項**）
+
+#### 20.29.2 防迴圈：三層
+
+放寬「別的 App @ 它」就等於打開了機器人互相回話的門，所以同時補三層：
+
+| 層 | 作法 |
+| --- | --- |
+| 進 | 別的 App **只有明確 @ 我們**才處理；「回覆」不算；私訊不算 |
+| 冷卻 | 同一個 App 在同一個頻道 **30 秒煞車**（`LLM_APP_COOLDOWN_SECONDS`，`0` = 關掉）；真人不受影響 |
+| 出 | 回覆 App 時 `AllowedMentions { AllowedTypes = None, MentionRepliedUser = false }` —— **連回覆通知都不發**（我們的通知就是對方繼續回話的燃料） |
+
+#### 20.29.3 兩個「文件沒寫、只有踩過才知道」的 API 細節
+
+* `SocketUserMessage` **沒有** `MentionEveryone` 屬性 —— @everyone／@here 在
+  `IMessage.Tags`（`TagType.EveryoneMention`／`HereMention`）裡
+* `AllowedMentions` 的屬性是 **`MentionRepliedUser`**（不是 `RepliedUser`）
+
+兩個都是先用反射把 Discord.Net 3.18 的實際成員印出來確認的 ——
+跟這份文件裡其他「設定了不等於送出去了」的教訓同一類：**不要靠印象寫 API**。
+
+#### 20.29.4 離線驗證自己抓到的實作問題
+
+`--dryrun` 的 IL 掃描要求「入口真的呼叫了 `MessageAddress.IsOwnAppRole`」，
+而第一版寫成 `MentionedRoles.Any(r => MessageAddress.IsOwnAppRole(...))` ——
+**lambda 會編譯成閉包方法**，IL 掃描在 `MoveNext` 裡看不到那個呼叫。
+所以改成明確的 `foreach`（程式裡留了註解說明為什麼不用 LINQ）。
+這不只是為了驗證好寫：規則藏在 lambda 裡，以後有人改動時同樣不容易被檢查到。
+
+#### 20.29.5 驗收
+
+| 在哪 | 驗什麼 |
+| --- | --- |
+| `tcbus selftest` 第 31 節（新增 17 項） | 別的 App @ 它要處理／沒 @ 要忽略／回覆不算／私訊不算；@ 別的 App、@身分組、@everyone 都算「@ 了別人」；同時 @ 它與別人時以「明確 @ 我」優先；App 不偷聽；App 冷卻只套用在 App；@ 自己的 App 身分組算 @ 我們（別人的不算） |
+| `--dryrun` 偷聽入口檢查 | 入口真的用 `MessageAddress.IgnoreReason`、真的讀 `Tags`（@everyone）、真的呼叫 `IsOwnAppRole`；回覆路徑真的關掉 ping（`MentionRepliedUser`）；五種事實組合的真值表 |
 
 ---
 

@@ -2835,6 +2835,51 @@ public static class DryRun
             Problem("ChatOrchestrator.RecordAmbient 沒有看 LLM_EAVESDROP_CONTEXT 設定 —— 關不掉會很花 token");
 
         Console.WriteLine("  ✔ 核心真的會：TouchListen（@ 別人）／ConsumeListen（判斷）／RecordAmbient（留下上下文）");
+
+        // ── 4) 「誰在對它說話」的規則（兩個真實回報的 bug）──────────
+        //    1. 別的 App @ 它 → 吃不到（以前整段丟掉）
+        //    2. @ 別人（別的 App／身分組／@everyone）→ 被當成在對它說話
+        //    規則在 Core 的 MessageAddress（純函式），所以這裡驗的是
+        //    「入口真的用了那個判斷」。
+        if (!calls.Contains("MessageAddress.IgnoreReason"))
+            Problem("訊息入口沒有用 MessageAddress.IgnoreReason —— 「別的 App @ 它」與「@ 別人」的判斷會走回舊路");
+        else if (!calls.Contains("MessageFacts.Describe"))
+            Problem("入口沒有記下「這一則在對誰說話」的事實 —— 出事時 log 看不出來為什麼不理它");
+
+        // @everyone 要從 Tags 讀（SocketUserMessage 沒有 MentionEveryone 這個屬性）
+        if (!calls.Any(c => c.EndsWith("get_Tags", StringComparison.Ordinal)))
+            Problem("入口沒有檢查 @everyone／@here（它們在訊息 Tags 裡，不是 MentionedUsers）");
+
+        // @「App 自己的身分組」也要算 @ 我們（Discord 幫每個 App 建同名身分組）
+        if (!calls.Contains("MessageAddress.IsOwnAppRole"))
+            Problem("入口沒有認「App 自己的身分組」被 @ —— 有人從成員清單 @ 它時會完全不理");
+
+        // 回覆別的 App 時不可以發任何 ping（否則我們的通知就是對方繼續回話的燃料）
+        var replyCalls = answer is null ? [] : CollectCalls(answer, resolveAll: true);
+
+        if (!replyCalls.Contains("AllowedMentions.set_AllowedTypes")
+            || !replyCalls.Contains("AllowedMentions.set_MentionRepliedUser"))
+            Problem("回覆別的 App 時沒有關掉 ping／回覆通知 —— 會變成「A @ 我、我 @ A」的循環");
+
+        var appRules = new[]
+        {
+            (Facts: new MessageFacts(true, false, false, 0, 0, 0, false, false), Expected: false, Why: "別的 App 沒 @ 它（要忽略）"),
+            (Facts: new MessageFacts(true, false, true, 0, 0, 0, false, false), Expected: true, Why: "別的 App @ 它（一定要回）"),
+            (Facts: new MessageFacts(true, false, false, 0, 0, 0, false, true), Expected: false, Why: "別的 App「回覆」它（不可以開鏈）"),
+            (Facts: new MessageFacts(true, true, true, 0, 0, 0, false, false), Expected: false, Why: "別的 App 在私訊裡"),
+            (Facts: new MessageFacts(false, false, true, 0, 0, 0, false, false), Expected: true, Why: "真人 @ 它")
+        };
+
+        foreach (var (facts, expected, why) in appRules)
+        {
+            var handles = MessageAddress.IgnoreReason(facts) is null;
+
+            if (handles != expected)
+                Problem($"入口規則錯了（{why}）：IgnoreReason 說 {(handles ? "處理" : "忽略")}");
+        }
+
+        Console.WriteLine("  ✔ 別的 App 只有「明確 @ 它」才會被處理，回覆／私訊／沒 @ 都不理；" +
+                          "回覆 App 時不發任何 ping");
     }
 
     /// <summary>

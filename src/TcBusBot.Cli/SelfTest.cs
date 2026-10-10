@@ -128,6 +128,9 @@ public static class SelfTest
         Section("30. 每週頻道摘要（/digest）：排程、游標、分批、@ 人的核對、永久歸檔");
         TestDigest();
 
+        Section("31. 誰在對它說話（別的 App @ 它要吃得到；@ 別人不是 @ 它）");
+        TestMessageAddress();
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -3407,7 +3410,7 @@ public static class SelfTest
         var otherPerson = eavesdropChat.AskAsync(
             guild, channel,
             new ChatTurn(ChatRole.User, "阿美", 88UL, 503UL, "@小華 你要幾點到？", now),
-            null, cancellationToken: default, addressed: false, mentionsOtherHuman: true)
+            null, cancellationToken: default, addressed: false, mentionsOther: true)
             .GetAwaiter().GetResult();
 
         Check("★ @ 了別人 → 不插話而且**不花錢判斷**（LLM 呼叫次數不變）",
@@ -3484,7 +3487,7 @@ public static class SelfTest
 
         eavesdropChat.AskAsync(guild, channel,
             new ChatTurn(ChatRole.User, "阿美", 88UL, 603UL, "@小華 你幾點到？", now),
-            null, cancellationToken: default, addressed: false, mentionsOtherHuman: true,
+            null, cancellationToken: default, addressed: false, mentionsOther: true,
             onReplying: OnReplying).GetAwaiter().GetResult();
 
         Check("★ @ 了別人（不問模型的那條路）也不會顯示「正在輸入…」", typing == 0, $"{typing} 次");
@@ -3925,6 +3928,100 @@ public static class SelfTest
 
     /// <summary>「@ Bot 自己」用的假 ID（與其他測試的 Bot ID 一致）。</summary>
     private const ulong QuotaBotId = 999UL;
+
+    /// <summary>
+    /// 「誰在對它說話」—— 兩個真實回報過的症狀：
+    ///   1. **別的 App @ 它，它吃不到**（以前整段「Bot／webhook 的訊息」都被丟掉）
+    ///   2. **@ 別人被當成在對它說話**（以前「@ 了別人」只算真人，
+    ///      所以 @ 別的 App／@身分組／@everyone 都不算「在跟別人說話」→ 它插話）
+    ///
+    /// 這些規則全都是「錯了不會拋例外，只會不回你、或亂回話」的那種，
+    /// 所以每一條都要能離線測。
+    /// </summary>
+    private static void TestMessageAddress()
+    {
+        // ── 1) 別的 App：只有「明確 @ 我們」才處理 ──────────────
+        Check("★ 別的 App @ 我們 → 要處理（這是以前吃不到的那一種）",
+            MessageAddress.IgnoreReason(new MessageFacts(
+                FromApp: true, DirectMessage: false, MentionsBot: true,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false)) is null);
+
+        Check("★ 別的 App 沒 @ 我們 → 忽略（不然兩個機器人會互相回話到天荒地老）",
+            MessageAddress.IgnoreReason(new MessageFacts(
+                FromApp: true, DirectMessage: false, MentionsBot: false,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false))
+            is { } appReason && appReason.Contains("App", StringComparison.Ordinal));
+
+        Check("★ 別的 App「回覆」我們不算（否則 A 回我、我回 A 就是一條鏈）",
+            MessageAddress.IgnoreReason(new MessageFacts(
+                FromApp: true, DirectMessage: false, MentionsBot: false,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: true)) is not null);
+
+        Check("★ 別的 App 在私訊裡 @ 我們 → 也不理（機器人私訊沒有對話的意義）",
+            MessageAddress.IgnoreReason(new MessageFacts(
+                FromApp: true, DirectMessage: true, MentionsBot: true,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false)) is not null);
+
+        Check("真人 @ 我們 → 一定要處理",
+            MessageAddress.IgnoreReason(new MessageFacts(
+                FromApp: false, DirectMessage: false, MentionsBot: true,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false)) is null);
+
+        // ── 2)「@ 了別人」的鐵證（不插話、也不花錢判斷）──────────
+        Check("★ @ 別的 App 也算「@ 了別人」（以前只算真人 → 它會插話）",
+            new MessageFacts(false, false, false, 0, 1, 0, false, false).MentionsSomeoneElse);
+
+        Check("★ @ 身分組也算（例如 @管理員、App 自己的身分組）",
+            new MessageFacts(false, false, false, 0, 0, 1, false, false).MentionsSomeoneElse);
+
+        Check("★ @everyone／@here 也算（那是對所有人宣布，不是對它說話）",
+            new MessageFacts(false, false, false, 0, 0, 0, true, false).MentionsSomeoneElse
+            && new MessageFacts(false, false, false, 0, 0, 1, false, false).MentionsSomeoneElse);
+
+        Check("什麼都沒 @ → 不算「@ 了別人」（那是可以偷聽判斷的閒聊）",
+            !new MessageFacts(false, false, false, 0, 0, 0, false, false).MentionsSomeoneElse);
+
+        // ── 3)「同時 @ 我與別人」→ 明確 @ 我優先 ────────────────
+        var bothMentioned = new MessageFacts(false, false, true, 1, 1, 0, false, false);
+
+        Check("★ 同時 @ 我與別人 → 還是在對我說話（明確 @ 我優先）",
+            bothMentioned.AddressedToBot && bothMentioned.MentionsSomeoneElse);
+
+        // ── 4) 偷聽與冷卻的適用範圍 ────────────────────────────
+        Check("★ 別的 App 的訊息不偷聽（機器人講話不需要我們插話，判斷還要花錢）",
+            !new MessageFacts(true, false, false, 0, 0, 0, false, false).CanEavesdrop
+            && new MessageFacts(false, false, false, 0, 0, 0, false, false).CanEavesdrop);
+
+        Check("已經在對它說話時不算「偷聽」",
+            !new MessageFacts(false, false, true, 0, 0, 0, false, false).CanEavesdrop);
+
+        Check("★ App 冷卻只套用在「App @ 我們」那種情況",
+            MessageAddress.NeedsAppCooldown(new MessageFacts(true, false, true, 0, 0, 0, false, false))
+            && !MessageAddress.NeedsAppCooldown(new MessageFacts(false, false, true, 0, 0, 0, false, false))
+            && !MessageAddress.NeedsAppCooldown(new MessageFacts(true, false, false, 0, 0, 0, false, false)));
+
+        Check("App 冷卻預設 30 秒（正常使用感覺不到，但足以壓住失控的迴圈）",
+            new LlmOptions().AppCooldownSeconds == 30 && new LlmOptions { AppCooldownSeconds = 0 }.AppCooldownSeconds == 0);
+
+        Check("「這一則在對誰說話」的說明看得出是 App／私訊／@ 了誰（除錯用）",
+            new MessageFacts(true, false, true, 0, 1, 1, true, false).Describe()
+                is var described && described.Contains("App", StringComparison.Ordinal)
+                && described.Contains("App", StringComparison.Ordinal)
+                && described.Contains("everyone", StringComparison.Ordinal),
+            new MessageFacts(true, false, true, 0, 1, 1, true, false).Describe());
+
+        // ── 5) @「App 自己的身分組」也算是 @ 我們 ────────────────
+        //     Discord 幫每個 App 建一個同名身分組；從成員清單 @ 它時，
+        //     送出的可能是身分組 mention。只認使用者 mention 就會「明明 @ 了卻不理」。
+        Check("★ @ 我們自己的 App 身分組 → 算 @ 我們",
+            MessageAddress.IsOwnAppRole(isManaged: true, roleBotId: 999UL, botId: 999UL));
+
+        Check("★ 別人的身分組／別的身分組不算（@ 管理員不是 @ 我們）",
+            !MessageAddress.IsOwnAppRole(isManaged: true, roleBotId: 111UL, botId: 999UL)
+            && !MessageAddress.IsOwnAppRole(isManaged: false, roleBotId: 999UL, botId: 999UL)
+            && !MessageAddress.IsOwnAppRole(isManaged: true, roleBotId: null, botId: 999UL)
+            && !MessageAddress.IsOwnAppRole(isManaged: true, roleBotId: 999UL, botId: 0));
+    }
 
     /// <summary>
     /// 測試用的假 LLM：固定回一句話，並記住被呼叫幾次（用來驗證「該不該花錢」）。

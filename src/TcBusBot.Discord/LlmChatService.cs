@@ -40,6 +40,14 @@ public sealed class LlmChatService : IDisposable
 
     private readonly ConcurrentDictionary<ulong, DateTimeOffset> _lastAskedAt = new();
 
+    /// <summary>
+    /// 每個（頻道, App）上一次回話的時間 —— 別的 App 連續 @ 我們的煞車。
+    ///
+    /// 為什麼要按頻道分開：同一個 App 在 A 頻道被冷卻，不該影響它在 B 頻道叫我們
+    /// （那會變成「換個頻道就能繞過」）。
+    /// </summary>
+    private readonly ConcurrentDictionary<(ulong Channel, ulong App), DateTimeOffset> _lastAppAt = new();
+
     /// <summary>「訊息內容是空的」只提醒一次（那幾乎一定是沒開 Message Content 意圖）。</summary>
     private static int _emptyContentWarned;
 
@@ -111,12 +119,60 @@ public sealed class LlmChatService : IDisposable
 
     private async Task HandleCoreAsync(SocketMessage message)
     {
-        // 只處理真人打的訊息（Bot 之間互相回話會無限循環）
         if (message is not SocketUserMessage userMessage) return;
-        if (userMessage.Author.IsBot || userMessage.Author.IsWebhook) return;
 
         var botId = _client.CurrentUser?.Id ?? 0;
         var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id ?? 0;
+        var now = DateTimeOffset.UtcNow;
+        var referenced = userMessage.ReferencedMessage;
+
+        // ── 這一則「在對誰說話」的事實（規則在 Core，可離線測）──────
+        // ⚠️ 這裡以前有兩個 bug，都是同一個原因（判斷寫得太粗）：
+        //   1. 所有 Bot／webhook 的訊息**整段被丟掉** → 別的 App @ 它也吃不到
+        //   2.「@ 了別人」只算真人（`!u.IsBot`）→ @ 別的 App／@身分組／@everyone
+        //      都不算「在跟別人說話」，於是它會插話
+        //
+        // @ 我們有兩種寫法：使用者 mention（`<@id>`）與 **App 自己的身分組** mention
+        // （`<@&roleId>`，Discord 幫每個 App 建一個同名身分組）。
+        // ⚠️ 身分組那一段刻意用 foreach 而不是 LINQ：`Any(lambda)` 會把呼叫藏進
+        //    編譯器生成的閉包方法裡，離線驗證的 IL 掃描就看不到 ——
+        //    而我們要驗的正是「這條規則真的接上了」（第一版就是這樣被掃出來的）。
+        var mentionedByUser = botId != 0 && userMessage.MentionedUsers.Any(u => u.Id == botId);
+        var mentionedByAppRole = false;
+
+        if (!mentionedByUser && botId != 0)
+        {
+            foreach (var role in userMessage.MentionedRoles)
+            {
+                if (!MessageAddress.IsOwnAppRole(role.IsManaged, role.Tags?.BotId, botId)) continue;
+
+                mentionedByAppRole = true;
+                break;
+            }
+        }
+
+        var facts = new MessageFacts(
+            FromApp: userMessage.Author.IsBot || userMessage.Author.IsWebhook,
+            DirectMessage: guildId == 0,
+            MentionsBot: mentionedByUser || mentionedByAppRole,
+            OtherHumans: userMessage.MentionedUsers.Count(u => u.Id != botId && !u.IsBot),
+            OtherApps: userMessage.MentionedUsers.Count(u => u.Id != botId && u.IsBot),
+            Roles: userMessage.MentionedRoles.Count,
+            // ⚠️ Discord.Net 的 SocketUserMessage 沒有 MentionEveryone 這個屬性，
+            //    @everyone／@here 在 `Tags` 裡（TagType.EveryoneMention／HereMention）。
+            MentionsEveryone: userMessage.Tags.Any(t => t.Type is TagType.EveryoneMention or TagType.HereMention),
+            RepliesToBot: referenced is not null
+                          && (referenced.Author.Id == botId
+                              || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
+                              || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id)));
+
+        if (MessageAddress.IgnoreReason(facts) is { } why)
+        {
+            if (facts.FromApp)
+                Console.WriteLine($"[llm] 🤖 忽略一則 App 訊息（{facts.Describe()}）：{why}");
+
+            return;
+        }
 
         // 私訊預設不回（沒有「@ 機器人」這個動作，容易被誤觸）
         if (guildId == 0 && !_options.AllowDm)
@@ -128,27 +184,36 @@ public sealed class LlmChatService : IDisposable
         }
 
         var raw = message.Content ?? "";
-        var referenced = userMessage.ReferencedMessage;
 
-        var mentioned = botId != 0 && userMessage.MentionedUsers.Any(u => u.Id == botId);
-
-        // 回覆也算「對 Bot 說話」：回覆 Bot 的訊息、回覆提到 Bot 的訊息、
-        // 或回覆任何一則**我們記得過的**訊息（= 想把那段話題拉回來）
-        var replyAddressed = referenced is not null
-                             && (referenced.Author.Id == botId
-                                 || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
-                                 || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id));
-
-        var now = DateTimeOffset.UtcNow;
+        var mentioned = facts.MentionsBot;
+        var addressed = facts.AddressedToBot;
 
         // ── 偷聽中的訊息也要進來處理 ─────────────────────────
         //    ⚠️ 這裡出過大包：原本的判斷只有「@ 它」與「回覆它」，
         //    沒被叫到的訊息會在**到達偷聽那段程式之前**就 return，
         //    所以「回完話後繼續聽」從來沒有真的生效過（使用者看到的是後面的訊息全被忽略）。
-        var listening = !mentioned && !replyAddressed
+        var listening = facts.CanEavesdrop
                         && _chat.Conversations.PeekListening(guildId, message.Channel.Id, now) is not null;
 
-        if (!ShouldHandle(mentioned, replyAddressed, listening)) return;
+        if (!ShouldHandle(mentioned, addressed, listening)) return;
+
+        // ── App 專屬冷卻（機器人互相回話的煞車）────────────────
+        //    真人回一句話可以算「在對我說話」，但兩個機器人之間只要有一邊失控，
+        //    就會變成「A @ 我、我 @ A」的無限循環 —— 每一輪都真的花錢。
+        if (MessageAddress.NeedsAppCooldown(facts) && _options.AppCooldownSeconds > 0)
+        {
+            var key = (message.Channel.Id, userMessage.Author.Id);
+
+            if (_lastAppAt.TryGetValue(key, out var lastApp)
+                && now - lastApp < TimeSpan.FromSeconds(_options.AppCooldownSeconds))
+            {
+                Console.WriteLine($"[llm] 🤖 別的 App 在 {_options.AppCooldownSeconds} 秒內又 @ 了我 → 先不回" +
+                                  "（避免機器人互相回話；要調整設 LLM_APP_COOLDOWN_SECONDS）");
+                return;
+            }
+
+            _lastAppAt[key] = now;
+        }
 
         // 沒開 Message Content 意圖時，Discord 會把「沒有 @ 到 Bot」的訊息內容清空
         if (raw.Length == 0 && !mentioned)
@@ -172,14 +237,11 @@ public sealed class LlmChatService : IDisposable
         text = MentionFormatter.Expand(text, mentions, _options.ExposeUserIds);
 
         // ── 偷聽模式：這一則沒有 @ 它、也不是回覆它 ──────────
-        //   如果剛剛回過話（偷聽窗口還開著），就讓它聽一下並自己判斷要不要接話。
-        var addressed = mentioned || replyAddressed;
-
-        // 訊息 @ 了**別的真人**（不是 Bot）→ 那是在跟那個人說話，這是鐵證。
+        // 訊息 @ 了**別人**（真人／別的 App／身分組／@everyone）→ 那是在跟那個人說話，這是鐵證。
         // 交給 Core 處理：不插話、**不花錢判斷**，但**繼續偷聽**
         // （以前的版本在這裡直接停止偷聽 —— 一群人聊天時只要有人 @ 別人，
         //   之後的訊息就全部被忽略了）。
-        var mentionsOtherHuman = userMessage.MentionedUsers.Any(u => u.Id != botId && !u.IsBot);
+        var mentionsOther = facts.MentionsSomeoneElse;
 
         if (!addressed)
         {
@@ -218,7 +280,7 @@ public sealed class LlmChatService : IDisposable
         //   多人頻道裡第二個 @ 它的人會被**默默吃掉**（console 只有一行 log，
         //   使用者什麼都看不到）。使用者要的是「盡量每個人都回」，
         //   所以改成排隊，只有佇列真的滿了才丟（而且先丟閒聊、不丟 @ 它的）。
-        Enqueue(new QueuedMessage(userMessage, text, addressed, mentionsOtherHuman), now);
+        Enqueue(new QueuedMessage(userMessage, text, addressed, mentionsOther), now);
     }
 
     /// <summary>排隊中的一則（保留原訊息，回覆時要用它的頻道／訊息 ID）。</summary>
@@ -226,7 +288,11 @@ public sealed class LlmChatService : IDisposable
         SocketUserMessage Message,
         string Text,
         bool Addressed,
-        bool MentionsOtherHuman);
+        /// <summary>
+        /// 這一則 @ 了**別人**嗎（真人／別的 App／身分組／@everyone）——
+        /// 是的話就是在跟那個人說話，不要插話（見 <see cref="MessageAddress"/>）。
+        /// </summary>
+        bool MentionsOther);
 
     /// <summary>每個頻道的待處理佇列 ＋ 它的工人。</summary>
     private sealed class ChannelQueue
@@ -345,7 +411,7 @@ public sealed class LlmChatService : IDisposable
                 {
                     await AnswerAsync(
                         payload.Message, GuildOf(payload.Message), payload.Text,
-                        payload.Message.ReferencedMessage, payload.Addressed, payload.MentionsOtherHuman);
+                        payload.Message.ReferencedMessage, payload.Addressed, payload.MentionsOther);
 
                     if (merged.Length > 0)
                         Console.WriteLine($"[llm] ✔ 回覆完成{merged}（{DescribeWhere(GuildOf(payload.Message), payload.Message)}）");
@@ -637,7 +703,7 @@ public sealed class LlmChatService : IDisposable
         string text,
         IMessage? referenced,
         bool addressed = true,
-        bool mentionsOtherHuman = false)
+        bool mentionsOther = false)
     {
         // ── 圖片理解（只有「被明確指定」的那一則才會附圖）──────────
         //   1. 一定要是**對 Bot 說話**的訊息（@ 它、回覆它）—— 偷聽到的圖片不送
@@ -692,7 +758,7 @@ public sealed class LlmChatService : IDisposable
         {
             answer = await _chat.AskAsync(guildId, message.Channel.Id, incoming, replyTarget,
                                           cancellationToken: default, addressed: addressed,
-                                          mentionsOtherHuman: mentionsOtherHuman,
+                                          mentionsOther: mentionsOther,
                                           onReplying: StartTypingOnce,
                                           selfName: SelfNameIn(guildId, message));
         }
@@ -762,7 +828,14 @@ public sealed class LlmChatService : IDisposable
 
         var chunks = Split(replyText, MaxChunkChars);
         IMessage? sent = null;
-        var allowedMentions = ReplyMentions();
+
+        // 回覆別的 App 時**一個 ping 都不發**（連「回覆通知」也關掉）：
+        // 我們發出的通知就是對方繼續回話的燃料 —— 這是防「A @ 我、我 @ A」的第二道。
+        var toApp = message.Author.IsBot || message.Author.IsWebhook;
+
+        var allowedMentions = toApp
+            ? new AllowedMentions { AllowedTypes = AllowedMentionTypes.None, MentionRepliedUser = false }
+            : ReplyMentions();
 
         for (var i = 0; i < chunks.Count; i++)
         {

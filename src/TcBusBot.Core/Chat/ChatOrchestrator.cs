@@ -234,9 +234,13 @@ public sealed class ChatOrchestrator
     /// <c>false</c> 代表這是**偷聽到的**訊息：會先問 LLM「這是在跟我說話嗎」，
     /// 不是就回傳 <see cref="ChatAnswer.Ignored"/>（呼叫端不要送任何訊息）。
     /// </param>
-    /// <param name="mentionsOtherHuman">
-    /// 這一則 @ 了**別的真人**嗎（<paramref name="addressed"/> 為 false 時才有意義）。
-    /// 這是「在跟別人說話」的鐵證：不插話、**不花錢判斷**，但**繼續偷聽**。
+    /// <param name="mentionsOther">
+    /// 這一則 @ 了**別人**嗎（<paramref name="addressed"/> 為 false 時才有意義）。
+    /// 真人、**別的 App**、身分組、<c>@everyone</c> 都算 —— 這是「在跟別人說話」的鐵證：
+    /// 不插話、**不花錢判斷**，但**繼續偷聽**。
+    ///
+    /// ⚠️ 以前只算「真人」（`!u.IsBot`），所以「@ 某個 App」「@ 管理員」都會被當成
+    ///    在對它說話 → 它會插話（使用者實際回報的「誤把 @ 別人認為是自己」）。
     /// </param>
     /// <param name="onReplying">
     /// 「確定要回話了」的時機點 —— 呼叫端用它在頻道顯示「正在輸入…」。
@@ -259,7 +263,7 @@ public sealed class ChatOrchestrator
         ChatTurn? replyTarget,
         CancellationToken cancellationToken = default,
         bool addressed = true,
-        bool mentionsOtherHuman = false,
+        bool mentionsOther = false,
         Action? onReplying = null,
         string? selfName = null)
     {
@@ -298,11 +302,11 @@ public sealed class ChatOrchestrator
             if (_conversations.PeekListening(guildId, channelId, now) is null)
                 return Ignored(startedAt, "沒有在偷聽（沒有人對它說話）");
 
-            // ★「@ 了別人」＝ 鐵證：這句是在跟那個人說話。
+            // ★「@ 了別人」＝ 鐵證：這句是在跟那個人說話（真人／別的 App／身分組／@everyone）。
             //   不插話、**不問模型（不花錢）**，但**繼續偷聽** ——
             //   多人頻道裡 @ 別人太常見，以前在這裡直接停止偷聽，
             //   結果就是「有人 @ 別人之後，Bot 之後的訊息全部不理」。
-            if (mentionsOtherHuman)
+            if (mentionsOther)
             {
                 RecordAmbient(guildId, channelId, incoming, "偷聽到的訊息（@ 了別人）");
                 _conversations.TouchListen(guildId, channelId, now);

@@ -300,6 +300,11 @@ public sealed class BotConfig
                 ["LLM_USER_COOLDOWN_SECONDS"]).Value, out var cooldown) && cooldown >= 0)
             cfg.Llm.UserCooldownSeconds = cooldown;
 
+        // 別的 App 在同一個頻道連續 @ 我們的煞車（預設 30 秒；0 = 不限制）
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-app-cooldown", file,
+                ["LLM_APP_COOLDOWN_SECONDS"]).Value, out var appCooldown) && appCooldown is >= 0 and <= 3600)
+            cfg.Llm.AppCooldownSeconds = appCooldown;
+
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-timeout", file,
                 ["LLM_TIMEOUT_SECONDS"]).Value, out var llmTimeout) && llmTimeout is >= 5 and <= 600)
             cfg.Llm.RequestTimeoutSeconds = llmTimeout;
