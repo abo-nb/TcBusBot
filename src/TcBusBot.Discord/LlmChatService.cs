@@ -1055,14 +1055,10 @@ public sealed class LlmChatService : IDisposable
         //    停損改成靠 `/stop` ＋ 每小時上限（見 AppChatGuard）。
         var allowedMentions = toApp
             ? appChat
-                ? new AllowedMentions
-                {
-                    // 只允許「那一個 App」—— 型別上不可能 @everyone／身分組／其他人
-                    AllowedTypes = AllowedMentionTypes.Users,
-                    UserIds = [message.Author.Id],
-                    MentionRepliedUser = true
-                }
-                : new AllowedMentions { AllowedTypes = AllowedMentionTypes.None, MentionRepliedUser = false }
+                // 只允許「那一個 App」—— @everyone／身分組／其他人都不可能
+                // （⚠️ 一定要用 Mentions.OnlyUsers：Users 旗標與 UserIds 互斥，見那裡)
+                ? Mentions.OnlyUsers([message.Author.Id], mentionRepliedUser: true)
+                : Mentions.Silent()
             : ReplyMentions();
 
         for (var i = 0; i < chunks.Count; i++)
@@ -1209,9 +1205,7 @@ public sealed class LlmChatService : IDisposable
     /// mention 的文字是模型產生的，開放 @everyone／@身分組等於讓它有機會洗頻整個伺服器。
     /// </summary>
     private AllowedMentions ReplyMentions()
-        => _options.AllowMentions
-            ? new AllowedMentions { AllowedTypes = AllowedMentionTypes.Users }
-            : AllowedMentions.None;
+        => _options.AllowMentions ? Mentions.UsersAllowed() : Mentions.Silent();
 
     /// <summary>把「@Bot」那個 mention 拿掉（Discord 給的是 &lt;@123&gt; / &lt;@!123&gt;）。</summary>
     private static string StripMention(string content, ulong botId)

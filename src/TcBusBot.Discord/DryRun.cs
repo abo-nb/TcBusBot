@@ -1364,8 +1364,7 @@ public static class DryRun
 
         if (post is null)
             Problem("找不到 DigestRunner.PostAsync");
-        else if (!postCalls.Contains("AllowedMentions.set_AllowedTypes")
-                 || !postCalls.Contains("AllowedMentions.set_UserIds"))
+        else if (!postCalls.Contains("Mentions.OnlyUsers"))
             Problem("發週報時沒有把允許 @ 的對象限制成「那幾個使用者」—— @everyone／身分組會漏出去");
 
         var fetch = typeof(DigestRunner).GetMethod("FetchAsync",
@@ -1535,10 +1534,34 @@ public static class DryRun
 
         if (answer is null)
             Problem("找不到 LlmChatService.AnswerAsync");
-        else if (!answerCalls.Contains("AllowedMentions.set_UserIds"))
+        else if (!answerCalls.Contains("Mentions.OnlyUsers"))
             Problem("跟 App 對話時沒有把「允許 @ 的對象」限制成那一個 App —— 可能 @ 到別人");
         else if (!answerCalls.Contains("ChatOrchestrator.AskAsync"))
             Problem("回覆路徑沒有走 AskAsync");
+
+        // ── 3b) ★ `AllowedMentions` 的兩套寫法互斥（真的在線上炸過）──────
+        //    `AllowedTypes = Users` ＋ `UserIds = [...]` 一起設會丟
+        //    ArgumentException: The Users flag is mutually exclusive with the list of User Ids.
+        //    而那個例外是在**送出訊息時**才丟的（背景佇列／排程）——
+        //    使用者只看到「它什麼都沒說」。所以這裡直接驗 helper 的輸出。
+        var onlyUsers = Mentions.OnlyUsers([111UL, 222UL], mentionRepliedUser: true);
+        var silent = Mentions.Silent();
+        var everyoneAllowed = Mentions.UsersAllowed();
+
+        if (onlyUsers.AllowedTypes is not null && onlyUsers.UserIds.Count > 0)
+            Problem("Mentions.OnlyUsers 同時設了 AllowedTypes 與 UserIds —— 送出時會丟 ArgumentException");
+        else if (onlyUsers.AllowedTypes is not null
+                 || !onlyUsers.UserIds.SequenceEqual([111UL, 222UL])
+                 || onlyUsers.MentionRepliedUser != true)
+            Problem("Mentions.OnlyUsers 的內容不對（應該只有 UserIds、AllowedTypes 維持 null）");
+        else if (silent.AllowedTypes != AllowedMentionTypes.None || silent.UserIds.Count > 0)
+            Problem("Mentions.Silent 不是「完全安靜」");
+        else if (everyoneAllowed.AllowedTypes != AllowedMentionTypes.Users || everyoneAllowed.UserIds.Count > 0)
+            Problem("Mentions.UsersAllowed 不是「不限制名單」");
+        else if (Mentions.OnlyUsers([]).UserIds.Count > 0 || Mentions.OnlyUsers([]).AllowedTypes != AllowedMentionTypes.None)
+            Problem("Mentions.OnlyUsers 空名單應該等於 Silent（不該送出空的使用者清單）");
+        else
+            Console.WriteLine("  ✔ AllowedMentions 的兩套寫法沒有混用（OnlyUsers／Silent／UsersAllowed 各自正確）");
 
         // 「你在跟另一個機器人講話」那一段是 `const`（編譯器會內嵌），IL 掃不到 ——
         // 所以它由 `tcbus selftest` 的行為測試蓋：餵一個 fromApp 的訊息，
@@ -3035,9 +3058,10 @@ public static class DryRun
         // 回覆別的 App 時不可以發任何 ping（否則我們的通知就是對方繼續回話的燃料）
         var replyCalls = answer is null ? [] : CollectCalls(answer, resolveAll: true);
 
-        if (!replyCalls.Contains("AllowedMentions.set_AllowedTypes")
-            || !replyCalls.Contains("AllowedMentions.set_MentionRepliedUser"))
-            Problem("回覆別的 App 時沒有關掉 ping／回覆通知 —— 會變成「A @ 我、我 @ A」的循環");
+        // 回覆別的 App 時不可以發任何 ping（否則我們的通知就是對方繼續回話的燃料）：
+        // 非對話模式下用 Mentions.Silent，對話模式下用 Mentions.OnlyUsers（只 @ 那一個）
+        if (!replyCalls.Contains("Mentions.Silent") || !replyCalls.Contains("Mentions.OnlyUsers"))
+            Problem("回覆別的 App 時沒有關掉 ping／限制 @ 的對象 —— 會變成「A @ 我、我 @ A」的循環");
 
         var appRules = new[]
         {

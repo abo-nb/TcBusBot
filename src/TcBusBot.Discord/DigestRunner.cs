@@ -378,11 +378,10 @@ public sealed class DigestRunner
             .WithFooter(footer)
             .Build();
 
-        var allowed = new AllowedMentions
-        {
-            AllowedTypes = AllowedMentionTypes.Users,
-            UserIds = mentions.Select(m => m.UserId).ToList()
-        };
+        // ⚠️ 一定要用 Mentions.OnlyUsers：`Users` 旗標與 `UserIds` 互斥，
+        //    兩個一起設會在**送出訊息時**丟 ArgumentException ——
+        //    而那是背景排程在跑的，使用者只會看到「這一週沒收到週報」。
+        var allowed = Mentions.OnlyUsers(mentions.Select(m => m.UserId));
 
         // 有進度訊息就把它改成成品（不刪不重發：頻道只跳一次通知、時間軸只有一份週報）
         if (placeholder is not null)
