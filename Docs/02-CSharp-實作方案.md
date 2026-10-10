@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 795 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 800 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 795 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 800 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -4524,6 +4524,32 @@ MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply
 | `tcbus selftest` 第 31 節（新增 23 項） | **每個頻道各自啟用**：沒啟用 → 用主機預設；`/chat enable` → 那個頻道才會回（其他頻道不受影響）；`app:` 只跟一個 App（其他 App 仍然只看到）；`cap:` 只改那個頻道；`/chat disable` 回到預設；**設定跨重啟**；`chat` 模式辨識（`Decide` ＋ `IsAppChat` ＋ 中英文設定值）；每小時上限（到了就擋、下一小時自動恢復、0 ＝ 不限制）、`/stop` 之後連下一小時也不恢復、**有真人找他才恢復**、狀態上限；`AppChatNote` 真的被放進送出去的 system prompt，而真人訊息不會多那一段 |
 | `--dryrun` 新增「App 對話檢查」 | `/stop` 真的呼叫 `AppChatGuard.Stop`／`StopAll`；**`/chat enable`／`disable` 真的先問 `IsAdmin`（而 `IsAdmin` 真的讀 `LLM_ADMIN_IDS` ＋ 比對發話者）**，而且真的寫進 `AppChatGuard.Enable`；訊息入口真的問 `ModeFor`（照**那個頻道**的設定）、`BlockReason`、`RecordAppReply`、在真人找他時 `Resume`；回覆 App 時真的限制 `AllowedMentions.UserIds`；`Persist` 真的寫 `ILlmStateStore.SetBlob` |
 | 三個坑 | `AppChatNote` 是 `const`（編譯器內嵌）→ IL 掃描看不到，所以改用**行為測試**；`AppChatGuard` 的「啟動時讀回」在建構子裡（掃描工具只吃 `MethodInfo`）→ 也交給行為測試；授權寫在 `IsAdmin` 屬性裡 → 要驗的是「有沒有走那道門」＋「門本身讀什麼」 |
+
+#### 20.31.5 `/chat reply`：手動叫它回「那個機器人剛剛那句」
+
+使用者的追加需求：**「加個小的指令，可以直接讓他回覆（手動，類似 say）最近的、指定的那個 bot 的訊息」**。
+也就是「自動對話」之外，還要一個**當場、一次一句**的手動扳機（跟 `/say` 同一個精神）。
+
+| 決定 | 為什麼 |
+| --- | --- |
+| **不用先 `/chat enable`** | 「我只想讓它回這一句」不該逼人開啟整條自動迴圈 |
+| **一定要 @ 對方** | 跟自動對話同一個理由：多數機器人只認 mention，不叫它不會動 |
+| **算「有真人找他」→ 會解除 `/stop`** | 管理員正在對它下指令，那就是「有真人找他」 |
+| **不計入每小時上限** | 上限是為了擋**自動迴圈**；人手動一句一句下的本身就有節制 |
+| **指定的 App 找不到就說「找不到」** | 不可以退而求其次回別的 App —— 那會變成「我叫你回 A，你回 B」 |
+| **跟 App 對話時不掛任何按鈕** | 面板／復原按鈕是給人按的，而且會用「發話者」開面板 session —— 等於替那個 App 開一個 session |
+| **管理員的 `hint:` 走系統提示，不塞進訊息內容** | 訊息內容代表「對方說了什麼」，塞進去會讓它以為那是機器人講的（而且會寫進對話記憶）。所以包成【這次的額外指示】（來自管理員） |
+
+實作時踩到兩個 Discord.Net 的型別細節（都是「不處理就會直接壞掉」的那種）：
+
+1. **REST 抓回來的訊息不是 `SocketUserMessage`**：`GetMessagesAsync` 回的是 `SocketMessage`
+   （只有閘道事件才有 `SocketUserMessage`）。所以回覆路徑的參數型別放寬成 **`IUserMessage`**
+   （兩者都實作它），`BuildTurn`／`BuildUiComponents`／`BuildUndoComponents`／`ExpandMentions`／
+   `SelfNameIn`／`DescribeWhere` 跟著放寬成 `IMessage`。
+2. **挑選規則抽成 Core 的 `AppReplyTarget.Latest`**（純函式）：
+   「最近一則**別的 App** 的訊息」——不回自己的（會自言自語）、不回真人的、
+   指定了 App 就只挑那一個（挑不到回 null）。這些挑錯都不會拋例外，只會回一句莫名其妙的話，
+   所以每一條都要能離線測（selftest 第 31 節新增 5 項）。
 
 ---
 

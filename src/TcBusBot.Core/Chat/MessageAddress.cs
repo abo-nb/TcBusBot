@@ -108,6 +108,34 @@ public enum MessageHandling
 }
 
 /// <summary>
+/// 「手動叫他回某個 App 的訊息」（`/chat reply`）用的挑選規則。
+///
+/// 為什麼把規則抽出來：這裡要挑的是「**最近一則別的 App 的訊息**」，
+/// 而挑錯的代價很具體 —— 回錯人（回到自己的訊息）、回到已經被回過的、
+/// 或是指定了 App 卻挑到別的 App。這些都不會拋例外，只會回一句莫名其妙的話。
+/// </summary>
+public static class AppReplyTarget
+{
+    /// <summary>挑選用的一則訊息（由 Discord 那一層投影出來的純資料）。</summary>
+    public sealed record Candidate(string Id, ulong AuthorId, bool IsBot, DateTimeOffset At, string Preview);
+
+    /// <summary>
+    /// 挑出最近一則「別的 App」的訊息。
+    ///
+    /// <paramref name="appId"/> 給了就只挑那一個 App（挑不到回 null ——
+    /// **不可以**退而求其次挑別的 App：那會變成「我叫你回 A，你回 B」）。
+    /// </summary>
+    public static Candidate? Latest(
+        IEnumerable<Candidate> messages, ulong selfBotId, ulong appId = 0)
+        => messages
+            .Where(m => m.IsBot)
+            .Where(m => m.AuthorId != selfBotId)          // 不回自己的訊息（會自言自語）
+            .Where(m => appId == 0 || m.AuthorId == appId)
+            .OrderByDescending(m => m.At)
+            .FirstOrDefault();
+}
+
+/// <summary>
 /// 從 <see cref="MessageFacts"/> 算出「要不要處理這一則」。
 ///
 /// 規則集中成一個純函式，是因為這裡的每一條都是**安全與禮貌**問題：

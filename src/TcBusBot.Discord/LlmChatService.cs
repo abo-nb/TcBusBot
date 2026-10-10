@@ -345,7 +345,7 @@ public sealed class LlmChatService : IDisposable
     /// ⚠️ 這裡刻意用 `foreach` 而不是 LINQ：`ToDictionary(..., g => …)` 會把呼叫藏進
     ///    編譯器生成的閉包方法裡，`--dryrun` 的 IL 掃描就看不到「這條規則真的接上了」。
     /// </summary>
-    private string ExpandMentions(SocketMessage message, ulong botId)
+    private string ExpandMentions(IMessage message, ulong botId)
     {
         var known = new Dictionary<ulong, string>();
 
@@ -410,6 +410,76 @@ public sealed class LlmChatService : IDisposable
                               $"{MentionFormatter.SpeakerName(author?.DisplayName, message.Author.Username, id, false)}：" +
                               $"{Preview(text)}" +
                               (facts.MentionsSomeoneElse ? "（它 @ 了別人）" : ""));
+    }
+
+    /// <summary>
+    /// **手動叫它回某一個 App 的訊息**（`/chat reply`）—— 一次性的，跟 `/say` 同一個精神：
+    /// 人不只是旁觀，還可以指定「回這一句」。
+    ///
+    /// 為什麼要有這個（即使已經有 `/chat enable` 自動對話）：
+    ///   * 自動對話要**先啟用**，而「我只想讓它回這一句」不該逼人開啟整條自動迴圈
+    ///   * 沒有啟用的頻道也可以單獨用一次（臨時、可控、一次一句）
+    ///
+    /// 幾個刻意的行為：
+    ///   * **算「有真人找他」** → 會解除 `/stop`（管理員正在跟它說話）
+    ///   * **不受每小時上限限制、也不記在額度裡** —— 那是人手動一句一句下的，
+    ///     上限是為了擋「自動迴圈」，不該擋人
+    ///   * **一定 @ 對方**（不然多數機器人根本不會動）
+    ///   * 指定的 App 找不到訊息時**不回別人的**（見 <see cref="AppReplyTarget.Latest"/>）
+    /// </summary>
+    public async Task<string> ReplyToAppAsync(
+        SocketTextChannel channel, ulong? appId, string? hint, CancellationToken ct = default)
+    {
+        var selfId = _client.CurrentUser?.Id ?? 0;
+
+        // 抓最近幾則來挑（Discord 一次最多 100；50 則足夠找到「剛剛那句」）
+        var recent = (await channel.GetMessagesAsync(50).FlattenAsync()).ToList();
+
+        var candidate = AppReplyTarget.Latest(
+            recent.Select(m => new AppReplyTarget.Candidate(
+                m.Id.ToString(), m.Author.Id, m.Author.IsBot, m.Timestamp, Preview(m.Content ?? ""))),
+            selfId,
+            appId ?? 0);
+
+        if (candidate is null)
+        {
+            return appId is null
+                ? "我找不到這個頻道裡有其他 App（機器人／webhook）的訊息。"
+                : $"我在最近 50 則訊息裡找不到 <@{appId}> 的發言。";
+        }
+
+        var target = recent.FirstOrDefault(m => m.Id.ToString() == candidate.Id) as IUserMessage;
+
+        if (target is null) return "找不到那一則訊息（它可能被刪掉了）。";
+
+        // 管理員正在跟它說話 → 解除先前的 /stop（跟真人 @ 它的規則一致）
+        if (_appChat.Resume(channel.Id))
+            Console.WriteLine($"[App 對話] /chat reply 解除 {channel.Id} 的 /stop（有真人下指令）");
+
+        var text = ExpandMentions(target, botId: 0).Trim();
+
+        if (text.Length == 0) text = "（沒有文字，可能是圖片或貼圖）";
+
+        Console.WriteLine($"[App 對話] 手動回覆：{channel.Id}｜對象 {target.Author.Id}" +
+                          $"（{MentionFormatter.SpeakerName(null, target.Author.Username, target.Author.Id, false)}）" +
+                          $"{Preview(text)}");
+
+        var guildId = channel.Guild?.Id ?? 0;
+
+        var answer = await AnswerAsync(
+            target, guildId, text, referenced: null,
+            addressed: true, mentionsOther: false,
+            forceAppChat: true, extraNote: hint);
+
+        if (answer is null) return "沒有送出任何訊息（被判斷成不需要回話）。";
+
+        if (answer.Refused)
+            return $"⛔ 沒有回覆：{answer.Error}\n（額度不足時可以用 `/ai status` 的「♻️ 重置本週額度」）";
+
+        if (!answer.Ok) return $"❌ 回覆失敗：{answer.Error}";
+
+        return $"✅ 已回覆 <@{target.Author.Id}> 的訊息（{answer.InputTokens + answer.OutputTokens:N0} tokens、" +
+               $"{answer.Elapsed.TotalSeconds:0.0} 秒）";
     }
 
     /// <summary>排隊中的一則（保留原訊息，回覆時要用它的頻道／訊息 ID）。</summary>
@@ -785,7 +855,7 @@ public sealed class LlmChatService : IDisposable
     ///   * <c>PromptLabel</c>：主對話的標籤，一定同時帶帳號與 ID（`LLM_EXPOSE_IDS`），
     ///     所以就算兩個人剛好取同一個暱稱也分得出來。
     /// </summary>
-    private ChatTurn BuildTurn(SocketUserMessage message, string text)
+    private ChatTurn BuildTurn(IUserMessage message, string text)
         => new(
             ChatRole.User,
             NameOf(message.Author),
@@ -816,7 +886,7 @@ public sealed class LlmChatService : IDisposable
     /// 為什麼要傳給 Core：伺服器把 Bot 改叫「貓貓」之後，有人喊「貓貓」它要知道那是在叫它 ——
     /// 判斷「這句話是不是在對我說話」時尤其重要（判斷器問的是「你是『誰』」）。
     /// </summary>
-    private string SelfNameIn(ulong guildId, SocketMessage message)
+    private string SelfNameIn(ulong guildId, IMessage message)
     {
         if (!_options.ShowNicknames || !_options.TellSelfName) return _client.CurrentUser?.Username ?? "Bot";
 
@@ -826,13 +896,15 @@ public sealed class LlmChatService : IDisposable
         return HostNameOf(guild?.CurrentUser ?? (IUser?)_client.CurrentUser!);
     }
 
-    private async Task AnswerAsync(
-        SocketUserMessage message,
+    private async Task<ChatAnswer?> AnswerAsync(
+        IUserMessage message,
         ulong guildId,
         string text,
         IMessage? referenced,
         bool addressed = true,
-        bool mentionsOther = false)
+        bool mentionsOther = false,
+        bool forceAppChat = false,
+        string? extraNote = null)
     {
         // ── 圖片理解（只有「被明確指定」的那一則才會附圖）──────────
         //   1. 一定要是**對 Bot 說話**的訊息（@ 它、回覆它）—— 偷聽到的圖片不送
@@ -890,7 +962,8 @@ public sealed class LlmChatService : IDisposable
                                           mentionsOther: mentionsOther,
                                           onReplying: StartTypingOnce,
                                           selfName: SelfNameIn(guildId, message),
-                                          fromApp: message.Author.IsBot || message.Author.IsWebhook);
+                                          fromApp: message.Author.IsBot || message.Author.IsWebhook,
+                                          extraNote: extraNote);
         }
         finally
         {
@@ -906,7 +979,7 @@ public sealed class LlmChatService : IDisposable
         {
             Console.WriteLine($"[llm] 👂 {answer.IgnoreReason}｜沒有送出訊息，" +
                               "也沒有顯示「正在輸入…」｜" + where);
-            return;
+            return answer;
         }
 
         // ── log（每一則都留下「為什麼這樣回答」與用量）──────
@@ -946,8 +1019,8 @@ public sealed class LlmChatService : IDisposable
         // mention 寫在 embed 裡不會觸發通知，而且多數機器人只認「被 @ 到」才會有反應 ——
         // 不叫它，兩邊就聊不起來。（允許清單只放那一個 App，見下面的 allowedMentions）
         var toApp = message.Author.IsBot || message.Author.IsWebhook;
-        var appChat = toApp && MessageAddress.IsAppChat(
-            _appChat.ModeFor(message.Channel.Id, message.Author.Id, _options.AppMessages));
+        var appChat = toApp && (forceAppChat || MessageAddress.IsAppChat(
+            _appChat.ModeFor(message.Channel.Id, message.Author.Id, _options.AppMessages)));
 
         if (appChat && answer.Ok && replyText.Length > 0)
             replyText = $"<@{message.Author.Id}> {replyText}";
@@ -959,10 +1032,15 @@ public sealed class LlmChatService : IDisposable
                          "請再說一次（或直接告訴我要做什麼）。";
 
         // LLM 做的破壞性操作也要能一鍵還原（取消訂閱 → 掛「↩️ 復原」按鈕）
-        var components = BuildUndoComponents(message);
+        //
+        // ⚠️ 跟機器人對話時**不掛任何元件**：那些按鈕是給人按的（面板、復原），
+        //    而且它們會用「發話者」去建面板 session —— 在跟另一個 App 講話時
+        //    等於替那個 App 開了一個 session，沒有意義又會污染狀態。
+        var components = appChat ? null : BuildUndoComponents(message);
 
         // 模型要求「畫面上要出現什麼元件」（開面板／路線清單／到站時間）→ 附上真正的按鈕
-        var uiComponents = BuildUiComponents(guildId, message);
+        // （同樣的道理：跟 App 對話時不掛）
+        var uiComponents = appChat ? null : BuildUiComponents(guildId, message);
 
         if (uiComponents is not null) components = uiComponents;
 
@@ -1011,6 +1089,8 @@ public sealed class LlmChatService : IDisposable
                 _client.CurrentUser?.Username ?? "Bot",
                 DateTimeOffset.UtcNow);
         }
+
+        return answer;
     }
 
     // ─────────────────────────────────────────────────────
@@ -1032,7 +1112,7 @@ public sealed class LlmChatService : IDisposable
     /// 所以使用者看到的面板狀態是真的 —— 附上元件之後他可以接手自己點，
     /// 不用再打一次 `/bus panel`。
     /// </summary>
-    private MessageComponent? BuildUiComponents(ulong guildId, SocketUserMessage message)
+    private MessageComponent? BuildUiComponents(ulong guildId, IUserMessage message)
     {
         if (_chat.Tools is not BotToolProvider provider) return null;
         if (provider.TakePendingUi() is not { } request) return null;
@@ -1084,7 +1164,7 @@ public sealed class LlmChatService : IDisposable
     public void RecordAmbient(ulong guildId, ulong channelId, ChatTurn turn, string reason)
         => _chat.RecordAmbient(guildId, channelId, turn, reason);
 
-    private MessageComponent? BuildUndoComponents(SocketUserMessage message)
+    private MessageComponent? BuildUndoComponents(IUserMessage message)
     {
         if (_chat.Tools is not BotToolProvider busTools) return null;
         if (busTools.TakePendingUndo() is not { Count: > 0 } removed) return null;
@@ -1143,7 +1223,7 @@ public sealed class LlmChatService : IDisposable
             .Replace($"<@!{botId}>", "", StringComparison.Ordinal);
     }
 
-    private static string DescribeWhere(ulong guildId, SocketMessage message)
+    private static string DescribeWhere(ulong guildId, IMessage message)
     {
         var where = guildId == 0
             ? "私訊"

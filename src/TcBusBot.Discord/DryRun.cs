@@ -1461,7 +1461,7 @@ public static class DryRun
         //      而且啟用的人應該在那裡看得到成果、隨時能停。
         foreach (var (method, label) in new[]
                  {
-                     ("EnableAsync", "啟用"), ("DisableAsync", "關閉")
+                     ("EnableAsync", "啟用"), ("DisableAsync", "關閉"), ("ReplyAsync", "手動回覆")
                  })
         {
             var info = typeof(AppChatModule).GetMethod(method);
@@ -1495,6 +1495,19 @@ public static class DryRun
 
         if (enable is not null && !enableCalls.Contains("AppChatGuard.Enable"))
             Problem("/chat enable 沒有真的寫進設定（啟用了卻不會生效）");
+
+        // 手動回覆（`/chat reply`）：挑訊息、真的回、而且算「有真人找他」
+        var replyAsync = typeof(LlmChatService).GetMethod(nameof(LlmChatService.ReplyToAppAsync));
+        var replyCalls = replyAsync is null ? [] : CollectCalls(replyAsync, resolveAll: true);
+
+        if (replyAsync is null)
+            Problem("找不到 LlmChatService.ReplyToAppAsync（/chat reply 不會動）");
+        else if (!replyCalls.Contains("AppReplyTarget.Latest"))
+            Problem("/chat reply 沒有用共用的挑選規則 —— 可能回到自己的訊息或回錯 App");
+        else if (!replyCalls.Contains("AppChatGuard.Resume"))
+            Problem("/chat reply 沒有算「有真人找他」—— /stop 之後管理員下指令也回不了");
+        else if (!replyCalls.Contains("LlmChatService.AnswerAsync"))
+            Problem("/chat reply 沒有走正常回覆路徑（打字動畫、@ 對方、記錄都會少）");
 
         // ── 2) 入口真的會問「能不能聊」而且會記帳 ────────────────
         var handle = typeof(LlmChatService).GetMethod("HandleCoreAsync",

@@ -4119,6 +4119,38 @@ public static class SelfTest
             perChannel.EnabledChannels().Contains(chatChannel)
             && perChannel.Describe().Contains("啟用", StringComparison.Ordinal));
 
+        // ── 1e) 「手動叫他回某個 App 的最新訊息」（/chat reply）─────────
+        //      要挑的是「最近一則**別的 App** 的訊息」——挑錯的代價很具體：
+        //      回到自己的訊息（自言自語）、回到別人的、或指定了 A 卻回 B。
+        var pickAt = guardStart;
+        var candidates = new List<AppReplyTarget.Candidate>
+        {
+            new("1", 111UL, IsBot: false, pickAt.AddMinutes(1), "小明：304 有到嗎"),      // 真人
+            new("2", 4444UL, IsBot: true, pickAt.AddMinutes(2), "通知機器人：300 五分鐘"),  // 別的 App
+            new("3", 999UL, IsBot: true, pickAt.AddMinutes(3), "我自己：上一句回覆"),        // 我們自己
+            new("4", 5555UL, IsBot: true, pickAt.AddMinutes(4), "簽到機器人：已簽到")        // 另一個 App
+        };
+
+        var picked = AppReplyTarget.Latest(candidates, selfBotId: 999UL);
+
+        Check("★ 手動回覆：挑「最近一則別的 App 的訊息」，而且不會挑到自己",
+            picked?.Id == "4", picked?.Preview);
+
+        Check("★ 指定 App 時只挑那一個（挑不到就回 null，不會退而求其次回別人）",
+            AppReplyTarget.Latest(candidates, 999UL, appId: 4444UL)?.Id == "2"
+            && AppReplyTarget.Latest(candidates, 999UL, appId: 1234UL) is null);
+
+        Check("★ 只有真人的訊息時 → 挑不到（不會去回人類，那用 @ 它就好）",
+            AppReplyTarget.Latest(candidates.Where(c => !c.IsBot), 999UL) is null);
+
+        Check("★ 只有自己的訊息時 → 挑不到（不然會自言自語）",
+            AppReplyTarget.Latest(candidates.Where(c => c.AuthorId == 999UL), 999UL) is null);
+
+        Check("★ 手動回覆的額外指示要標成「管理員的指令」（不然它會去回那句指令）",
+            ChatOrchestrator.ExtraNoteText("用一句話回他").Contains("來自管理員", StringComparison.Ordinal)
+            && ChatOrchestrator.ExtraNoteText(null).Length == 0
+            && ChatOrchestrator.ExtraNoteText("  ").Length == 0);
+
         // ── 1c) 那一段真的會被送進提示詞（不是只寫在常數裡）─────────
         //      為什麼要驗行為：`AppChatNote` 是 const，編譯器會內嵌 ——
         //      `--dryrun` 的 IL 掃描看不到它，只有「真的送出去的那一份 prompt」能證明。

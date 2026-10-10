@@ -23,11 +23,13 @@ public sealed class AppChatModule : BusModuleBase
 {
     private readonly AppChatGuard _guard;
     private readonly LlmOptions _llm;
+    private readonly LlmChatService _chat;
 
-    public AppChatModule(AppChatGuard guard, LlmOptions llm)
+    public AppChatModule(AppChatGuard guard, LlmOptions llm, LlmChatService chat)
     {
         _guard = guard;
         _llm = llm;
+        _chat = chat;
     }
 
     private bool IsAdmin => _llm.AdminUserIds.Contains(Context.User.Id);
@@ -121,6 +123,53 @@ public sealed class AppChatModule : BusModuleBase
             "⏹ 已關掉這個頻道的「跟其他 App 對話」。\n" +
             "它還是看得到其他 App 的訊息（會記進上下文），但不會再回話了。\n" +
             "（設定留著 —— 要再開隨時 `/chat enable`。）",
+            ephemeral: true);
+    }
+
+    [SlashCommand("reply", "手動叫它回某一個機器人最新的訊息（Bot 管理員；一次一句）")]
+    public async Task ReplyAsync(
+        [Summary("app", "要回哪一個機器人（留空＝這個頻道最近一個開口的 App）")] SocketUser? app = null,
+        [Summary("hint", "給它的額外指示，例如「用一句話回他」（留空＝自然回）")] string? hint = null)
+    {
+        if (!IsAdmin)
+        {
+            await RespondAsync(AdminOnlyMessage(), ephemeral: true);
+            return;
+        }
+
+        if (Context.Channel is not SocketTextChannel channel)
+        {
+            await RespondAsync("這個指令要在伺服器文字頻道裡使用。", ephemeral: true);
+            return;
+        }
+
+        if (app is not null && !app.IsBot && !app.IsWebhook)
+        {
+            await RespondAsync(
+                $"❌ `{app.Username}` 不是 App（機器人／webhook）—— 這個指令是設計來回機器人的。",
+                ephemeral: true);
+            return;
+        }
+
+        // 要讀歷史 ＋ 呼叫模型，會超過 Discord 的 3 秒互動時限 → 先 defer
+        await DeferAsync(ephemeral: true);
+
+        string result;
+
+        try
+        {
+            result = await _chat.ReplyToAppAsync(channel, app?.Id, hint, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            result = $"❌ 回覆時出錯：{(ex is LlmException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}")}";
+        }
+
+        await FollowupAsync(
+            result +
+            (result.StartsWith("✅", StringComparison.Ordinal)
+                ? "\n-# 這一則不計入每小時上限（那是人手動下的指令）"
+                : ""),
             ephemeral: true);
     }
 

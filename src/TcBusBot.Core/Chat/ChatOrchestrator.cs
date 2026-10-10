@@ -229,6 +229,22 @@ public sealed class ChatOrchestrator
     /// 呼叫端只要把 <see cref="ChatAnswer.Text"/> 貼出去就好 ——
     /// Discord 的事件處理裡丟例外有可能影響連線。
     /// </summary>
+    /// <summary>
+    /// 「這一次的額外指示」那一段（`/chat reply hint:…` 用）。
+    ///
+    /// 為什麼要包一層而不是直接把字串接上去：要讓模型清楚知道
+    /// **這段話是管理員下的指令、不是對方說的話**（不然它會去回那句指令本身）。
+    /// </summary>
+    public static string ExtraNoteText(string? extraNote)
+        => string.IsNullOrWhiteSpace(extraNote)
+            ? ""
+            : $"""
+
+
+                【這次的額外指示】（來自管理員，不是對方說的話）
+                {extraNote.Trim()}
+                """;
+
     /// <param name="addressed">
     /// 這一則有沒有明確對 Bot 說話（@ 提及或回覆）。
     /// <c>false</c> 代表這是**偷聽到的**訊息：會先問 LLM「這是在跟我說話嗎」，
@@ -258,6 +274,12 @@ public sealed class ChatOrchestrator
     /// 這一則來自**另一個 App**（機器人／webhook）。
     /// 為 true 時會把 <see cref="AppChatNote"/> 附加到系統提示後面 ——
     /// 讓它知道自己在跟機器人講話（見那段說明）。
+    /// </param>
+    /// <param name="extraNote">
+    /// **這一次的額外指示**（來自管理員，例如 `/chat reply hint:用一句話回他`）。
+    ///
+    /// 為什麼放在系統提示而不是訊息內容：訊息內容代表「對方說了什麼」，
+    /// 把人的指示塞進去會讓它以為是那個機器人講的（而且會寫進對話記憶）。
     /// </param>
     /// <param name="mentionsOther">
     /// 這一則 @ 了**別人**嗎（<paramref name="addressed"/> 為 false 時才有意義）。
@@ -291,7 +313,8 @@ public sealed class ChatOrchestrator
         bool mentionsOther = false,
         Action? onReplying = null,
         string? selfName = null,
-        bool fromApp = false)
+        bool fromApp = false,
+        string? extraNote = null)
     {
         var startedAt = DateTimeOffset.UtcNow;
         var now = DateTimeOffset.UtcNow;
@@ -466,7 +489,8 @@ public sealed class ChatOrchestrator
                 ambientContext: trimmed.Turns.Any(t => t.Ambient),
                 selfName: selfName,
                 cityNote: CityNoteFor(incoming.AuthorId))
-                + (fromApp ? AppChatNote : ""),
+                + (fromApp ? AppChatNote : "")
+                + ExtraNoteText(extraNote),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,
