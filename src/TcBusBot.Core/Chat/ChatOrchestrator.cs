@@ -234,6 +234,31 @@ public sealed class ChatOrchestrator
     /// <c>false</c> 代表這是**偷聽到的**訊息：會先問 LLM「這是在跟我說話嗎」，
     /// 不是就回傳 <see cref="ChatAnswer.Ignored"/>（呼叫端不要送任何訊息）。
     /// </param>
+    /// <summary>
+    /// 「你正在跟另一個 App 對話」那一段。
+    ///
+    /// 為什麼需要：使用者要兩個機器人自由聊天（沒有題目、沒有腳本）。
+    /// 少了這一段，模型會用**服務台語氣**回一個機器人（「我幫你查一下…」），
+    /// 或把它的公告當成人類的請求 —— 兩個機器人很快就會講出無意義的迴圈。
+    /// </summary>
+    public const string AppChatNote =
+        """
+
+
+        【你正在跟另一個 App 對話】
+        剛剛那一則標著 `[App]` 的是**另一個機器人**（不是你的人類使用者）說的。
+        使用者要你們自由聊，所以你可以自然接話，但請記得：
+        • 不要假裝自己是人類，也不要說「我幫你查」「請問需要什麼」那種服務台語氣
+        • 不要 @everyone／@here，也不要召喚其他同事或使用者
+        • 可以聊公車、這個頻道的事、或它剛剛說的話；也可以問它問題
+        • 沒話說就誠實說沒話說（不要為了接話而編內容）
+        """;
+
+    /// <param name="fromApp">
+    /// 這一則來自**另一個 App**（機器人／webhook）。
+    /// 為 true 時會把 <see cref="AppChatNote"/> 附加到系統提示後面 ——
+    /// 讓它知道自己在跟機器人講話（見那段說明）。
+    /// </param>
     /// <param name="mentionsOther">
     /// 這一則 @ 了**別人**嗎（<paramref name="addressed"/> 為 false 時才有意義）。
     /// 真人、**別的 App**、身分組、<c>@everyone</c> 都算 —— 這是「在跟別人說話」的鐵證：
@@ -265,7 +290,8 @@ public sealed class ChatOrchestrator
         bool addressed = true,
         bool mentionsOther = false,
         Action? onReplying = null,
-        string? selfName = null)
+        string? selfName = null,
+        bool fromApp = false)
     {
         var startedAt = DateTimeOffset.UtcNow;
         var now = DateTimeOffset.UtcNow;
@@ -439,7 +465,8 @@ public sealed class ChatOrchestrator
                 admin.IsAdmin,
                 ambientContext: trimmed.Turns.Any(t => t.Ambient),
                 selfName: selfName,
-                cityNote: CityNoteFor(incoming.AuthorId)),
+                cityNote: CityNoteFor(incoming.AuthorId))
+                + (fromApp ? AppChatNote : ""),
             History: trimmed.Turns,
             Incoming: incoming,
             MaxTokens: _options.MaxOutputTokens,

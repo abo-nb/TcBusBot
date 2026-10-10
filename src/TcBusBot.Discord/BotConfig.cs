@@ -316,6 +316,11 @@ public sealed class BotConfig
                 ["LLM_MAX_APP_TURNS"]).Value, out var maxAppTurns) && maxAppTurns is >= 1 and <= 48)
             cfg.Llm.MaxAppTurnsPerSegment = maxAppTurns;
 
+        // 「跟另一個 App 對話」時每個頻道每小時最多回幾句（0 = 不限制）
+        if (int.TryParse(SettingResolver.Resolve(args, "--llm-app-chat-per-hour", file,
+                ["LLM_APP_CHAT_PER_HOUR"]).Value, out var appChatPerHour) && appChatPerHour is >= 0 and <= 1000)
+            cfg.Llm.AppChatPerHour = appChatPerHour;
+
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-timeout", file,
                 ["LLM_TIMEOUT_SECONDS"]).Value, out var llmTimeout) && llmTimeout is >= 5 and <= 600)
             cfg.Llm.RequestTimeoutSeconds = llmTimeout;

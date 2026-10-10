@@ -37,6 +37,7 @@ public sealed class LlmChatService : IDisposable
     private readonly ChatOrchestrator _chat;
     private readonly LlmOptions _options;
     private readonly BusSessionStore _sessions;
+    private readonly AppChatGuard _appChat;
 
     private readonly ConcurrentDictionary<ulong, DateTimeOffset> _lastAskedAt = new();
 
@@ -62,13 +63,18 @@ public sealed class LlmChatService : IDisposable
         DiscordSocketClient client,
         ChatOrchestrator chat,
         LlmOptions options,
-        BusSessionStore sessions)
+        BusSessionStore sessions,
+        AppChatGuard appChat)
     {
         _client = client;
         _chat = chat;
         _options = options;
         _sessions = sessions;
+        _appChat = appChat;
     }
+
+    /// <summary>`/stop` 與「每小時上限」的狀態（**持久化**：重啟不會讓迴圈從頭開始）。</summary>
+    public AppChatGuard AppChat => _appChat;
 
     public int Handled => _handled;
     public int Failed => _failed;
@@ -171,6 +177,15 @@ public sealed class LlmChatService : IDisposable
 
         var handling = MessageAddress.Decide(facts, _options.AppMessages);
 
+        // ── 有真人找他 → 解除 `/stop` ─────────────────────────
+        //    使用者指定的恢復條件就是這一句：「停到有真人找他」。
+        if (!facts.FromApp && facts.AddressedToBot && _appChat.Resume(message.Channel.Id))
+        {
+            Console.WriteLine($"[App 對話] 有真人 @ 它 → 解除 /stop（{DescribeWhere(guildId, message)}）");
+            await SafeReplyAsync(userMessage,
+                "▶️ 收到，我恢復跟其他 App 對話了（先前被 `/stop` 停下來）。");
+        }
+
         // ── 別的 App 的訊息：**看得到，但不回話** ──────────────
         //    使用者回報「他似乎看不到其他 App 說的話」——
         //    「看不到」與「不回話」是兩件事：記進上下文它才知道剛剛機器人講了什麼，
@@ -188,6 +203,24 @@ public sealed class LlmChatService : IDisposable
                                   $"{MessageAddress.IgnoreReason(facts) ?? "（App 訊息模式：off）"}");
 
             return;
+        }
+
+        // ── 跟另一個 App 對話時的停損（兩種）───────────────────
+        //    1. `/stop`：使用者指定的主要開關 —— 停到有真人找他
+        //    2. 每小時上限：無人看管的保險（凌晨沒有人會按 /stop）
+        if (handling == MessageHandling.ReplyToApp)
+        {
+            if (_appChat.BlockReason(message.Channel.Id, _options.AppChatPerHour, now) is { } blocked)
+            {
+                RecordAppContext(facts, userMessage, guildId, now);   // 還是看得到，只是不回
+
+                if (MessageAddress.IsAppChat(_options.AppMessages))
+                    Console.WriteLine($"[App 對話] 不回這一則（{DescribeWhere(guildId, message)}）：{blocked}");
+
+                return;
+            }
+
+            _appChat.RecordAppReply(message.Channel.Id, now);
         }
 
         // 私訊預設不回（沒有「@ 機器人」這個動作，容易被誤觸）
@@ -850,7 +883,8 @@ public sealed class LlmChatService : IDisposable
                                           cancellationToken: default, addressed: addressed,
                                           mentionsOther: mentionsOther,
                                           onReplying: StartTypingOnce,
-                                          selfName: SelfNameIn(guildId, message));
+                                          selfName: SelfNameIn(guildId, message),
+                                          fromApp: message.Author.IsBot || message.Author.IsWebhook);
         }
         finally
         {
@@ -902,6 +936,15 @@ public sealed class LlmChatService : IDisposable
         // 模型常常講得比做得多，這句話讓使用者能核對。
         var replyText = answer.Text;
 
+        // 跟另一個 App 對話時，**在內容裡 @ 它**：
+        // mention 寫在 embed 裡不會觸發通知，而且多數機器人只認「被 @ 到」才會有反應 ——
+        // 不叫它，兩邊就聊不起來。（允許清單只放那一個 App，見下面的 allowedMentions）
+        var toApp = message.Author.IsBot || message.Author.IsWebhook;
+        var appChat = toApp && MessageAddress.IsAppChat(_options.AppMessages);
+
+        if (appChat && answer.Ok && replyText.Length > 0)
+            replyText = $"<@{message.Author.Id}> {replyText}";
+
         if (answer.Ok && answer.ToolChangedState)
             replyText += "\n\n-# 🔧 我實際做了：" + string.Join("、", answer.ToolCalls);
         else if (answer.Ok && ClaimsAnAction(replyText))
@@ -921,10 +964,20 @@ public sealed class LlmChatService : IDisposable
 
         // 回覆別的 App 時**一個 ping 都不發**（連「回覆通知」也關掉）：
         // 我們發出的通知就是對方繼續回話的燃料 —— 這是防「A @ 我、我 @ A」的第二道。
-        var toApp = message.Author.IsBot || message.Author.IsWebhook;
-
+        //
+        // ⚠️ 例外：「跟另一個 App 對話」模式（`LLM_APP_MESSAGES=chat`）**要 @ 它**——
+        //    多數機器人只認 mention，不叫它就完全不動，那樣兩邊根本聊不起來。
+        //    停損改成靠 `/stop` ＋ 每小時上限（見 AppChatGuard）。
         var allowedMentions = toApp
-            ? new AllowedMentions { AllowedTypes = AllowedMentionTypes.None, MentionRepliedUser = false }
+            ? appChat
+                ? new AllowedMentions
+                {
+                    // 只允許「那一個 App」—— 型別上不可能 @everyone／身分組／其他人
+                    AllowedTypes = AllowedMentionTypes.Users,
+                    UserIds = [message.Author.Id],
+                    MentionRepliedUser = true
+                }
+                : new AllowedMentions { AllowedTypes = AllowedMentionTypes.None, MentionRepliedUser = false }
             : ReplyMentions();
 
         for (var i = 0; i < chunks.Count; i++)

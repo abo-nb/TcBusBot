@@ -78,6 +78,15 @@ public enum AppMessageMode
     /// <summary>沒 @ 它也回話（還是有冷卻與「不發 ping」兩道煞車）。</summary>
     Reply,
 
+    /// <summary>
+    /// **跟另一個 App 對話**：沒 @ 也回，而且會 **@ 回去**（多數機器人只認 mention，
+    /// 不叫它就完全不動 —— 那樣兩邊根本聊不起來）。
+    ///
+    /// ⚠️ 這個模式一定要搭配停損（`AppChatGuard`：`/stop` ＋ 每小時上限）——
+    ///    兩個都會回話的機器人放著不管就是無限迴圈。
+    /// </summary>
+    Chat,
+
     /// <summary>完全忽略（連記都不記）—— 以前的舊行為。</summary>
     Off
 }
@@ -126,7 +135,7 @@ public static class MessageAddress
 
         return appMode switch
         {
-            AppMessageMode.Reply => MessageHandling.ReplyToApp,
+            AppMessageMode.Reply or AppMessageMode.Chat => MessageHandling.ReplyToApp,
             AppMessageMode.Off => MessageHandling.Ignore,
             _ => MessageHandling.ContextOnly
         };
@@ -156,13 +165,19 @@ public static class MessageAddress
 
     /// <summary>要不要套用「App 專屬冷卻」（同一個 App 在同一個頻道連續叫我們的煞車）。</summary>
     public static bool NeedsAppCooldown(MessageFacts facts, AppMessageMode appMode = AppMessageMode.Context)
-        => facts.FromApp && (facts.MentionsBot || appMode == AppMessageMode.Reply);
+        => facts.FromApp && (facts.MentionsBot || appMode is AppMessageMode.Reply or AppMessageMode.Chat);
+
+    /// <summary>
+    /// 「跟另一個 App 對話」模式嗎（回話時要 **@ 回去**，否則多數機器人不會理我們）。
+    /// </summary>
+    public static bool IsAppChat(AppMessageMode appMode) => appMode == AppMessageMode.Chat;
 
     /// <summary>把使用者設定的字串轉成模式（看不懂就用預設的「看得到但不回話」）。</summary>
     public static AppMessageMode ParseAppMode(string? value)
         => (value ?? "").Trim().ToLowerInvariant() switch
         {
             "reply" or "回" or "回話" => AppMessageMode.Reply,
+            "chat" or "聊天" or "talk" => AppMessageMode.Chat,
             "off" or "false" or "0" or "ignore" or "忽略" => AppMessageMode.Off,
             _ => AppMessageMode.Context
         };
@@ -170,6 +185,8 @@ public static class MessageAddress
     /// <summary>給 `/ai status` 與啟動訊息看的一行說明。</summary>
     public static string DescribeAppMode(AppMessageMode mode) => mode switch
     {
+        AppMessageMode.Chat =>
+            "別的 App 的訊息：**跟它對話**（會 @ 回去；用 `/stop` 停、有每小時上限）",
         AppMessageMode.Reply => "別的 App 的訊息：沒 @ 也會回（有冷卻、不發 ping）",
         AppMessageMode.Off => "別的 App 的訊息：完全忽略（連上下文都不記）",
         _ => "別的 App 的訊息：看得到（記進上下文並標成 [App]），但不會回話"

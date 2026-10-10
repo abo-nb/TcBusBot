@@ -142,6 +142,10 @@ internal static class BotServices
             BotName = client.CurrentUser?.Username ?? "Bot"
         });
 
+        // 「跟另一個 App 對話」的煞車（`/stop` ＋ 每小時上限）——**持久化**，
+        // 所以重啟（Render 會自己重啟）不會讓兩個機器人的迴圈從頭再來一次。
+        services.AddSingleton(sp => new AppChatGuard(sp.GetRequiredService<ILlmStateStore>()));
+
         services.AddSingleton<LlmChatService>();
 
         // ── 每週頻道摘要（/digest）────────────────────────────

@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 772 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 787 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 772 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 787 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -4437,7 +4437,72 @@ MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply
 | --- | --- |
 | `tcbus selftest` 第 31 節（新增 10 項） | `Decide` 的真值表（被 @ 一定回、沒 @ 預設只記上下文、`reply`／`off` 模式、私訊不記、真人走一般流程）；設定的字串解析；**真的寫進記憶**（`Snapshot` 看得到）、標成 `[App]`、`[閒聊]` 不混淆；App 訊息有則數上限**而且不影響人類的訊息** |
 | `--dryrun` 偷聽入口檢查 | 入口真的用 `Decide`、真的呼叫 `RecordAppContext`；`RecordAppContext` 真的寫進 `RecordAmbient`；`ExpandMentions` 真的用 `SpeakerName` ＋ 看 `LLM_SHOW_NICKNAMES`；`Decide` 的五種組合真值表 |
-| `/ai status` | 多一欄「別的 App 的訊息」，直接顯示目前是哪一種模式（`context`／`reply`／`off`） |
+| `/ai status` | 多一欄「別的 App 的訊息」，直接顯示目前是哪一種模式（`context`／`reply`／`chat`／`off`） |
+
+### 20.31 讓兩個機器人聊天（`LLM_APP_MESSAGES=chat` ＋ `/stop`）
+
+需求原文：**「我這裡還有另一個機器人，我想讓他們聊天」**。
+這正是 §20.29／§20.30 一路在防的那件事（兩個都會回話的機器人 = 無限迴圈 = 每一輪都花錢），
+所以「可以做，但一定要有停損」是這個需求的全部重點。
+
+問到的兩個決定：
+
+| 問題 | 使用者的答案 | 影響 |
+| --- | --- | --- |
+| 什麼時候停 | **新增 `/stop` 指令強制停止，直到有真人找他** | 停損必須是「人可以當場按」的開關，而且要能持久化 |
+| 聊什麼 | **不用題目，自由接話** | 不需要腳本，但提示詞要告訴它「你在跟機器人講話」 |
+
+#### 20.31.1 為什麼「自由接話」需要 `chat` 模式（而不是現成的 `reply`）
+
+`reply` 模式（§20.30）會回話，但**刻意不 @ 對方**（避免我們的通知變成對方繼續回話的燃料）。
+問題是**多數機器人只認 mention** —— 不叫它，它完全不會動，兩邊根本聊不起來。
+
+所以 `chat` 模式多做兩件事：
+
+1. 回覆時在**訊息內容**裡 `<@對方>`（mention 寫在 embed 裡不會觸發通知），
+   而且 `AllowedMentions` 只放那**一個**使用者 id —— 型別上不可能 @everyone／身分組／其他人
+2. 停損改成靠 `AppChatGuard`（`/stop` ＋ 每小時上限），而不是靠「不發 ping」
+
+#### 20.31.2 停損：兩個開關，一個給人、一個給半夜
+
+| 開關 | 誰負責 | 行為 |
+| --- | --- | --- |
+| `/stop` | 人（當場喊停） | 停到**有真人 @ 它**。只有「停」沒有「開始」：多一顆開始按鈕只會讓人不小心把迴圈又打開 |
+| `LLM_APP_CHAT_PER_HOUR`（預設 60） | 程式（無人看管的保險） | 每個頻道每小時最多回幾句；換一個小時自動歸零 |
+
+為什麼「有人按 `/stop`」還不夠：真正危險的情境是**沒有人在看**（半夜、出門）。
+使用者要的是「聊夠了就喊停」，而「聊夠了」只有人知道 —— 所以程式的責任是
+**讓沒人看管的迴圈只花掉一小部分額度**，而不是假裝自己能判斷聊夠了沒。
+
+⚠️ `/stop` 的狀態**一定要持久化**（`AppChatGuard`，blob `app_chat_guard`）：
+只放在記憶體的話，一次重啟（Render 會自己重啟）就讓兩個機器人從頭繼續聊。
+這是「不只需要正確、還需要在最糟的時刻正確」的例子。
+
+`/stop` 開放給**所有人**（不是管理員限定）：它是往「停止花錢」的方向，
+讓一般成員也能按是安全的 —— 反過來，如果是「開始聊天」的指令就一定要管理員。
+
+#### 20.31.3 提示詞：讓它知道在跟機器人講話
+
+`ChatOrchestrator.AppChatNote`（只在 `fromApp: true` 時附加）：
+
+```
+【你正在跟另一個 App 對話】
+剛剛那一則標著 [App] 的是**另一個機器人**（不是你的人類使用者）說的。
+• 不要假裝自己是人類，也不要說「我幫你查」「請問需要什麼」那種服務台語氣
+• 不要 @everyone／@here，也不要召喚其他同事或使用者
+• 沒話說就誠實說沒話說（不要為了接話而編內容）
+```
+
+沒有這一段，兩個機器人會在幾輪之內講出「您好，請問需要什麼協助」→「您好，請問需要什麼協助」
+那種服務台迴圈。
+
+#### 20.31.4 驗收
+
+| 在哪 | 驗什麼 |
+| --- | --- |
+| `tcbus selftest` 第 31 節（新增 15 項） | `chat` 模式會被認出來（`Decide` ＋ `IsAppChat` ＋ 中英文設定值）；`AppChatGuard`：每小時上限到了就擋、**下一小時自動恢復**、上限 0 ＝ 不限制、`/stop` 之後連下一小時也不恢復、**有真人找他才恢復**、`/stop all`、狀態上限；**`/stop` 真的寫進儲存區**（重開一個守門員還記得）；`AppChatNote` 真的被放進送出去的 system prompt，而真人訊息不會多那一段 |
+| `--dryrun` 新增「App 對話檢查」 | `/stop` 真的呼叫 `AppChatGuard.Stop`／`StopAll`；入口真的問 `BlockReason`、記 `RecordAppReply`、在真人找他時 `Resume`；回覆 App 時真的限制 `AllowedMentions.UserIds`；`Persist` 真的寫 `ILlmStateStore.SetBlob`；預設值本身合理（上限不是 0、冷卻不是 0） |
+| 兩個坑 | `AppChatNote` 是 `const`（編譯器內嵌）→ IL 掃描看不到，所以改用**行為測試**（檢查真的送出去的 prompt）；`AppChatGuard` 的「啟動時讀回」在建構子裡，掃描工具只吃 `MethodInfo` → 也交給行為測試（重開一個守門員還記得 `/stop`） |
 
 ---
 

@@ -403,9 +403,21 @@ public sealed class LlmOptions
 
     /// <summary>
     /// 別的 App 的訊息要怎麼對待（`LLM_APP_MESSAGES`）：
-    /// `context`（預設）＝看得到但不回話、`reply`＝沒 @ 也回、`off`＝完全忽略。
+    /// `context`（預設）＝看得到但不回話、`reply`＝沒 @ 也回（不 ping）、
+    /// `chat`＝**跟它對話**（會 @ 回去，靠 `/stop` 與每小時上限停損）、`off`＝完全忽略。
     /// </summary>
     public AppMessageMode AppMessages { get; set; } = AppMessageMode.Context;
+
+    /// <summary>
+    /// 「跟另一個 App 對話」時，**每個頻道每小時最多回幾句**（`0` ＝ 不限制）。
+    ///
+    /// 為什麼要有這個（使用者要的是「用 `/stop` 手動停」）：
+    /// `/stop` 要有人在場按。真正危險的是**沒有人在看的時候** ——
+    /// 兩個都會回話的機器人會在半夜一直互相回，把整週額度燒完。
+    /// 預設 60 句／小時（約每分鐘一句）：正常聊天完全夠用，
+    /// 但足以讓「沒人看管的迴圈」只花掉一小部分額度。
+    /// </summary>
+    public int AppChatPerHour { get; set; } = 60;
 
     /// <summary>
     /// 每一段對話最多留幾則「別的 App 的訊息」。

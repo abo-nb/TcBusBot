@@ -558,6 +558,9 @@ public static class DryRun
         // ── 每週摘要（/digest）：授權、@ 人的範圍、游標、額度 ─────
         AuditDigest();
 
+        // ── 跟另一個 App 對話（/stop ＋ 每小時上限）─────────────
+        AuditAppChat();
+
         // ── 偷聽模式的入口（「後面的訊息全被忽略」的那個 bug）────
         AuditEavesdropWiring();
 
@@ -1423,6 +1426,91 @@ public static class DryRun
         if (_problems == before)
             Console.WriteLine("  ✔ 只有 Bot 管理員能啟用／執行；@ 人只限核對過的那幾位；" +
                               "游標會推進、花費會記進每週額度；思考原文抓得到（/ai think）");
+    }
+
+    /// <summary>
+    /// **跟另一個 App 對話**（`LLM_APP_MESSAGES=chat`）的離線驗證。
+    ///
+    /// 這是整個專案**最容易燒錢**的一條路：兩個都會回話的機器人放進同一個頻道，
+    /// 就是「A 回我 → 我回 A → A 又回我…」的無限迴圈，而每一輪都是真的 LLM 呼叫。
+    /// 所以這裡驗三件事：
+    ///   1. **停損真的接上了**：`/stop`（使用者指定的開關）＋ 每小時上限（無人看管的保險）
+    ///   2. **狀態真的持久化**：沒有人在看的時候最需要它，重啟不該讓迴圈從頭開始
+    ///   3. **@ 回去只 @ 那一個 App**（型別上不可能 @everyone／身分組／其他人）
+    /// </summary>
+    private static void AuditAppChat()
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ App 對話檢查  跟另一個機器人聊天（/stop＋每小時上限）");
+
+        var before = _problems;
+
+        // ── 1) /stop 這個指令在不在，而且真的會停 ──────────────
+        var stopAsync = typeof(StopModule).GetMethod(nameof(StopModule.StopAsync));
+        var stopCalls = stopAsync is null ? [] : CollectCalls(stopAsync, resolveAll: true);
+
+        if (stopAsync is null)
+            Problem("找不到 StopModule.StopAsync —— 使用者沒有辦法叫它停止跟另一個 App 對話");
+        else if (!stopCalls.Contains("AppChatGuard.Stop"))
+            Problem("/stop 沒有真的把那個頻道停下來");
+        else if (!stopCalls.Contains("AppChatGuard.StopAll"))
+            Problem("/stop all 沒有停全部頻道那條路");
+
+        // ── 2) 入口真的會問「能不能聊」而且會記帳 ────────────────
+        var handle = typeof(LlmChatService).GetMethod("HandleCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var handleCalls = handle is null ? [] : CollectCalls(handle, resolveAll: true);
+
+        if (handle is null)
+            Problem("找不到 LlmChatService.HandleCoreAsync");
+        else if (!handleCalls.Contains("AppChatGuard.BlockReason"))
+            Problem("訊息入口沒有問 AppChatGuard —— /stop 與每小時上限都不會生效（迴圈會一直跑）");
+        else if (!handleCalls.Contains("AppChatGuard.RecordAppReply"))
+            Problem("訊息入口沒有記「回給 App 幾句」—— 每小時上限永遠不會到");
+        else if (!handleCalls.Contains("AppChatGuard.Resume"))
+            Problem("訊息入口沒有在真人找他時解除 /stop —— 停了就再也不會恢復");
+
+        // ── 3) 對話模式下 @ 回去只 @ 那一個 App ─────────────────
+        var answer = typeof(LlmChatService).GetMethod("AnswerAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var answerCalls = answer is null ? [] : CollectCalls(answer, resolveAll: true);
+
+        if (answer is null)
+            Problem("找不到 LlmChatService.AnswerAsync");
+        else if (!answerCalls.Contains("AllowedMentions.set_UserIds"))
+            Problem("跟 App 對話時沒有把「允許 @ 的對象」限制成那一個 App —— 可能 @ 到別人");
+        else if (!answerCalls.Contains("ChatOrchestrator.AskAsync"))
+            Problem("回覆路徑沒有走 AskAsync");
+
+        // 「你在跟另一個機器人講話」那一段是 `const`（編譯器會內嵌），IL 掃不到 ——
+        // 所以它由 `tcbus selftest` 的行為測試蓋：餵一個 fromApp 的訊息，
+        // 檢查送出去的 system prompt 真的含那一段。
+
+        // ── 4) 狀態一定要持久化 ────────────────────────────────
+        var persist = typeof(AppChatGuard).GetMethod("Persist", BindingFlags.Instance | BindingFlags.NonPublic);
+        var persistCalls = persist is null ? [] : CollectCalls(persist, resolveAll: true);
+
+        // 「啟動時讀回來」那條路用建構子，這裡的掃描工具只吃 MethodInfo ——
+        // 所以它由 `tcbus selftest` 的行為測試蓋（重開一個守門員還記得 /stop）。
+        if (persist is null)
+            Problem("找不到 AppChatGuard.Persist");
+        else if (!persistCalls.Contains("ILlmStateStore.SetBlob"))
+            Problem("/stop 的狀態沒有寫進儲存區 —— 重啟之後迴圈會從頭開始（正是最危險的時候）");
+
+        // ── 5) 設定本身合不合理 ────────────────────────────────
+        var options = new LlmOptions();
+        Console.WriteLine($"  ℹ 預設：{MessageAddress.DescribeAppMode(options.AppMessages)}" +
+                          $"｜每小時上限 {options.AppChatPerHour} 句｜App 冷卻 {options.AppCooldownSeconds} 秒");
+
+        if (options.AppChatPerHour is <= 0 or > 600)
+            Problem($"每小時上限預設 {options.AppChatPerHour} 不合理（0 = 完全沒有保險，太大 = 等於沒有）");
+
+        if (options.AppCooldownSeconds <= 0)
+            Problem("App 冷卻預設是 0 —— 兩個機器人會用最快的速度互相回話");
+
+        if (_problems == before)
+            Console.WriteLine("  ✔ /stop 真的會停（而且狀態存進資料庫）；每小時上限會在入口擋；" +
+                              "回覆時只 @ 那一個 App，並告訴模型「你在跟機器人講話」");
     }
 
     /// <summary>

@@ -30,6 +30,7 @@ public static class BotModules
         (typeof(DigestModule), "digest（每週摘要）"),
         (typeof(PersonaGrantModule), "ai（授權按鈕）"),
         (typeof(QuotaResetModule), "ai（額度重置按鈕）"),
-        (typeof(ResetModule), "rest")
+        (typeof(ResetModule), "rest"),
+        (typeof(StopModule), "stop（停止跟其他 App 對話）")
     ];
 }

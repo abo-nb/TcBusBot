@@ -3965,6 +3965,14 @@ public static class SelfTest
                 OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false),
                 AppMessageMode.Off) == MessageHandling.Ignore);
 
+        Check("★ 設 chat（跟另一個機器人對話）→ 沒 @ 也會回（會 @ 回去）",
+            MessageAddress.Decide(new MessageFacts(
+                FromApp: true, DirectMessage: false, MentionsBot: false,
+                OtherHumans: 0, OtherApps: 0, Roles: 0, MentionsEveryone: false, RepliesToBot: false),
+                AppMessageMode.Chat) == MessageHandling.ReplyToApp
+            && MessageAddress.IsAppChat(AppMessageMode.Chat)
+            && !MessageAddress.IsAppChat(AppMessageMode.Reply));
+
         Check("★ 被 @ 的話三種模式都一定要回（被叫了就要答）",
             MessageAddress.Decide(new MessageFacts(
                 true, false, true, 0, 0, 0, false, false), AppMessageMode.Off) == MessageHandling.ReplyToApp
@@ -3995,6 +4003,101 @@ public static class SelfTest
             && MessageAddress.ParseAppMode("忽略") == AppMessageMode.Off
             && MessageAddress.ParseAppMode("亂打") == AppMessageMode.Context
             && MessageAddress.ParseAppMode(null) == AppMessageMode.Context);
+
+        Check("★ chat／聊天 也要認得（使用者會直接用中文寫）",
+            MessageAddress.ParseAppMode("chat") == AppMessageMode.Chat
+            && MessageAddress.ParseAppMode("聊天") == AppMessageMode.Chat);
+
+        // ── 1b) 「跟另一個 App 對話」的停損（`/stop` ＋ 每小時上限）────
+        //      為什麼一定要有：兩個都會回話的機器人放著不管就是無限迴圈，
+        //      而每一輪都真的花錢。狀態**一定要持久化** ——
+        //      正是「沒有人在看」的時候最需要它（重啟不該讓迴圈從頭開始）。
+        var guardStore = new FakeStateStore();
+        var guard = new AppChatGuard(guardStore);
+        var guardChannel = 42UL;
+        var guardStart = new DateTimeOffset(2026, 10, 10, 12, 0, 0, TimeSpan.Zero);
+
+        Check("一開始沒有被擋（預設可以聊）",
+            guard.BlockReason(guardChannel, hourlyCap: 60, guardStart) is null);
+
+        // 每小時上限
+        for (var i = 0; i < 3; i++) guard.RecordAppReply(guardChannel, guardStart);
+
+        Check("★ 每小時上限：還沒到就不擋、到了就擋（無人看管的保險）",
+            guard.BlockReason(guardChannel, hourlyCap: 3, guardStart) is { } cappedReason
+            && cappedReason.Contains("上限", StringComparison.Ordinal),
+            guard.BlockReason(guardChannel, hourlyCap: 3, guardStart));
+
+        Check("★ 下一小時自動恢復（不必等人來按什麼）",
+            guard.BlockReason(guardChannel, hourlyCap: 3, guardStart.AddHours(1)) is null
+            && guard.SentThisHour(guardChannel, guardStart.AddHours(1)) == 0);
+
+        Check("上限設 0 ＝ 不限制（只有 /stop 這道）",
+            guard.BlockReason(guardChannel, hourlyCap: 0, guardStart) is null);
+
+        // /stop 與「有真人找他」才恢復
+        guard.Stop(guardChannel, byUserId: 777UL, guardStart);
+
+        Check("★ `/stop` 之後就不再回（連「下一小時」也不會自己恢復）",
+            guard.BlockReason(guardChannel, hourlyCap: 0, guardStart.AddHours(5)) is { } stopped
+            && stopped.Contains("/stop", StringComparison.Ordinal),
+            guard.BlockReason(guardChannel, hourlyCap: 0, guardStart.AddHours(5)));
+
+        Check("★ 有真人找他 → 恢復（使用者指定的恢復條件）",
+            guard.Resume(guardChannel)
+            && guard.BlockReason(guardChannel, hourlyCap: 0, guardStart.AddHours(5)) is null
+            && !guard.Resume(guardChannel));   // 沒停過就不用再恢復一次
+
+        var stoppedAgain = new AppChatGuard(guardStore);
+        stoppedAgain.Stop(guardChannel, 777UL, guardStart);
+
+        Check("★ /stop 真的寫進儲存區（重開一個守門員還記得）",
+            new AppChatGuard(guardStore).Stopped().Contains(guardChannel),
+            $"停用中的頻道：{string.Join("、", new AppChatGuard(guardStore).Stopped())}");
+
+        Check("`/stop all` 會停掉所有記得的頻道",
+            stoppedAgain.StopAll(777UL, guardStart) >= 1);
+
+        Check("★ 狀態有上限（不會因為很多頻道而無限長大）",
+            AppChatGuard.MaxChannels == 200);
+
+        Check("/ai status 的說明看得出目前是哪一種模式",
+            MessageAddress.DescribeAppMode(AppMessageMode.Chat).Contains("對話", StringComparison.Ordinal)
+            && MessageAddress.DescribeAppMode(AppMessageMode.Context).Contains("不會回話", StringComparison.Ordinal));
+
+        Check("★ 跟機器人對話時要告訴模型「你在跟另一個 App 講話」",
+            ChatOrchestrator.AppChatNote.Contains("另一個機器人", StringComparison.Ordinal)
+            && ChatOrchestrator.AppChatNote.Contains("服務台", StringComparison.Ordinal));
+
+        // ── 1c) 那一段真的會被送進提示詞（不是只寫在常數裡）─────────
+        //      為什麼要驗行為：`AppChatNote` 是 const，編譯器會內嵌 ——
+        //      `--dryrun` 的 IL 掃描看不到它，只有「真的送出去的那一份 prompt」能證明。
+        var chatLlm = new CountingLlmClient("好");
+
+        var chatOptions = new LlmOptions { SystemPrompt = "你是貓貓", ToolsEnabled = false };
+
+        var chatOrchestrator = new ChatOrchestrator(
+            chatLlm, chatOptions, new ConversationStore(chatOptions),
+            new WeeklyTokenBudget(chatOptions), NoChatTools.Instance, new GuildPersonaStore());
+
+        chatOrchestrator.AskAsync(
+            1UL, 2UL,
+            new ChatTurn(ChatRole.User, "另一個機器人", 555UL, 700UL, "300 五分鐘後到", guardStart, FromApp: true),
+            null, cancellationToken: default, addressed: true, fromApp: true)
+            .GetAwaiter().GetResult();
+
+        Check("★ 來自 App 的訊息：送出去的 system prompt 真的含那一段",
+            chatLlm.Last?.SystemPrompt.Contains("另一個機器人", StringComparison.Ordinal) == true,
+            chatLlm.Last?.SystemPrompt.Replace("\n", " ｜ "));
+
+        chatOrchestrator.AskAsync(
+            1UL, 2UL,
+            new ChatTurn(ChatRole.User, "小明", 111UL, 701UL, "304 有到嗎", guardStart),
+            null, cancellationToken: default, addressed: true)
+            .GetAwaiter().GetResult();
+
+        Check("真人問話時不會多那一段（省 token，也不該叫它跟人聊機器人的事）",
+            chatLlm.Last?.SystemPrompt.Contains("你正在跟另一個 App 對話", StringComparison.Ordinal) != true);
 
         // ── 2)「@ 了別人」的鐵證（不插話、也不花錢判斷）──────────
         Check("★ @ 別的 App 也算「@ 了別人」（以前只算真人 → 它會插話）",
