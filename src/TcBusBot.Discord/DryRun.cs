@@ -1456,6 +1456,46 @@ public static class DryRun
         else if (!stopCalls.Contains("AppChatGuard.StopAll"))
             Problem("/stop all 沒有停全部頻道那條路");
 
+        // ── 1b) /chat enable 是**管理員**在**那個頻道**啟用的唯一入口 ──
+        //      為什麼不用環境變數：要不要跟另一個機器人聊是「那個頻道的事」，
+        //      而且啟用的人應該在那裡看得到成果、隨時能停。
+        foreach (var (method, label) in new[]
+                 {
+                     ("EnableAsync", "啟用"), ("DisableAsync", "關閉")
+                 })
+        {
+            var info = typeof(AppChatModule).GetMethod(method);
+            var calls = info is null ? [] : CollectCalls(info, resolveAll: true);
+
+            if (info is null)
+            {
+                Problem($"找不到 AppChatModule.{method}（/chat {label} 不見了）");
+                continue;
+            }
+
+            // 授權判斷在 `IsAdmin` 這個屬性裡（讀 LLM_ADMIN_IDS）——
+            // 這裡驗「有沒有走那道門」，門本身另外驗（見下面）。
+            if (!calls.Contains("AppChatModule.get_IsAdmin"))
+                Problem($"/chat {label} 沒有先問 IsAdmin —— 任何人都能讓它跟機器人聊起來（會花錢）");
+        }
+
+        var isChatAdmin = typeof(AppChatModule).GetProperty("IsAdmin",
+            BindingFlags.Instance | BindingFlags.NonPublic)?.GetMethod;
+        var isChatAdminCalls = isChatAdmin is null ? [] : CollectCalls(isChatAdmin, resolveAll: true);
+
+        if (isChatAdmin is null)
+            Problem("找不到 AppChatModule.IsAdmin —— 無法確認 /chat 的授權來源");
+        else if (!isChatAdminCalls.Contains("LlmOptions.get_AdminUserIds"))
+            Problem("/chat 的 IsAdmin 不是看 LLM_ADMIN_IDS —— 授權名單會失效");
+        else if (!isChatAdminCalls.Any(c => c.EndsWith(".get_Id", StringComparison.Ordinal)))
+            Problem("/chat 的 IsAdmin 沒有比對發話者 ID");
+
+        var enable = typeof(AppChatModule).GetMethod(nameof(AppChatModule.EnableAsync));
+        var enableCalls = enable is null ? [] : CollectCalls(enable, resolveAll: true);
+
+        if (enable is not null && !enableCalls.Contains("AppChatGuard.Enable"))
+            Problem("/chat enable 沒有真的寫進設定（啟用了卻不會生效）");
+
         // ── 2) 入口真的會問「能不能聊」而且會記帳 ────────────────
         var handle = typeof(LlmChatService).GetMethod("HandleCoreAsync",
             BindingFlags.Instance | BindingFlags.NonPublic);
@@ -1469,6 +1509,11 @@ public static class DryRun
             Problem("訊息入口沒有記「回給 App 幾句」—— 每小時上限永遠不會到");
         else if (!handleCalls.Contains("AppChatGuard.Resume"))
             Problem("訊息入口沒有在真人找他時解除 /stop —— 停了就再也不會恢復");
+
+        // 入口要照「**那個頻道**的設定」決定，不是照主機的全域設定
+        // （`/chat enable` 是每個頻道各自啟用的唯一入口）
+        if (handle is not null && !handleCalls.Contains("AppChatGuard.ModeFor"))
+            Problem("訊息入口沒有問「這個頻道啟用了嗎」—— /chat enable 不會生效");
 
         // ── 3) 對話模式下 @ 回去只 @ 那一個 App ─────────────────
         var answer = typeof(LlmChatService).GetMethod("AnswerAsync",

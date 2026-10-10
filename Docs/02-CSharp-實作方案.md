@@ -2382,7 +2382,7 @@ TcBusBot.sln
 │   └─ DryRun.cs                        離線檢查所有 Discord 元件限制
 └─ src/TcBusBot.Cli/             ← 離線開發工具（`tcbus`）
     ├─ Program.cs                       selftest / search / route / diag / mongo
-    └─ SelfTest.cs                      ★ 787 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
+    └─ SelfTest.cs                      ★ 795 項離線驗收測試（搜尋、匹配、儲存與 DI、AI 聊天與工具、可馴服的提示詞、偷聽模式…）
 ```
 
 `src/TcBusBot.Discord/DryRun.cs` 除了檢查元件限制，還會做
@@ -2392,7 +2392,7 @@ TcBusBot.sln
 **驗收指令**（不需要網路、TDX 金鑰、Discord Token）：
 
 ```powershell
-dotnet run --project src\TcBusBot.Cli -- selftest              # 787 項驗收
+dotnet run --project src\TcBusBot.Cli -- selftest              # 795 項驗收
 dotnet run --project src\TcBusBot.Cli -- search 台中車站         # 模糊搜尋 + 建議群組
 dotnet run --project src\TcBusBot.Cli -- route 台中車站 靜宜大學    # 匹配 + 訂閱展開
 dotnet run --project src\TcBusBot.Cli -- diag 台中科技大學 大坑口   # 逐條說明路線為何被排除
@@ -4439,7 +4439,7 @@ MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply
 | `--dryrun` 偷聽入口檢查 | 入口真的用 `Decide`、真的呼叫 `RecordAppContext`；`RecordAppContext` 真的寫進 `RecordAmbient`；`ExpandMentions` 真的用 `SpeakerName` ＋ 看 `LLM_SHOW_NICKNAMES`；`Decide` 的五種組合真值表 |
 | `/ai status` | 多一欄「別的 App 的訊息」，直接顯示目前是哪一種模式（`context`／`reply`／`chat`／`off`） |
 
-### 20.31 讓兩個機器人聊天（`LLM_APP_MESSAGES=chat` ＋ `/stop`）
+### 20.31 讓兩個機器人聊天（`/chat enable` ＋ `/stop`）
 
 需求原文：**「我這裡還有另一個機器人，我想讓他們聊天」**。
 這正是 §20.29／§20.30 一路在防的那件事（兩個都會回話的機器人 = 無限迴圈 = 每一輪都花錢），
@@ -4451,6 +4451,27 @@ MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply
 | --- | --- | --- |
 | 什麼時候停 | **新增 `/stop` 指令強制停止，直到有真人找他** | 停損必須是「人可以當場按」的開關，而且要能持久化 |
 | 聊什麼 | **不用題目，自由接話** | 不需要腳本，但提示詞要告訴它「你在跟機器人講話」 |
+
+#### 20.31.0 啟用方式是「管理員在那個頻道打指令」（不是環境變數）
+
+第一版做成 `LLM_APP_MESSAGES=chat`（主機層級的環境變數），使用者馬上修正：
+**「别放环境变数，让管理员在那个频道启用」**。這個修正是對的：
+
+| 為什麼環境變數是錯的 | 每個頻道各自啟用 |
+| --- | --- |
+| 環境變數是**全機**的：一開就是所有頻道都被兩個機器人的對話洗版 | 只影響那個頻道，其他頻道維持「看得到但不回話」 |
+| 改環境變數要進 dashboard ＋ 重啟（Render 會跟著重啟服務） | `/chat enable` 當場生效 |
+| 開的人看不到成果（要等重啟，還得自己去那個頻道找） | 啟用的人就在那個頻道，馬上看到、隨時能停 |
+
+所以最後的形狀是：**環境變數只留「沒啟用的頻道要用哪一種模式」的預設值**
+（`LLM_APP_MESSAGES`，預設 `context` ＝ 看得到但不回話），
+**真正的開關是 `/chat enable`**（管理員；`/chat status` 任何人可看）。
+
+`/chat enable` 還多了兩個很實用的選項：
+
+* **`app:` 只跟指定的一個機器人對話** —— 頻道裡常常有好幾個 App（通知、簽到、音樂），
+  只想跟其中一個聊時，其他 App 仍然只「看得到」。這比「任何 App 都回」安全得多。
+* **`cap:` 只改那個頻道的每小時上限**（沒設定就沿用主機預設）。
 
 #### 20.31.1 為什麼「自由接話」需要 `chat` 模式（而不是現成的 `reply`）
 
@@ -4500,9 +4521,9 @@ MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply
 
 | 在哪 | 驗什麼 |
 | --- | --- |
-| `tcbus selftest` 第 31 節（新增 15 項） | `chat` 模式會被認出來（`Decide` ＋ `IsAppChat` ＋ 中英文設定值）；`AppChatGuard`：每小時上限到了就擋、**下一小時自動恢復**、上限 0 ＝ 不限制、`/stop` 之後連下一小時也不恢復、**有真人找他才恢復**、`/stop all`、狀態上限；**`/stop` 真的寫進儲存區**（重開一個守門員還記得）；`AppChatNote` 真的被放進送出去的 system prompt，而真人訊息不會多那一段 |
-| `--dryrun` 新增「App 對話檢查」 | `/stop` 真的呼叫 `AppChatGuard.Stop`／`StopAll`；入口真的問 `BlockReason`、記 `RecordAppReply`、在真人找他時 `Resume`；回覆 App 時真的限制 `AllowedMentions.UserIds`；`Persist` 真的寫 `ILlmStateStore.SetBlob`；預設值本身合理（上限不是 0、冷卻不是 0） |
-| 兩個坑 | `AppChatNote` 是 `const`（編譯器內嵌）→ IL 掃描看不到，所以改用**行為測試**（檢查真的送出去的 prompt）；`AppChatGuard` 的「啟動時讀回」在建構子裡，掃描工具只吃 `MethodInfo` → 也交給行為測試（重開一個守門員還記得 `/stop`） |
+| `tcbus selftest` 第 31 節（新增 23 項） | **每個頻道各自啟用**：沒啟用 → 用主機預設；`/chat enable` → 那個頻道才會回（其他頻道不受影響）；`app:` 只跟一個 App（其他 App 仍然只看到）；`cap:` 只改那個頻道；`/chat disable` 回到預設；**設定跨重啟**；`chat` 模式辨識（`Decide` ＋ `IsAppChat` ＋ 中英文設定值）；每小時上限（到了就擋、下一小時自動恢復、0 ＝ 不限制）、`/stop` 之後連下一小時也不恢復、**有真人找他才恢復**、狀態上限；`AppChatNote` 真的被放進送出去的 system prompt，而真人訊息不會多那一段 |
+| `--dryrun` 新增「App 對話檢查」 | `/stop` 真的呼叫 `AppChatGuard.Stop`／`StopAll`；**`/chat enable`／`disable` 真的先問 `IsAdmin`（而 `IsAdmin` 真的讀 `LLM_ADMIN_IDS` ＋ 比對發話者）**，而且真的寫進 `AppChatGuard.Enable`；訊息入口真的問 `ModeFor`（照**那個頻道**的設定）、`BlockReason`、`RecordAppReply`、在真人找他時 `Resume`；回覆 App 時真的限制 `AllowedMentions.UserIds`；`Persist` 真的寫 `ILlmStateStore.SetBlob` |
+| 三個坑 | `AppChatNote` 是 `const`（編譯器內嵌）→ IL 掃描看不到，所以改用**行為測試**；`AppChatGuard` 的「啟動時讀回」在建構子裡（掃描工具只吃 `MethodInfo`）→ 也交給行為測試；授權寫在 `IsAdmin` 屬性裡 → 要驗的是「有沒有走那道門」＋「門本身讀什麼」 |
 
 ---
 

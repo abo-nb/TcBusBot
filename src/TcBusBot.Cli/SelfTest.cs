@@ -4069,6 +4069,56 @@ public static class SelfTest
             ChatOrchestrator.AppChatNote.Contains("另一個機器人", StringComparison.Ordinal)
             && ChatOrchestrator.AppChatNote.Contains("服務台", StringComparison.Ordinal));
 
+        // ── 1d) **每個頻道各自啟用**（管理員用 /chat enable）─────────
+        //      為什麼不是環境變數：「要不要跟另一個機器人聊」是那個頻道的事，
+        //      而且啟用的人應該在那裡看得到成果、隨時能停。
+        var perChannelStore = new FakeStateStore();
+        var perChannel = new AppChatGuard(perChannelStore);
+        var chatChannel = 77UL;
+        var otherChannel = 88UL;
+        var otherAppId = 4444UL;
+        var anotherAppId = 5555UL;
+
+        Check("★ 沒啟用的頻道 → 用主機預設（看得到但不回話）",
+            perChannel.ModeFor(chatChannel, otherAppId, AppMessageMode.Context) == AppMessageMode.Context
+            && perChannel.ModeFor(chatChannel, otherAppId, AppMessageMode.Context) != AppMessageMode.Chat);
+
+        perChannel.Enable(chatChannel, byUserId: 777UL, appId: 0, hourCap: 0, guardStart);
+
+        Check("★ 管理員在那個頻道啟用 → 那個頻道會回（其他頻道不受影響）",
+            perChannel.ModeFor(chatChannel, otherAppId, AppMessageMode.Context) == AppMessageMode.Chat
+            && perChannel.ModeFor(otherChannel, otherAppId, AppMessageMode.Context) == AppMessageMode.Context);
+
+        Check("啟用之後 /stop 的舊狀態會被清掉（啟用＝我要聊）",
+            perChannel.Config(chatChannel).Stopped == false
+            && perChannel.Config(chatChannel).EnabledBy == 777UL);
+
+        perChannel.Disable(chatChannel);
+
+        Check("★ /chat disable → 回到「看得到但不回話」（設定留著）",
+            perChannel.ModeFor(chatChannel, otherAppId, AppMessageMode.Context) == AppMessageMode.Context
+            && perChannel.Config(chatChannel).Enabled == false);
+
+        // 只跟「那一個」機器人聊
+        perChannel.Enable(chatChannel, 777UL, appId: otherAppId, hourCap: 5, guardStart);
+
+        Check("★ 指定只跟某一個 App 聊：其他 App 仍然只「看得到」",
+            perChannel.ModeFor(chatChannel, otherAppId, AppMessageMode.Context) == AppMessageMode.Chat
+            && perChannel.ModeFor(chatChannel, anotherAppId, AppMessageMode.Context) == AppMessageMode.Context);
+
+        Check("★ 每個頻道可以有自己的每小時上限（沒設定就沿用主機預設）",
+            perChannel.HourCapFor(chatChannel, fallback: 60) == 5
+            && perChannel.HourCapFor(otherChannel, fallback: 60) == 60);
+
+        Check("★ 這些設定跨重啟（不然管理員啟用過的頻道會忘記）",
+            new AppChatGuard(new FakeStateStore()).EnabledChannels().Count == 0
+            && new AppChatGuard(perChannelStore).ModeFor(chatChannel, otherAppId, AppMessageMode.Context)
+                == AppMessageMode.Chat);
+
+        Check("啟用中的頻道列得出來（診斷用）",
+            perChannel.EnabledChannels().Contains(chatChannel)
+            && perChannel.Describe().Contains("啟用", StringComparison.Ordinal));
+
         // ── 1c) 那一段真的會被送進提示詞（不是只寫在常數裡）─────────
         //      為什麼要驗行為：`AppChatNote` 是 const，編譯器會內嵌 ——
         //      `--dryrun` 的 IL 掃描看不到它，只有「真的送出去的那一份 prompt」能證明。

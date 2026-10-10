@@ -175,7 +175,11 @@ public sealed class LlmChatService : IDisposable
                               || (botId != 0 && referenced.MentionedUserIds.Contains(botId))
                               || _chat.Conversations.HasMessage(guildId, message.Channel.Id, referenced.Id)));
 
-        var handling = MessageAddress.Decide(facts, _options.AppMessages);
+        // 這個頻道要用哪一種模式：管理員用 `/chat enable` 在這個頻道啟用過 → 跟它對話；
+        // 沒啟用 → 用主機的預設值（`LLM_APP_MESSAGES`，預設「看得到但不回話」）。
+        var appMode = _appChat.ModeFor(message.Channel.Id, userMessage.Author.Id, _options.AppMessages);
+
+        var handling = MessageAddress.Decide(facts, appMode);
 
         // ── 有真人找他 → 解除 `/stop` ─────────────────────────
         //    使用者指定的恢復條件就是這一句：「停到有真人找他」。
@@ -210,11 +214,13 @@ public sealed class LlmChatService : IDisposable
         //    2. 每小時上限：無人看管的保險（凌晨沒有人會按 /stop）
         if (handling == MessageHandling.ReplyToApp)
         {
-            if (_appChat.BlockReason(message.Channel.Id, _options.AppChatPerHour, now) is { } blocked)
+            var cap = _appChat.HourCapFor(message.Channel.Id, _options.AppChatPerHour);
+
+            if (_appChat.BlockReason(message.Channel.Id, cap, now) is { } blocked)
             {
                 RecordAppContext(facts, userMessage, guildId, now);   // 還是看得到，只是不回
 
-                if (MessageAddress.IsAppChat(_options.AppMessages))
+                if (MessageAddress.IsAppChat(appMode))
                     Console.WriteLine($"[App 對話] 不回這一則（{DescribeWhere(guildId, message)}）：{blocked}");
 
                 return;
@@ -940,7 +946,8 @@ public sealed class LlmChatService : IDisposable
         // mention 寫在 embed 裡不會觸發通知，而且多數機器人只認「被 @ 到」才會有反應 ——
         // 不叫它，兩邊就聊不起來。（允許清單只放那一個 App，見下面的 allowedMentions）
         var toApp = message.Author.IsBot || message.Author.IsWebhook;
-        var appChat = toApp && MessageAddress.IsAppChat(_options.AppMessages);
+        var appChat = toApp && MessageAddress.IsAppChat(
+            _appChat.ModeFor(message.Channel.Id, message.Author.Id, _options.AppMessages));
 
         if (appChat && answer.Ok && replyText.Length > 0)
             replyText = $"<@{message.Author.Id}> {replyText}";

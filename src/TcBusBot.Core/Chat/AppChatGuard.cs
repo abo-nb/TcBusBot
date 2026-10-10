@@ -9,7 +9,25 @@ public sealed record AppChatState(
     [property: JsonPropertyName("by")] ulong StoppedBy,
     [property: JsonPropertyName("at")] DateTimeOffset? StoppedAt,
     [property: JsonPropertyName("hour")] string HourKey,
-    [property: JsonPropertyName("sent")] int SentThisHour);
+    [property: JsonPropertyName("sent")] int SentThisHour,
+    /// <summary>
+    /// 這個頻道**由管理員啟用**了「跟其他 App 對話」嗎。
+    ///
+    /// 為什麼是「每個頻道各自啟用」而不是一個環境變數：
+    /// 「要不要跟另一個機器人聊」是**那個頻道的事**（別的頻道可能只想看到通知、
+    /// 不想被兩個機器人的對話洗版），而且啟用的人應該在那裡看得到成果。
+    /// 環境變數只留「沒設定時的預設值」。
+    /// </summary>
+    [property: JsonPropertyName("enabled")] bool Enabled,
+    /// <summary>只跟這一個 App 對話（0 ＝ 任何 App 都可以）。</summary>
+    [property: JsonPropertyName("app")] ulong AppId,
+    /// <summary>這個頻道自己的每小時上限（0 ＝ 用主機設定的預設值）。</summary>
+    [property: JsonPropertyName("cap")] int HourCap,
+    [property: JsonPropertyName("enabled_by")] ulong EnabledBy,
+    [property: JsonPropertyName("enabled_at")] DateTimeOffset? EnabledAt)
+{
+    public static AppChatState Empty { get; } = new(false, 0, null, "", 0, false, 0, 0, 0, null);
+}
 
 /// <summary>
 /// 「跟另一個 App 聊天」的煞車與開關（**持久化**）。
@@ -96,17 +114,87 @@ public sealed class AppChatGuard
     {
         lock (_gate)
         {
-            var state = Get(channelId);
-
-            var updated = state with
+            return Save(channelId, Get(channelId) with
             {
                 Stopped = true,
                 StoppedBy = byUserId,
                 StoppedAt = now
-            };
-
-            return Save(channelId, updated);
+            });
         }
+    }
+
+    /// <summary>
+    /// `/chat enable`：**在這個頻道**啟用「跟其他 App 對話」（管理員指令）。
+    ///
+    /// <paramref name="appId"/> 給了就**只跟那一個 App** 對話 ——
+    /// 這是最實用的一種設定：頻道裡可能有好幾個機器人（通知、簽到、音樂），
+    /// 只想跟其中一個聊。其他 App 的訊息仍然「看得到但不回話」。
+    /// </summary>
+    public AppChatState Enable(
+        ulong channelId, ulong byUserId, ulong appId, int hourCap, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            return Save(channelId, Get(channelId) with
+            {
+                Enabled = true,
+                AppId = appId,
+                HourCap = Math.Max(0, hourCap),
+                EnabledBy = byUserId,
+                EnabledAt = now,
+                // 啟用本身就是「我要聊」→ 順便解除先前的 /stop
+                Stopped = false,
+                StoppedBy = 0,
+                StoppedAt = null
+            });
+        }
+    }
+
+    /// <summary>`/chat disable`：停用（回到「看得到但不回話」）。設定本身留著，方便再啟用。</summary>
+    public AppChatState Disable(ulong channelId)
+    {
+        lock (_gate) return Save(channelId, Get(channelId) with { Enabled = false });
+    }
+
+    /// <summary>
+    /// 這個頻道現在要用哪一種「App 訊息模式」。
+    ///
+    /// * 管理員在這個頻道啟用過 → <see cref="AppMessageMode.Chat"/>
+    ///   （指定了 AppId 時，其他 App 仍然只記上下文）
+    /// * 沒有 → 用主機的預設值（`LLM_APP_MESSAGES`，預設是「看得到但不回話」）
+    /// </summary>
+    public AppMessageMode ModeFor(ulong channelId, ulong authorId, AppMessageMode fallback)
+    {
+        lock (_gate)
+        {
+            if (!_states.TryGetValue(channelId, out var state) || !state.Enabled) return fallback;
+
+            // 只跟指定的一個 App 聊：其他 App 走預設（通常是「看得到但不回話」）
+            if (state.AppId != 0 && state.AppId != authorId) return fallback;
+
+            return AppMessageMode.Chat;
+        }
+    }
+
+    /// <summary>這個頻道的每小時上限（有自己設定就用它，否則用主機預設）。</summary>
+    public int HourCapFor(ulong channelId, int fallback)
+    {
+        lock (_gate)
+            return _states.TryGetValue(channelId, out var state) && state.HourCap > 0
+                ? state.HourCap
+                : fallback;
+    }
+
+    /// <summary>這個頻道的設定（`/chat status` 用）。</summary>
+    public AppChatState Config(ulong channelId)
+    {
+        lock (_gate) return Get(channelId);
+    }
+
+    /// <summary>目前有哪些頻道啟用了（診斷用）。</summary>
+    public IReadOnlyList<ulong> EnabledChannels()
+    {
+        lock (_gate) return _states.Where(kv => kv.Value.Enabled).Select(kv => kv.Key).ToList();
     }
 
     /// <summary>`/stop all:True`：全部頻道都停。</summary>
@@ -181,11 +269,13 @@ public sealed class AppChatGuard
     {
         lock (_gate)
         {
+            var enabled = _states.Values.Count(s => s.Enabled);
             var stopped = _states.Values.Count(s => s.Stopped);
 
-            return stopped == 0
-                ? "沒有頻道被 /stop 停下來"
-                : $"{stopped} 個頻道被 /stop 停下來（等真人找它）";
+            if (enabled == 0 && stopped == 0) return "沒有頻道啟用「跟其他 App 對話」";
+
+            return $"{enabled} 個頻道啟用「跟其他 App 對話」" +
+                   (stopped > 0 ? $"｜{stopped} 個被 /stop 停下來（等真人找它）" : "");
         }
     }
 
@@ -196,9 +286,7 @@ public sealed class AppChatGuard
     }
 
     private AppChatState Get(ulong channelId)
-        => _states.TryGetValue(channelId, out var state)
-            ? state
-            : new AppChatState(false, 0, null, "", 0);
+        => _states.TryGetValue(channelId, out var state) ? state : AppChatState.Empty;
 
     private AppChatState Save(ulong channelId, AppChatState state)
     {
