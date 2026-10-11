@@ -110,6 +110,9 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .AddField("這個伺服器學到的規矩",
                 _personas.Describe(guildId),
                 inline: false)
+            .AddField("這個頻道的專屬提示詞",
+                _personas.DescribeChannel(Context.Channel.Id) + "（`/ai cset`）",
+                inline: false)
             .AddField("每週額度",
                 _budget.Limit <= 0
                     ? $"不限（已用 {_budget.Usage.TotalTokens:N0} tokens）"
@@ -776,6 +779,118 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         };
 
         await RespondAsync(message, ephemeral: true);
+    }
+
+    /// <summary>
+    /// `/ai cset`：**管理員設定「這個頻道」專屬的提示詞**（只影響這個頻道）。
+    ///
+    /// 為什麼要有這一層（已經有 `/ai pset` 的伺服器層了）：
+    /// 伺服器層解決「整個群組的風格」，但實際上常常只有**某一個頻道**需要不一樣的規矩 ——
+    /// 例如 #公車討論 要它只談路線、#閒聊 要它放鬆並少查資料。
+    /// 用伺服器層去達成只能靠「叫它在某些時候…」那種模糊寫法，不如直接分層。
+    ///
+    /// 順序：全域（主人）→ 伺服器 → **頻道**。頻道最 specific，所以排在最後
+    /// （模型對最後的指示最聽話）—— 有衝突時以頻道層為準。
+    /// </summary>
+    [SlashCommand("cset", "設定「這個頻道」專屬的提示詞（管理員；只影響這個頻道）")]
+    public async Task ChannelPersonaSetAsync(
+        [Summary("text", "要設定的內容（一句重點；留空＝只顯示目前的設定）")] string? text = null,
+        [Summary("mode", "Append＝追加；Replace＝覆蓋掉這個頻道現有的全部")] PersonaMode mode = PersonaMode.Append,
+        [Summary("clear", "清空這個頻道的專屬提示詞")] bool clear = false)
+    {
+        var guildId = Context.Guild?.Id ?? 0;
+        var channelId = Context.Channel.Id;
+
+        if (guildId == 0)
+        {
+            await RespondAsync("這個指令要在伺服器頻道裡使用（頻道提示詞綁在頻道上）。", ephemeral: true);
+            return;
+        }
+
+        // 授權與 `/ai pset` 相同：主機端名單，或「來源伺服器按按鈕同意」過的授權
+        if (!CanSetPersona(guildId, Context.User.Id))
+        {
+            await RespondAsync(
+                NotAuthorizedMessage() + "\n\n（`/ai cset` 跟 `/ai pset` 用同一份授權。）",
+                ephemeral: true);
+            return;
+        }
+
+        // ── 清空 ─────────────────────────────────────────
+        if (clear)
+        {
+            var removed = _personas.ResetChannel(channelId);
+
+            if (removed.Count == 0)
+            {
+                await RespondAsync("這個頻道本來就沒有專屬提示詞（不用清）。", ephemeral: true);
+                return;
+            }
+
+            await RespondAsync(
+                $"🧹 已清空這個頻道的 {removed.Count} 條專屬提示詞（伺服器層與全域的規則不受影響）。\n" +
+                "下面是清掉的原文（想留就複製走）：\n" +
+                Truncate(string.Join("\n", removed.Select(l => $"• {l}")), 3500),
+                ephemeral: true);
+            return;
+        }
+
+        var current = _personas.ChannelLines(channelId);
+
+        // ── 沒給內容 → 顯示目前設定 ────────────────────────
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            var body = current.Count == 0
+                ? "（這個頻道沒有專屬提示詞）"
+                : string.Join("\n", current.Select((l, i) => $"`{i + 1}.` {Truncate(l, 300)}"));
+
+            await RespondAsync(
+                embed: new EmbedBuilder()
+                    .WithColor(new Color(0x2B, 0x6C, 0xB0))
+                    .WithTitle($"🛠 這個頻道的專屬提示詞　#{Context.Channel.Name}")
+                    .WithDescription(Truncate(body, 3500))
+                    .AddField("這個頻道 ID（給其他工具／腳本用）", $"`{channelId}`", inline: false)
+                    .AddField("順序與優先度",
+                        "**全域（主人）→ 伺服器（`/ai pset`）→ 這個頻道（`/ai cset`）**，" +
+                        "越後面越優先（模型對最後的指示最聽話）。",
+                        inline: false)
+                    .WithFooter($"共 {current.Count}/{_personas.Limits.MaxLinesPerGuild} 條｜" +
+                                "用法：/ai cset text:<內容>｜mode:Replace 覆蓋｜clear:True 清空")
+                    .Build(),
+                ephemeral: true);
+            return;
+        }
+
+        // ── 設定（追加或覆蓋）─────────────────────────────
+        var outcome = _personas.SetChannelRules(
+            channelId, Context.User.Id, text, replace: mode == PersonaMode.Replace);
+
+        var result = outcome.Result switch
+        {
+            GuildPersonaStore.LearnResult.Added =>
+                (mode == PersonaMode.Replace
+                    ? $"✅ 已**覆蓋**這個頻道的專屬提示詞（清掉 {outcome.Removed} 條舊的）。"
+                    : "✅ 已**追加**一條這個頻道的專屬提示詞。") +
+                $"\n目前共 {outcome.Lines.Count}/{_personas.Limits.MaxLinesPerGuild} 條：" +
+                Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000) +
+                "\n-# 只影響這個頻道；伺服器層與全域的規則不受影響。",
+
+            GuildPersonaStore.LearnResult.Duplicate =>
+                "ℹ️ 這條已經在裡面了（沒有重複加）。目前內容：\n" +
+                Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000),
+
+            GuildPersonaStore.LearnResult.TooLong =>
+                $"❌ 太長了（上限 {_personas.Limits.MaxLineLength} 字）。" +
+                (mode == PersonaMode.Replace ? "舊的設定**沒有**被動到。" : "請縮短成一句重點。"),
+
+            GuildPersonaStore.LearnResult.TooMany =>
+                $"❌ 這個頻道已經有 {_personas.Limits.MaxLinesPerGuild} 條（上限）了。" +
+                (mode == PersonaMode.Replace ? "舊的設定**沒有**被動到。" : "可以先 `mode:Replace` 覆蓋，或清理一些。"),
+
+            _ => "❌ 沒有內容可以設定。"
+        };
+
+        await RespondAsync(result, ephemeral: true);
     }
 
     [SlashCommand("audit", "看最近的主人操作紀錄（誰改了全域設定；只有主人看得到）")]

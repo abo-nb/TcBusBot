@@ -40,15 +40,22 @@ public sealed class ResetModule : InteractionModuleBase<SocketInteractionContext
     {
         var guildId = Context.Guild?.Id ?? 0;
         var removed = _personas.Reset(guildId);
+
+        // ⚠️ 也要清掉**這個頻道**的專屬提示詞（`/ai cset`）：
+        //    「重設」如果留下頻道層，使用者會覺得「怎麼講話還是一樣」——
+        //    因為頻道層的優先度比伺服器層高（見 GuildPersonaStore.Overlay 的順序）。
+        var removedChannel = _personas.ResetChannel(Context.Channel.Id, audit: false);
+
         var clearedChat = forgetChat && _conversations.Reset(guildId, Context.Channel.Id);
 
         Console.WriteLine($"[rest] 使用者 {Context.User.Id} 在伺服器 {guildId} 重設：" +
-                          $"{removed.Count} 條規矩（清對話記憶：{clearedChat}）");
+                          $"{removed.Count} 條規矩＋{removedChannel.Count} 條頻道提示詞" +
+                          $"（清對話記憶：{clearedChat}）");
 
-        if (removed.Count == 0 && !clearedChat)
+        if (removed.Count == 0 && removedChannel.Count == 0 && !clearedChat)
         {
             await RespondAsync(
-                "這個伺服器本來就沒有學到任何規矩，這個頻道也沒有對話記憶 —— 不需要重設。",
+                "這個伺服器本來就沒有學到任何規矩，這個頻道也沒有專屬提示詞或對話記憶 —— 不需要重設。",
                 ephemeral: true);
             return;
         }
@@ -58,6 +65,7 @@ public sealed class ResetModule : InteractionModuleBase<SocketInteractionContext
             .WithTitle("♻️ 已重設（只影響這個伺服器）")
             .WithDescription(
                 $"清掉了 **{removed.Count}** 條學到的規矩" +
+                (removedChannel.Count > 0 ? $"＋ **{removedChannel.Count}** 條這個頻道的專屬提示詞" : "") +
                 (forgetChat ? "，並忘掉這個頻道的對話記憶。" : "。（對話記憶保留）") +
                 "\n\nAI 現在回到預設的人格；其他伺服器完全不受影響。");
 
@@ -70,6 +78,11 @@ public sealed class ResetModule : InteractionModuleBase<SocketInteractionContext
 
             embed.AddField("清掉的內容（想留就複製走）", Truncate(echo, 1024), inline: false);
         }
+
+        if (removedChannel.Count > 0)
+            embed.AddField("清掉的頻道提示詞（同一個頻道可以再用 `/ai cset` 加回來）",
+                Truncate(string.Join("\n", removedChannel.Select(l => $"• {l}")), 1024),
+                inline: false);
 
         await RespondAsync(embed: embed.Build(), ephemeral: true);
     }

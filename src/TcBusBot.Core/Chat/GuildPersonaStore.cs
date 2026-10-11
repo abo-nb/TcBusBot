@@ -78,6 +78,18 @@ public sealed class GuildPersonaStore
 
     private readonly Dictionary<string, List<string>> _lines = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// **每個頻道各自**的提示詞（`/ai cset`）。
+    ///
+    /// 為什麼要有這一層：伺服器層解決「整個群組的風格」，但常常只有**某一個頻道**需要
+    /// 不同的規矩（例如 #公車討論 要它只談路線、#閒聊 要它放鬆一點且不要查資料）。
+    /// 頻道比伺服器更specific，所以它在提示詞裡的順序**排在最後**（最後的指示最聽話）。
+    ///
+    /// ⚠️ 刻意跟伺服器層分開存（不同的字典）：兩邊的 id 都是 snowflake、不會撞，
+    ///    但**分開之後「這是伺服器還是頻道的規則」不會有猜錯的空間**。
+    /// </summary>
+    private readonly Dictionary<string, List<string>> _channels = new(StringComparer.Ordinal);
+
     public GuildPersonaStore(ILlmStateStore? store = null, PersonaLimits? limits = null)
     {
         _store = store;
@@ -128,6 +140,25 @@ public sealed class GuildPersonaStore
             return _lines.TryGetValue(Key(guildId), out var list) ? list.ToList() : [];
     }
 
+    /// <summary>這個**頻道**自己的提示詞（`/ai cset`）。</summary>
+    public IReadOnlyList<string> ChannelLines(ulong channelId)
+    {
+        lock (_gate)
+            return _channels.TryGetValue(Key(channelId), out var list) ? list.ToList() : [];
+    }
+
+    /// <summary>有幾個頻道設了自己的提示詞（診斷用）。</summary>
+    public int ChannelCount
+    {
+        get { lock (_gate) return _channels.Count; }
+    }
+
+    /// <summary>所有頻道提示詞加起來幾條。</summary>
+    public int TotalChannelLines
+    {
+        get { lock (_gate) return _channels.Values.Sum(v => v.Count); }
+    }
+
     /// <summary>
     /// 要接在系統提示後面的內容（沒有學到東西時回傳空字串）。
     ///
@@ -135,11 +166,21 @@ public sealed class GuildPersonaStore
     /// 兩者都在「工具說明」之後（對最後的指示最聽話）。
     /// </summary>
     public string Overlay(ulong guildId)
+        => Overlay(guildId, channelId: 0);
+
+    /// <summary>
+    /// 要接在系統提示後面的內容（沒有規則時回傳空字串）。
+    ///
+    /// 順序：**全域（主人）→ 伺服器 → 頻道**。越後面越 specific，
+    /// 而模型對「最後的指示」最聽話 —— 所以頻道層放最後是有意的。
+    /// </summary>
+    public string Overlay(ulong guildId, ulong channelId)
     {
         var global = GlobalLines;
         var local = Lines(guildId);
+        var channel = channelId == 0 ? [] : ChannelLines(channelId);
 
-        if (global.Count == 0 && local.Count == 0) return "";
+        if (global.Count == 0 && local.Count == 0 && channel.Count == 0) return "";
 
         var sb = new StringBuilder();
         sb.AppendLine();
@@ -164,6 +205,20 @@ public sealed class GuildPersonaStore
             sb.AppendLine("（這些是**這個伺服器專屬**的偏好與知識。 Discord 的自訂表情名稱只有在這裡才有意義。）");
 
             foreach (var line in local)
+            {
+                if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
+                sb.AppendLine($"• {line}");
+            }
+        }
+
+        if (channel.Count > 0)
+        {
+            if (global.Count > 0 || local.Count > 0) sb.AppendLine();
+
+            sb.AppendLine("── 這個頻道專屬的規則（管理員用 `/ai cset` 設定的）──");
+            sb.AppendLine("（**只有這個頻道**適用。它比上面幾層更優先 —— 有衝突時以這裡為準。）");
+
+            foreach (var line in channel)
             {
                 if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
                 sb.AppendLine($"• {line}");
@@ -451,6 +506,112 @@ public sealed class GuildPersonaStore
         Save();
     }
 
+    // ─────────────────────────────────────────────────────
+    //  頻道層（`/ai cset`）—— 只影響那一個頻道
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 管理員用指令設定**這個頻道**的提示詞（追加或覆蓋）。
+    ///
+    /// 跟 <see cref="SetRules"/> 完全同一個形狀（同一組上限、同一份稽核、同樣的
+    /// 「覆蓋失敗要還原」順序），差別只在寫進的是頻道那個桶子。
+    /// 授權一樣留在呼叫端。
+    /// </summary>
+    public PersonaSetResult SetChannelRules(ulong channelId, ulong userId, string? text, bool replace)
+    {
+        var clean = Clean(text);
+        if (clean.Length == 0) return new PersonaSetResult(LearnResult.Empty, 0, ChannelLines(channelId));
+
+        if (!replace)
+        {
+            var appended = LearnChannel(channelId, clean);
+
+            if (appended == LearnResult.Added)
+                AuditAdmin(userId, "追加這個頻道的提示詞", clean);
+
+            return new PersonaSetResult(appended, 0, ChannelLines(channelId));
+        }
+
+        // 覆蓋模式的順序跟伺服器層一樣：清掉舊的 → 寫新的 → 寫不進去就還原
+        var backup = ResetChannel(channelId, audit: false);
+        var result = LearnChannel(channelId, clean);
+
+        if (result != LearnResult.Added)
+        {
+            lock (_gate)
+                if (backup.Count > 0) _channels[Key(channelId)] = backup.ToList();
+
+            Save();
+            return new PersonaSetResult(result, 0, ChannelLines(channelId));
+        }
+
+        AuditAdmin(userId, "設定這個頻道的提示詞（覆蓋全部）", clean);
+
+        return new PersonaSetResult(result, backup.Count, ChannelLines(channelId));
+    }
+
+    /// <summary>學一條到頻道桶子（與伺服器層共用同一組上限與去重規則）。</summary>
+    public LearnResult LearnChannel(ulong channelId, string? text)
+    {
+        var clean = Clean(text);
+        if (clean.Length == 0) return LearnResult.Empty;
+        if (clean.Length > Limits.MaxLineLength) return LearnResult.TooLong;
+
+        lock (_gate)
+        {
+            if (!_channels.TryGetValue(Key(channelId), out var list))
+                _channels[Key(channelId)] = list = [];
+
+            if (list.Any(l => string.Equals(l, clean, StringComparison.Ordinal))) return LearnResult.Duplicate;
+            if (list.Count >= Limits.MaxLinesPerGuild) return LearnResult.TooMany;
+
+            list.Add(clean);
+            TrimChannels();
+        }
+
+        Save();
+        return LearnResult.Added;
+    }
+
+    /// <summary>清掉這個頻道的提示詞（回傳被清掉的內容，讓呼叫端可以顯示原文）。</summary>
+    public IReadOnlyList<string> ResetChannel(ulong channelId, bool audit = true)
+    {
+        List<string> removed;
+
+        lock (_gate)
+        {
+            if (!_channels.Remove(Key(channelId), out var list)) return [];
+            removed = list.ToList();
+        }
+
+        Save();
+
+        if (audit) AuditAdmin(0, "清空這個頻道的提示詞", $"{removed.Count} 條");
+
+        return removed;
+    }
+
+    /// <summary>頻道桶子的數量上限（跟伺服器層共用同一個數字）。</summary>
+    private void TrimChannels()
+    {
+        while (_channels.Count > Limits.MaxGuilds)
+        {
+            // 淘汰「條數最少」的那一個（跟伺服器層一致的策略）
+            var smallest = _channels.OrderBy(kv => kv.Value.Count).First().Key;
+            _channels.Remove(smallest);
+        }
+    }
+
+    /// <summary>給 `/ai cset` 看的一行說明。</summary>
+    public string DescribeChannel(ulong channelId)
+    {
+        var count = ChannelLines(channelId).Count;
+
+        return count == 0
+            ? "這個頻道沒有專屬提示詞（它只會用伺服器層與全域的規則）"
+            : $"這個頻道有 {count}/{Limits.MaxLinesPerGuild} 條專屬提示詞（只影響這個頻道）";
+    }
+
     /// <summary>給 `/ai status`／log 看的一行說明。</summary>
     public string Describe(ulong guildId)
     {
@@ -533,14 +694,21 @@ public sealed class GuildPersonaStore
         lock (_gate) return JsonSerializer.Serialize(Snapshot(), Json);
     }
 
-    /// <summary>要存下來的內容（規則 ＋ 主人操作紀錄）。</summary>
+    /// <summary>要存下來的內容（規則 ＋ 頻道規則 ＋ 主人操作紀錄）。</summary>
     private Persisted Snapshot()
-        => new(_lines, _audit.TakeLast(Limits.MaxAuditEntries).ToList());
+        => new(_lines, _audit.TakeLast(Limits.MaxAuditEntries).ToList(),
+               _channels.Count == 0 ? null : _channels);
 
-    /// <summary>存檔格式（舊版的「純字典」也讀得進來）。</summary>
+    /// <summary>
+    /// 存檔格式（舊版的「純字典」也讀得進來）。
+    ///
+    /// <c>channels</c> 是後加的（頻道層提示詞）—— 舊的存檔沒有這個欄位，
+    /// 所以它是可空的：讀不到就是「沒有頻道規則」，不是錯誤。
+    /// </summary>
     private sealed record Persisted(
         [property: JsonPropertyName("lines")] Dictionary<string, List<string>> Lines,
-        [property: JsonPropertyName("audit")] List<AuditEntry> Audit);
+        [property: JsonPropertyName("audit")] List<AuditEntry> Audit,
+        [property: JsonPropertyName("channels")] Dictionary<string, List<string>>? Channels = null);
 
     private void Load()
     {
@@ -568,9 +736,13 @@ public sealed class GuildPersonaStore
             {
                 _lines.Clear();
                 _audit.Clear();
+                _channels.Clear();
 
                 foreach (var (key, value) in current?.Lines ?? legacy ?? [])
                     if (value is { Count: > 0 }) _lines[key] = value.Take(Limits.MaxLinesPerGuild).ToList();
+
+                foreach (var (key, value) in current?.Channels ?? [])
+                    if (value is { Count: > 0 }) _channels[key] = value.Take(Limits.MaxLinesPerGuild).ToList();
 
                 if (current?.Audit is { Count: > 0 })
                     _audit.AddRange(current.Audit.TakeLast(Limits.MaxAuditEntries));

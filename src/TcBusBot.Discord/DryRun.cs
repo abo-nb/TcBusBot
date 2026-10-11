@@ -1723,7 +1723,7 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "test", "think" };
+            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "cset", "test", "think" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)
@@ -1797,6 +1797,32 @@ public static class DryRun
             // ── 授權按鈕：同意的人要真的被檢查資格 ────────────
             var approver = typeof(PersonaGrantModule).GetMethod(nameof(PersonaGrantModule.IsApprover));
             var approverCalls = approver is null ? [] : CollectCalls(approver, resolveAll: true);
+
+            // ── /ai cset：**頻道層**提示詞（管理員；只影響那個頻道）────────
+            var cset = typeof(ChatModule).GetMethod(nameof(ChatModule.ChannelPersonaSetAsync));
+            var csetCalls = cset is null ? [] : CollectCalls(cset, resolveAll: true);
+
+            if (cset is null)
+                Problem("找不到 ChatModule.ChannelPersonaSetAsync —— /ai cset 不見了");
+            else if (!csetCalls.Contains("ChatModule.CanSetPersona"))
+                Problem("/ai cset 沒有擋人 —— 任何人都能改這個頻道的提示詞");
+            else if (!csetCalls.Contains("GuildPersonaStore.SetChannelRules"))
+                Problem("/ai cset 沒有走 SetChannelRules（覆蓋模式的安全順序會失效）");
+            else if (!csetCalls.Contains("GuildPersonaStore.ChannelLines"))
+                Problem("/ai cset 沒有讀頻道層的內容（顯示目前設定會是空的）");
+            else if (!csetCalls.Contains("GuildPersonaStore.ResetChannel"))
+                Problem("/ai cset clear 沒有清頻道層（只會清到別的層）");
+            else
+                Console.WriteLine("  ✔ /ai cset 只改這個頻道（授權走 CanSetPersona，覆蓋／清空都走頻道層）");
+
+            // /rest 也要清頻道層 —— 不然「重設」之後講話還是一樣（頻道層優先度最高）
+            var rest = typeof(ResetModule).GetMethod(nameof(ResetModule.RestAsync));
+            var restCalls = rest is null ? [] : CollectCalls(rest, resolveAll: true);
+
+            if (rest is null)
+                Problem("找不到 ResetModule.RestAsync");
+            else if (!restCalls.Contains("GuildPersonaStore.ResetChannel"))
+                Problem("/rest 沒有清掉這個頻道的專屬提示詞 —— 重設之後行為不會變（頻道層比伺服器層優先）");
 
             var notice = typeof(PersonaGrantModule).GetMethod("HandleAsync",
                 BindingFlags.Instance | BindingFlags.NonPublic);

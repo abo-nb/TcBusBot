@@ -183,7 +183,7 @@ public sealed class ChatOrchestrator
     /// </summary>
     public string EffectiveSystemPrompt(
         ulong guildId, bool isOwner = false, bool ambientContext = false, string? selfName = null,
-        string? cityNote = null)
+        string? cityNote = null, ulong channelId = 0)
     {
         var prompt = isOwner
             ? OwnerInstructions.TrimStart() + "\n\n" + _options.SystemPrompt
@@ -209,7 +209,8 @@ public sealed class ChatOrchestrator
         if (ambientContext)
             prompt += AmbientContextNote;
 
-        return prompt + _personas.Overlay(guildId);
+        // 順序：全域（主人）→ 伺服器 → **頻道**（最後＝最優先，見 Overlay 的說明）
+        return prompt + _personas.Overlay(guildId, channelId);
     }
 
     /// <summary>
@@ -499,7 +500,8 @@ public sealed class ChatOrchestrator
                 admin.IsAdmin,
                 ambientContext: trimmed.Turns.Any(t => t.Ambient),
                 selfName: selfName,
-                cityNote: CityNoteFor(incoming.AuthorId))
+                cityNote: CityNoteFor(incoming.AuthorId),
+                channelId: channelId)
                 + (fromApp ? AppChatNote : "")
                 + ExtraNoteText(extraNote),
             History: trimmed.Turns,

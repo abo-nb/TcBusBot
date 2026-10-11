@@ -4351,6 +4351,120 @@ public static class SelfTest
 
         Check("★ 人類的訊息不會被 App 的上限影響（上限只算 App 的）",
             mixed is not null && mixed.CurrentTurnCount == 4, $"目前 {mixed?.CurrentTurnCount} 則");
+
+        // ── 1h) 頻道層提示詞（管理員用 /ai cset；只影響那個頻道）──────────
+        //      使用者的需求：「管理员可以单独设定频道的系统提示词（仅限该频道）」。
+        //      最關鍵的是**分層與優先順序**：全域 → 伺服器 → 頻道，
+        //      頻道層排最後（模型對最後的指示最聽話），而且**不能影響別的頻道**。
+        TestChannelPersona();
+    }
+
+    /// <summary>
+    /// 頻道層提示詞（`/ai cset`）：只影響那一個頻道，而且優先度高於伺服器層。
+    /// </summary>
+    private static void TestChannelPersona()
+    {
+        var memory = new FakeStateStore();
+        var store = new GuildPersonaStore(memory);
+
+        const ulong guild = 111UL;
+        const ulong busChannel = 222UL;
+        const ulong chatChannel = 333UL;
+        const ulong admin = 999UL;
+
+        store.Learn(guild, "伺服器層：一律用繁體中文");
+        store.SetRules(guild, admin, "伺服器層：回答前先確認站名", replace: false);
+
+        var set = store.SetChannelRules(busChannel, admin, "頻道層：這裡只談公車路線，不要閒聊", replace: false);
+
+        Check("★ 頻道層可以單獨設定（而且只寫進那個頻道）",
+            set.Ok
+            && store.ChannelLines(busChannel).Count == 1
+            && store.ChannelLines(chatChannel).Count == 0,
+            store.DescribeChannel(busChannel));
+
+        Check("★ 頻道層不影響伺服器層（兩邊各自獨立）",
+            store.Lines(guild).Count == 2 && store.TotalChannelLines == 1 && store.ChannelCount == 1);
+
+        var overlay = store.Overlay(guild, busChannel);
+
+        Check("★ 提示詞順序：伺服器層在頻道層之前，而且頻道層是最後一段",
+            overlay.IndexOf("這個伺服器後天學到的規則", StringComparison.Ordinal)
+            < overlay.IndexOf("這個頻道專屬的規則", StringComparison.Ordinal)
+            && overlay.Contains("只談公車路線", StringComparison.Ordinal),
+            overlay.Replace("\n", " ｜ "));
+
+        Check("★ 頻道層有講清楚「只有這個頻道適用、衝突時以這裡為準」",
+            overlay.Contains("只有這個頻道", StringComparison.Ordinal)
+            && overlay.Contains("以這裡為準", StringComparison.Ordinal));
+
+        Check("★ 別的頻道拿到的提示詞不含那一條（只限該頻道）",
+            !store.Overlay(guild, chatChannel).Contains("只談公車路線", StringComparison.Ordinal)
+            && store.Overlay(guild, chatChannel).Contains("回答前先確認站名", StringComparison.Ordinal));
+
+        Check("沒設頻道層時，overlay 不會多出空的段落",
+            !store.Overlay(guild, 0).Contains("這個頻道專屬的規則", StringComparison.Ordinal));
+
+        var replaced = store.SetChannelRules(busChannel, admin, "頻道層：只回答路線與時刻", replace: true);
+
+        Check("★ 覆蓋模式只覆蓋頻道層（伺服器層完好）",
+            replaced.Removed == 1
+            && store.ChannelLines(busChannel).Count == 1
+            && store.Lines(guild).Count == 2,
+            $"頻道 {store.ChannelLines(busChannel).Count} 條／伺服器 {store.Lines(guild).Count} 條");
+
+        Check("重複的內容不會重複加（回 Duplicate）",
+            store.SetChannelRules(busChannel, admin, "頻道層：只回答路線與時刻", replace: false).Result
+                == GuildPersonaStore.LearnResult.Duplicate);
+
+        Check("★ 頻道層也受同一組長度上限（太長會被擋，而且舊的沒有被動到）",
+            store.SetChannelRules(busChannel, admin, new string('字', store.Limits.MaxLineLength + 1), replace: true).Result
+                == GuildPersonaStore.LearnResult.TooLong
+            && store.ChannelLines(busChannel).Count == 1);
+
+        var cleared = store.ResetChannel(busChannel);
+
+        Check("★ 清空只清頻道層（伺服器層留著）",
+            cleared.Count == 1
+            && store.ChannelLines(busChannel).Count == 0
+            && store.Lines(guild).Count == 2);
+
+        store.SetChannelRules(busChannel, admin, "頻道層：講話簡短一點", replace: false);
+        store.SetChannelRules(chatChannel, admin, "頻道層：這裡可以放鬆閒聊", replace: false);
+
+        var reloaded = new GuildPersonaStore(memory);
+
+        Check("★ 頻道層跨重啟（不然重啟就全部忘了）",
+            reloaded.ChannelLines(busChannel).Count == 1
+            && reloaded.ChannelLines(chatChannel).Count == 1
+            && reloaded.ChannelCount == 2,
+            reloaded.DescribeChannel(chatChannel));
+
+        Check("★ 舊格式的存檔也讀得進來（沒有 channels 欄位時不當成錯誤）",
+            new GuildPersonaStore(new FakeStateStore()).ChannelCount == 0);
+
+        Check("★ 改頻道提示詞會留主人操作紀錄（/ai audit 看得到）",
+            store.AuditLog(20).Any(e => e.Describe().Contains("頻道", StringComparison.Ordinal)),
+            string.Join(" ｜ ", store.AuditLog(3).Select(e => e.Describe())));
+
+        var options = new LlmOptions { SystemPrompt = "你是貓貓", ToolsEnabled = false };
+        var llm = new CountingLlmClient("好");
+
+        var chat = new ChatOrchestrator(
+            llm, options, new ConversationStore(options), new WeeklyTokenBudget(options),
+            NoChatTools.Instance, store);
+
+        var prompt = chat.EffectiveSystemPrompt(guild, channelId: busChannel);
+
+        Check("★ 模型真的會看到頻道層的內容（而且排在伺服器層之後）",
+            prompt.Contains("講話簡短一點", StringComparison.Ordinal)
+            && prompt.IndexOf("這個伺服器後天學到的規則", StringComparison.Ordinal)
+               < prompt.IndexOf("這個頻道專屬的規則", StringComparison.Ordinal),
+            prompt.Length > 200 ? prompt[^200..].Replace("\n", " ｜ ") : prompt);
+
+        Check("★ 別的頻道只看到自己那一份（頻道之間完全隔離）",
+            chat.EffectiveSystemPrompt(guild, channelId: chatChannel).Contains("可以放鬆閒聊", StringComparison.Ordinal)
+            && !chat.EffectiveSystemPrompt(guild, channelId: chatChannel).Contains("講話簡短一點", StringComparison.Ordinal));
     }
 
     /// <summary>
