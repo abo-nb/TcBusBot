@@ -2053,9 +2053,23 @@ public static class SelfTest
             store.Lines(guildA)[^1] == "換行 也要 變成空白", store.Lines(guildA)[^1]);
 
         // ── 4) 上限 ──────────────────────────────────────
-        var longLine = new string('長', PersonaLimits.Default.MaxLineLength + 1);
-        Check("★ 太長的一條會被拒絕（不讓它變成記事本）",
-            store.Learn(guildA, longLine) == GuildPersonaStore.LearnResult.TooLong);
+        // ⚠️ 預設已經**沒有**字數上限（使用者要求拿掉原本的 300 字）——
+        //    所以這裡用「自己指定上限」的 store 來驗那個機制還在。
+        var lengthCapped = new GuildPersonaStore(new FakeStateStore(), new PersonaLimits { MaxLineLength = 300 });
+        var longLine = new string('長', 301);
+
+        Check("★ 有設定字數上限時，太長的一條會被拒絕（機制還在）",
+            lengthCapped.Learn(guildA, longLine) == GuildPersonaStore.LearnResult.TooLong);
+
+        Check("★ 預設沒有字數上限：一整段（比 300 字長很多）也存得進去",
+            longLine.Length > PersonaLimits.Default.MaxLineLength
+            && store.Learn(guildA, longLine) == GuildPersonaStore.LearnResult.Added,
+            $"預設上限 = {PersonaLimits.Default.MaxLineLength}（0 ＝ 不限）");
+
+        Check("預設的總長煞車仍然存在（提示詞每輪都會重送，這個不能拿掉）",
+            new LlmOptions().MaxOverlayChars > 0
+            && PersonaLimits.Default.MaxOverlayLength > 0,
+            $"{PersonaLimits.Default.MaxOverlayLength} 字");
 
         var guildC = 333UL;
         var added = 0;
@@ -4417,10 +4431,29 @@ public static class SelfTest
             store.SetChannelRules(busChannel, admin, "頻道層：只回答路線與時刻", replace: false).Result
                 == GuildPersonaStore.LearnResult.Duplicate);
 
-        Check("★ 頻道層也受同一組長度上限（太長會被擋，而且舊的沒有被動到）",
-            store.SetChannelRules(busChannel, admin, new string('字', store.Limits.MaxLineLength + 1), replace: true).Result
+        // 預設沒有字數上限，但「總長」煞車還在，而且截掉幾條要**講出來**
+        var tight = new GuildPersonaStore(new FakeStateStore(), new PersonaLimits { MaxOverlayLength = 200 });
+
+        tight.SetChannelRules(busChannel, admin, "第一條：要講重點", replace: false);
+        tight.SetChannelRules(busChannel, admin, new string('字', 400), replace: false);
+
+        var counts = tight.OverlayCounts(guild, busChannel);
+
+        Check("★ 總長上限截掉規則時「算得出來」（才能顯示給使用者看，不會默默吃掉）",
+            counts.Included == 1 && counts.Dropped == 1,
+            $"接進去 {counts.Included} 條／被截掉 {counts.Dropped} 條");
+
+        Check("★ 預設沒有字數上限 → 300 字以上的長規則真的存得進去（就是使用者要的）",
+            tight.ChannelLines(busChannel).Any(l => l.Length > 300),
+            $"最長 {tight.ChannelLines(busChannel).Max(l => l.Length)} 字");
+
+        var strict = new GuildPersonaStore(new FakeStateStore(), new PersonaLimits { MaxLineLength = 300 });
+        strict.SetChannelRules(busChannel, admin, "頻道層：只回答路線與時刻", replace: false);
+
+        Check("★ 頻道層也受同一組長度上限（有設上限時，太長會被擋、舊的沒有被動到）",
+            strict.SetChannelRules(busChannel, admin, new string('字', 301), replace: true).Result
                 == GuildPersonaStore.LearnResult.TooLong
-            && store.ChannelLines(busChannel).Count == 1);
+            && strict.ChannelLines(busChannel).Count == 1);
 
         var cleared = store.ResetChannel(busChannel);
 

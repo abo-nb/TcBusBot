@@ -15,9 +15,9 @@ namespace TcBusBot.Core.Chat;
 ///
 /// 對應的環境變數：
 ///   * <see cref="MaxLinesPerGuild"/>　`LLM_MAX_GUILD_RULES`（預設 40）
-///   * <see cref="MaxLineLength"/>　　 `LLM_MAX_RULE_CHARS`（預設 300）
+///   * <see cref="MaxLineLength"/>　　 `LLM_MAX_RULE_CHARS`（**預設 0 ＝ 不限**）
 ///   * <see cref="MaxGuilds"/>　　　　 `LLM_MAX_PERSONA_GUILDS`（預設 200）
-///   * <see cref="MaxOverlayLength"/>　`LLM_MAX_OVERLAY_CHARS`（預設 2000）
+///   * <see cref="MaxOverlayLength"/>　`LLM_MAX_OVERLAY_CHARS`（預設 8000）
 ///   * <see cref="MaxAuditEntries"/>　 `LLM_MAX_AUDIT_ENTRIES`（預設 200）
 /// </summary>
 public sealed record PersonaLimits
@@ -28,22 +28,34 @@ public sealed record PersonaLimits
     /// <summary>每個伺服器最多幾條（全域規則那個桶子也共用這個上限）。</summary>
     public int MaxLinesPerGuild { get; init; } = 40;
 
-    /// <summary>每一條最多幾個字。</summary>
-    public int MaxLineLength { get; init; } = 300;
+    /// <summary>
+    /// 每一條規則最多幾個字（`0` ＝ **不限**）。
+    ///
+    /// 使用者要求把原本的 300 字上限拿掉 —— 管理員常常想寫一整段
+    /// （好幾條指示、範例、例外），300 字一下就滿了。
+    /// 真正防止提示詞爆掉的是 <see cref="MaxOverlayLength"/>（總長），所以放寬這裡是安全的。
+    /// </summary>
+    public int MaxLineLength { get; init; }
 
     /// <summary>最多幾個伺服器可以有自己的規則（超過淘汰「條數最少」的那個）。</summary>
     public int MaxGuilds { get; init; } = 200;
 
-    /// <summary>接進提示詞的總長上限（字元）。這是「每次對話要多花多少 token」的煞車。</summary>
-    public int MaxOverlayLength { get; init; } = 2000;
+    /// <summary>
+    /// 接進提示詞的總長上限（字元）。這是「每次對話要多花多少 token」的煞車。
+    ///
+    /// ⚠️ 超過時是**截掉後面的規則**，而且呼叫端可以問 <see cref="GuildPersonaStore.OverlayCounts"/>
+    ///    知道「有幾條沒接進去」—— 這個一定要顯示給使用者看（默默吃掉會讓人以為設定沒生效）。
+    /// </summary>
+    public int MaxOverlayLength { get; init; } = 8000;
 
     /// <summary>主人操作紀錄最多留幾筆。</summary>
     public int MaxAuditEntries { get; init; } = 200;
 
     /// <summary>給 log／`--dryrun`／`/ai status` 看的一行摘要。</summary>
     public string Describe()
-        => $"每伺服器最多 {MaxLinesPerGuild} 條 × {MaxLineLength} 字、" +
-           $"最多 {MaxGuilds} 個伺服器有規則、接進提示詞最多 {MaxOverlayLength} 字、" +
+        => $"每層最多 {MaxLinesPerGuild} 條 × " +
+           (MaxLineLength > 0 ? $"{MaxLineLength} 字" : "不限字數") +
+           $"、最多 {MaxGuilds} 個範圍有規則、接進提示詞最多 {MaxOverlayLength} 字、" +
            $"主人紀錄 {MaxAuditEntries} 筆";
 }
 
@@ -175,14 +187,36 @@ public sealed class GuildPersonaStore
     /// 而模型對「最後的指示」最聽話 —— 所以頻道層放最後是有意的。
     /// </summary>
     public string Overlay(ulong guildId, ulong channelId)
+        => BuildOverlay(guildId, channelId).Text;
+
+    /// <summary>
+    /// 「接進提示詞的規則有幾條被總長度截掉了」。
+    ///
+    /// ⚠️ 為什麼一定要有這個：<c>MaxOverlayLength</c> 是**必要**的煞車
+    ///    （提示詞每一輪都會重送），但「截掉」如果不出聲，使用者的體驗是
+    ///    「我明明設定了，它卻沒照做」—— 而且完全查不出原因。
+    ///    所以設定當下與 `/ai status` 都要把這件事講出來。
+    /// </summary>
+    public (int Included, int Dropped) OverlayCounts(ulong guildId, ulong channelId)
+    {
+        var (text, included, dropped) = BuildOverlay(guildId, channelId);
+
+        _ = text;
+        return (included, dropped);
+    }
+
+    private (string Text, int Included, int Dropped) BuildOverlay(ulong guildId, ulong channelId)
     {
         var global = GlobalLines;
         var local = Lines(guildId);
         var channel = channelId == 0 ? [] : ChannelLines(channelId);
 
-        if (global.Count == 0 && local.Count == 0 && channel.Count == 0) return "";
+        if (global.Count == 0 && local.Count == 0 && channel.Count == 0) return ("", 0, 0);
 
         var sb = new StringBuilder();
+        var included = 0;
+        var dropped = 0;
+
         sb.AppendLine();
         sb.AppendLine();
 
@@ -192,8 +226,9 @@ public sealed class GuildPersonaStore
 
             foreach (var line in global)
             {
-                if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
+                if (sb.Length + line.Length > Limits.MaxOverlayLength) { dropped++; continue; }
                 sb.AppendLine($"• {line}");
+                included++;
             }
 
             if (local.Count > 0) sb.AppendLine();
@@ -206,8 +241,9 @@ public sealed class GuildPersonaStore
 
             foreach (var line in local)
             {
-                if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
+                if (sb.Length + line.Length > Limits.MaxOverlayLength) { dropped++; continue; }
                 sb.AppendLine($"• {line}");
+                included++;
             }
         }
 
@@ -220,12 +256,13 @@ public sealed class GuildPersonaStore
 
             foreach (var line in channel)
             {
-                if (sb.Length + line.Length > Limits.MaxOverlayLength) break;
+                if (sb.Length + line.Length > Limits.MaxOverlayLength) { dropped++; continue; }
                 sb.AppendLine($"• {line}");
+                included++;
             }
         }
 
-        return sb.ToString().TrimEnd();
+        return (sb.ToString().TrimEnd(), included, dropped);
     }
 
     public enum LearnResult
@@ -288,7 +325,7 @@ public sealed class GuildPersonaStore
     {
         var clean = Clean(text);
         if (clean.Length == 0) return LearnResult.Empty;
-        if (clean.Length > Limits.MaxLineLength) return LearnResult.TooLong;
+        if (Limits.MaxLineLength > 0 && clean.Length > Limits.MaxLineLength) return LearnResult.TooLong;
 
         lock (_gate)
         {
@@ -555,7 +592,7 @@ public sealed class GuildPersonaStore
     {
         var clean = Clean(text);
         if (clean.Length == 0) return LearnResult.Empty;
-        if (clean.Length > Limits.MaxLineLength) return LearnResult.TooLong;
+        if (Limits.MaxLineLength > 0 && clean.Length > Limits.MaxLineLength) return LearnResult.TooLong;
 
         lock (_gate)
         {

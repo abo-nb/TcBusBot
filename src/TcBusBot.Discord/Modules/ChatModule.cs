@@ -108,10 +108,11 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                         : "❌ 已關閉（LLM_TOOLS=false）→ 只會聊天，不會動到你的訂閱",
                 inline: false)
             .AddField("這個伺服器學到的規矩",
-                _personas.Describe(guildId),
+                _personas.Describe(guildId) + OverlayWarning(guildId, 0),
                 inline: false)
             .AddField("這個頻道的專屬提示詞",
-                _personas.DescribeChannel(Context.Channel.Id) + "（`/ai cset`）",
+                _personas.DescribeChannel(Context.Channel.Id) +
+                "（`/ai cset`）" + OverlayWarning(guildId, Context.Channel.Id),
                 inline: false)
             .AddField("每週額度",
                 _budget.Limit <= 0
@@ -768,7 +769,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000),
 
             GuildPersonaStore.LearnResult.TooLong =>
-                $"❌ 太長了（上限 {_personas.Limits.MaxLineLength} 字）。" +
+                $"❌ 太長了（上限 {_personas.Limits.MaxLineLength} 字；" +
+                "主機可以用 `LLM_MAX_RULE_CHARS=0` 取消這個上限）。" +
                 (mode == PersonaMode.Replace ? "舊的設定**沒有**被動到。" : "請縮短成一句重點。"),
 
             GuildPersonaStore.LearnResult.TooMany =>
@@ -777,6 +779,13 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
 
             _ => "❌ 沒有內容可以設定。"
         };
+
+        // ⚠️ 同上：總長上限截掉的規則要講出來（不然「設定了卻沒生效」查不出原因）
+        var (_, droppedLines) = _personas.OverlayCounts(guildId, 0);
+
+        if (outcome.Result == GuildPersonaStore.LearnResult.Added && droppedLines > 0)
+            message += $"\n\n⚠️ 有 **{droppedLines}** 條因為提示詞總長上限（`LLM_MAX_OVERLAY_CHARS` = " +
+                       $"{_personas.Limits.MaxOverlayLength} 字）**沒有接進提示詞**。";
 
         await RespondAsync(message, ephemeral: true);
     }
@@ -880,7 +889,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 Truncate(string.Join("\n", outcome.Lines.Select(l => $"• {l}")), 3000),
 
             GuildPersonaStore.LearnResult.TooLong =>
-                $"❌ 太長了（上限 {_personas.Limits.MaxLineLength} 字）。" +
+                $"❌ 太長了（上限 {_personas.Limits.MaxLineLength} 字；" +
+                "主機可以用 `LLM_MAX_RULE_CHARS=0` 取消這個上限）。" +
                 (mode == PersonaMode.Replace ? "舊的設定**沒有**被動到。" : "請縮短成一句重點。"),
 
             GuildPersonaStore.LearnResult.TooMany =>
@@ -889,6 +899,15 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
 
             _ => "❌ 沒有內容可以設定。"
         };
+
+        // ⚠️ 一定要講「有幾條因為總長上限沒接進提示詞」——
+        //    默默截掉會讓使用者覺得「我明明設定了，它卻沒照做」。
+        var (_, dropped) = _personas.OverlayCounts(guildId, channelId);
+
+        if (outcome.Result == GuildPersonaStore.LearnResult.Added && dropped > 0)
+            result += $"\n\n⚠️ 有 **{dropped}** 條因為提示詞總長上限（`LLM_MAX_OVERLAY_CHARS` = " +
+                      $"{_personas.Limits.MaxOverlayLength} 字）**沒有接進提示詞** —— " +
+                      "它們還在（`/ai cset` 看得到），只是每次對話不會送出去。";
 
         await RespondAsync(result, ephemeral: true);
     }
@@ -941,6 +960,22 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                 ? "🧹 已經忘掉這個頻道的對話記憶。下一句會當成全新的對話。"
                 : "這個頻道本來就沒有記憶（沒聊過，或被清過了）。",
             ephemeral: true);
+    }
+
+    /// <summary>
+    /// 「有幾條規則因為提示詞總長上限而沒有被送出去」的警告（沒有就回空字串）。
+    ///
+    /// 為什麼要顯示：總長上限是必要的煞車（提示詞每一輪都會重送），
+    /// 但它截掉規則時如果不出聲，使用者看到的是「我明明設定了，它卻沒照做」——
+    /// 而且完全查不出原因（設定還在、指令也說成功）。
+    /// </summary>
+    private string OverlayWarning(ulong guildId, ulong channelId)
+    {
+        var (_, dropped) = _personas.OverlayCounts(guildId, channelId);
+
+        return dropped == 0
+            ? ""
+            : $"\n⚠️ 有 {dropped} 條因為總長上限（{_personas.Limits.MaxOverlayLength} 字）沒有接進提示詞。";
     }
 
     private static string DescribeKey(string key)

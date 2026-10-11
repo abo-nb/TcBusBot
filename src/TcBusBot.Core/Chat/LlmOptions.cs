@@ -363,14 +363,30 @@ public sealed class LlmOptions
     /// <summary>每個伺服器最多學幾條規則（環境變數 `LLM_MAX_GUILD_RULES`，預設 40）。</summary>
     public int MaxGuildRules { get; set; } = 40;
 
-    /// <summary>每一條規則最多幾個字（環境變數 `LLM_MAX_RULE_CHARS`，預設 300）。</summary>
-    public int MaxRuleChars { get; set; } = 300;
+    /// <summary>
+    /// 每一條規則最多幾個字（環境變數 `LLM_MAX_RULE_CHARS`）。
+    ///
+    /// **預設 0 ＝ 不限**（使用者要求把原本的 300 字上限拿掉）——
+    /// 管理員常常想寫一整段（好幾條指示、範例、例外），300 字一下就滿了。
+    /// 想節制 token 的人可以把它設成一個數字（例如 300）。
+    ///
+    /// ⚠️ 真正防止提示詞爆掉的是下面的 <see cref="MaxOverlayChars"/>（總長），
+    ///    所以放寬這裡**不會**讓每次對話的錢無上限 —— 只會被總長截掉，
+    ///    而截掉幾條會**顯示出來**（不會默默吃掉，見 `GuildPersonaStore.OverlayCounts`）。
+    /// </summary>
+    public int MaxRuleChars { get; set; }
 
     /// <summary>最多幾個伺服器可以有自己的規則（環境變數 `LLM_MAX_PERSONA_GUILDS`，預設 200）。</summary>
     public int MaxPersonaGuilds { get; set; } = 200;
 
-    /// <summary>規則接進提示詞的總長上限（環境變數 `LLM_MAX_OVERLAY_CHARS`，預設 2000）。</summary>
-    public int MaxOverlayChars { get; set; } = 2000;
+    /// <summary>
+    /// 規則接進提示詞的總長上限（環境變數 `LLM_MAX_OVERLAY_CHARS`，預設 8000）。
+    ///
+    /// 這是「每次對話的錢」的煞車（提示詞每一輪都會重送）。
+    /// 原本預設 2000，但單條規則放寬到不限之後，2000 會讓「一段正常的長指示」被截掉 ——
+    /// 所以預設放寬到 8000（約 3～5k tokens），仍然是有意義的上限。
+    /// </summary>
+    public int MaxOverlayChars { get; set; } = 8000;
 
     /// <summary>主人操作紀錄最多留幾筆（環境變數 `LLM_MAX_AUDIT_ENTRIES`，預設 200）。</summary>
     public int MaxAuditEntries { get; set; } = 200;

@@ -272,8 +272,9 @@ public sealed class BotConfig
                 ["LLM_MAX_GUILD_RULES"]).Value, out var guildRules) && guildRules is >= 1 and <= 500)
             cfg.Llm.MaxGuildRules = guildRules;
 
+        // 0 = 不限（預設）；想節制 token 的人才設一個數字
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-rule-chars", file,
-                ["LLM_MAX_RULE_CHARS"]).Value, out var ruleChars) && ruleChars is >= 20 and <= 4000)
+                ["LLM_MAX_RULE_CHARS"]).Value, out var ruleChars) && ruleChars is >= 0 and <= 100_000)
             cfg.Llm.MaxRuleChars = ruleChars;
 
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-persona-guilds", file,
@@ -281,7 +282,7 @@ public sealed class BotConfig
             cfg.Llm.MaxPersonaGuilds = personaGuilds;
 
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-overlay-chars", file,
-                ["LLM_MAX_OVERLAY_CHARS"]).Value, out var overlayChars) && overlayChars is >= 100 and <= 20_000)
+                ["LLM_MAX_OVERLAY_CHARS"]).Value, out var overlayChars) && overlayChars is >= 100 and <= 200_000)
             cfg.Llm.MaxOverlayChars = overlayChars;
 
         if (int.TryParse(SettingResolver.Resolve(args, "--llm-audit-entries", file,

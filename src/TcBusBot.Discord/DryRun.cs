@@ -2487,12 +2487,18 @@ public static class DryRun
 
         Console.WriteLine($"  ℹ 學到的規矩：{limits.Describe()}");
 
-        if (limits.MaxOverlayLength < limits.MaxLineLength)
+        // ⚠️ 0 ＝ 不限字數（預設）：這時候「單條上限 vs 總長」的比較沒有意義，
+        //    因為單條可以是無限長 —— 真正會截掉東西的是總長，那由下面的提示負責講。
+        if (limits.MaxLineLength > 0 && limits.MaxOverlayLength < limits.MaxLineLength)
             Problem($"LLM_MAX_OVERLAY_CHARS（{limits.MaxOverlayLength}）比單一條的上限" +
                     $"（LLM_MAX_RULE_CHARS={limits.MaxLineLength}）還小 —— 一條都可能塞不進提示詞");
 
-        if (limits.MaxLinesPerGuild * limits.MaxLineLength > limits.MaxOverlayLength * 4)
-            Console.WriteLine($"  ℹ 提示：每伺服器最多 {limits.MaxLinesPerGuild} 條 × {limits.MaxLineLength} 字，" +
+        if (limits.MaxLineLength <= 0)
+            Console.WriteLine("  ℹ 單條規則**沒有字數上限**（LLM_MAX_RULE_CHARS=0）—— " +
+                              $"真正的煞車是總長 {limits.MaxOverlayLength} 字，" +
+                              "超過的部分會被截掉而且會顯示出來（不會默默吃掉）");
+        else if (limits.MaxLinesPerGuild * limits.MaxLineLength > limits.MaxOverlayLength * 4)
+            Console.WriteLine($"  ℹ 提示：每層最多 {limits.MaxLinesPerGuild} 條 × {limits.MaxLineLength} 字，" +
                               $"但接進提示詞只留 {limits.MaxOverlayLength} 字 —— " +
                               "後面的規則會被截掉（想全部生效就調高 LLM_MAX_OVERLAY_CHARS）");
 
