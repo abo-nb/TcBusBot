@@ -20,7 +20,7 @@ namespace TcBusBot.Core.Chat;
 /// 沒有設定判斷模型時（<see cref="LlmOptions.HasSeparateJudgeModel"/> 為 false），
 /// 這一層根本不會被建立（永遠只有主模型），所以「沒設定」＝零額外成本。
 /// </summary>
-public sealed class RoutingLlmClient : ILlmClient
+public sealed class RoutingLlmClient : ILlmClient, IDisposable
 {
     private readonly ILlmClient _main;
     private readonly ILlmClient? _judge;
@@ -143,5 +143,25 @@ public sealed class RoutingLlmClient : ILlmClient
 
         return (new RoutingLlmClient(main, judge, diagnostics, digest),
             $"{mainMessage}{digestMessage}\n✅ 短判斷（是在跟我說話嗎／換話題了沒）走另一個模型：{judge.Describe()}");
+    }
+
+    /// <summary>
+    /// 放掉底下每一條連線（每個 <c>SemanticKernelLlmClient</c> 各自有一個 HttpClient）。
+    ///
+    /// 為什麼需要：`/ai llm` 換設定時會整批重建連線（見 <see cref="ReloadableLlmClient"/>），
+    /// 沒有這個方法的話舊的 HttpClient 永遠不會被回收 —— 換幾次就漏幾組 socket。
+    /// </summary>
+    public void Dispose()
+    {
+        // 用「認身分」的集合：目前三條連線都是不同的實例，但重複處置的後果很嚴重
+        // （正在跑的請求會拿到已釋放的 HttpClient），所以寧可多擋一次
+        var seen = new HashSet<ILlmClient>(ReferenceEqualityComparer.Instance);
+
+        foreach (var client in new[] { _main, _judge, _digest })
+        {
+            if (client is null || !seen.Add(client)) continue;
+
+            if (client is IDisposable disposable) disposable.Dispose();
+        }
     }
 }

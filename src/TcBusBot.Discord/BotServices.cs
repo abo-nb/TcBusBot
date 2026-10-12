@@ -89,9 +89,26 @@ internal static class BotServices
         // 一定要是**同一個實例**（`/ai think` 才看得到剛剛那次呼叫的思考）。
         services.AddSingleton<ReasoningCapture>();
 
-        services.AddSingleton<ILlmClient>(sp =>
-            CreateLlmClient(cfg.Llm, log, sp.GetRequiredService<LlmDiagnostics>(),
-                sp.GetRequiredService<ReasoningCapture>()));
+        // ── 「整台 Bot 要用哪一組模型連線」的唯一來源 ──────────────
+        //    ⚠️ 建構子會**立刻**把資料庫裡的覆寫套進 cfg.Llm（見類別說明），
+        //       所以它一定要比 ReloadableLlmClient 先被建出來 ——
+        //       下面那個 factory 的第一行就是在保證這件事。
+        services.AddSingleton(sp => new LlmEndpointStore(
+            cfg.Llm, sp.GetRequiredService<ILlmStateStore>()));
+
+        // ILlmClient 是**可熱抽換**的：`/ai llm` 換金鑰／端點／模型時整批重建連線，
+        // 但外面那些單例（聊天、摘要、指令）拿到的是同一顆物件，所以不必重啟。
+        services.AddSingleton(sp =>
+        {
+            sp.GetRequiredService<LlmEndpointStore>();   // 先套用覆寫，再建連線
+            return new ReloadableLlmClient(
+                cfg.Llm,
+                sp.GetRequiredService<LlmDiagnostics>(),
+                sp.GetRequiredService<ReasoningCapture>(),
+                log: log);
+        });
+
+        services.AddSingleton<ILlmClient>(sp => sp.GetRequiredService<ReloadableLlmClient>());
 
         // ── 公車資料目錄：**「哪個使用者要用哪一份資料」的唯一入口** ──
         //     `/bus city` 讓訂公車的人自己選城市；沒選過的人用預設（BUS_CITY 的第一個）。
@@ -184,53 +201,6 @@ internal static class BotServices
             services.AddTransient(type);
 
         return services;
-    }
-
-    /// <summary>
-    /// 建立 LLM 客戶端。**不丟例外** —— 設定錯、連不上都只印警告，
-    /// 讓公車功能照常運作（AI 是額外功能，不該拖垮主要功能）。
-    ///
-    /// 有設定 `LLM_JUDGE_MODEL` 時會建**第二個**客戶端（那個模型），
-    /// 再用 <see cref="RoutingLlmClient"/> 把短判斷導過去 ——
-    /// 為什麼不共用一個客戶端、在請求裡換模型名稱：SK 這個版本會忽略 `ModelId`（實測）。
-    /// </summary>
-    private static ILlmClient CreateLlmClient(
-        LlmOptions options, Action<string> log, LlmDiagnostics diag, ReasoningCapture? capture = null)
-    {
-        if (!options.IsConfigured)
-        {
-            log("⏸️  AI 聊天未啟用（沒有設定 LLM_API_KEY）");
-            return DisabledLlmClient.Instance;
-        }
-
-        // 判斷用的模型：只換 Model（其餘設定照舊，包含思考關閉與逾時）
-        var judgeOptions = options.HasSeparateJudgeModel ? options.Clone() : null;
-
-        if (judgeOptions is not null) judgeOptions.Model = options.JudgeModel!;
-
-        // 每週摘要那條連線：換思考強度（預設 high）與可選的模型。
-        // 為什麼要另建一條：思考是在**建立連線**時決定的（ReasoningHandler 掛在 HttpClient 上），
-        // 不能在單一請求裡切換 —— 理由跟「換模型」完全一樣（見 RoutingLlmClient 的說明）。
-        var digestOptions = options.Clone();
-        digestOptions.Reasoning = options.Digest.Reasoning;
-
-        if (!string.IsNullOrWhiteSpace(options.Digest.Model)) digestOptions.Model = options.Digest.Model!;
-
-        // 設定跟主連線一模一樣時就不必多建一條（設 `LLM_DIGEST_REASONING` 跟 `LLM_REASONING` 相同）
-        var needsDigestConnection = options.Digest.Enabled && options.Digest.NeedsOwnConnection(options);
-
-        var (client, message) = RoutingLlmClient.Create(options, judgeOptions, opts =>
-        {
-            var (created, createdMessage) = SemanticKernelLlmClient.Create(opts, capture);
-            return ((ILlmClient?)created, createdMessage);
-        }, diag, needsDigestConnection ? digestOptions : null);
-
-        log(message);
-
-        if (options.Digest.Enabled && !needsDigestConnection)
-            log($"ℹ️  每週摘要與聊天共用同一條連線（思考設定相同：{options.Digest.Reasoning}）");
-
-        return client;
     }
 
     /// <summary>

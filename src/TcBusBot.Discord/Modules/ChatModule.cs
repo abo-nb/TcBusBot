@@ -31,6 +31,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly ReasoningCapture _reasoning;
     private readonly DigestStore _digests;
     private readonly AddresseeLog _addressee;
+    private readonly LlmEndpointStore _endpoints;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -48,11 +49,13 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         UserCityStore cities,
         ReasoningCapture reasoning,
         DigestStore digests,
-        AddresseeLog addressee)
+        AddresseeLog addressee,
+        LlmEndpointStore endpoints)
     {
         _reasoning = reasoning;
         _digests = digests;
         _addressee = addressee;
+        _endpoints = endpoints;
         _options = options;
         _conversations = conversations;
         _budget = budget;
@@ -93,6 +96,15 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                     ? $"{_options.CityDisplay}（同時服務多個城市，即時到站按城市分批查）"
                     : $"{_options.CityDisplay}（模型會被明確告知只回答這個縣市）", inline: false)
             .AddField("模型", enabled ? $"{_options.Model} @ {_options.EndpointHost}" : "—", inline: false)
+            .AddField("模型設定的來源",
+                // ⚠️ 金鑰的遮罩（前後幾碼）也只給主人看：那是**別人**的頻道也會看到的訊息，
+                //    非主人只需要知道「現在是誰的設定」就夠了
+                _options.AdminUserIds.Contains(Context.User.Id)
+                    ? _endpoints.Describe() + "\n" + _endpoints.DescribeOverride()
+                    : _endpoints.HasOverride
+                        ? "Discord 指令（主人設定的；用 `/ai llm` 看細節 —— 只有主人看得到）"
+                        : "環境變數（主機設定的）",
+                inline: false)
             .AddField("判斷用的模型",
                 !enabled
                     ? "—"
@@ -166,7 +178,8 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
                         : $"✅ 已啟用（回完話後開始聽：最多判斷 {_options.EavesdropMaxMessages} 則／" +
                           $"安靜 {_options.EavesdropSeconds} 秒後回到「等 @」）",
                 inline: false)
-            .WithFooter("用法：@ 我 或 回覆我的訊息就會回話｜/ai test 可以測 AI 通不通｜/ai forget 清記憶");
+            .WithFooter("用法：@ 我 或 回覆我的訊息就會回話｜/ai test 可以測 AI 通不通｜" +
+                        "/ai forget 清記憶｜/ai llm 換模型金鑰（只有主人）");
 
         // 誰在花額度（全域額度的代價就是需要看得出來誰在花）
         var top = _budget.Usage.ByGuild
@@ -575,6 +588,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         var started = DateTimeOffset.UtcNow;
         LlmReply? reply = null;
         string? error = null;
+        LlmErrorKind? errorKind = null;
 
         try
         {
@@ -585,6 +599,10 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         }
         catch (Exception ex)
         {
+            // ★ 失敗的「種類」比訊息可靠（見 LlmErrorKind）：金鑰被拒、找不到模型、
+            //   限流、餘額不足的下一步完全不同，不該用字串比對去猜
+            if (ex is LlmException llmError) errorKind = llmError.Kind;
+
             error = ex is LlmException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}";
         }
 
@@ -615,16 +633,24 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
             .WithTitle("❌ AI 呼叫失敗")
             .WithDescription($"`{Truncate(error ?? "（沒有錯誤訊息）", 800)}`")
             .AddField("設定", $"{_options.Model} @ {_options.EndpointHost}" +
-                             (_options.HasSeparateJudgeModel ? $"（判斷用：{_options.JudgeModel}）" : ""),
-                inline: false)
-            .AddField("怎麼查", CheckList(error), inline: false)
+                             (_options.HasSeparateJudgeModel ? $"（判斷用：{_options.JudgeModel}）" : "") +
+                             $"\n來源：{_endpoints.DescribeSource()}", inline: false)
+            .AddField("怎麼查", CheckList(errorKind, error), inline: false)
             .WithFooter($"{elapsed.TotalSeconds:0.0} 秒後失敗")
             .Build(), ephemeral: true);
     }
 
-    /// <summary>依錯誤訊息給對應的檢查方向（不然使用者只看到一串英文）。</summary>
-    private static string CheckList(string? error)
+    /// <summary>
+    /// 依錯誤訊息給對應的檢查方向（不然使用者只看到一串英文）。
+    ///
+    /// 有 <see cref="LlmErrorKind"/> 時以它為準（那是 API 層分類出來的、比字串可靠）；
+    /// 沒有種類的（例如非 LLM 的例外）才退回文字比對。
+    /// </summary>
+    private static string CheckList(LlmErrorKind? kind, string? error)
     {
+        if (kind is { } known && known != LlmErrorKind.Unknown)
+            return AiEndpointModule.CheckList(known);
+
         var text = error ?? "";
 
         if (text.Contains("401", StringComparison.Ordinal) || text.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase))

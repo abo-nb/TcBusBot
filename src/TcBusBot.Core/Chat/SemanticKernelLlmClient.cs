@@ -202,12 +202,14 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
         {
             sw.Stop();
             throw new LlmException(
-                $"等不到回應（超過 {_options.RequestTimeoutSeconds} 秒）", retryable: true, ex);
+                $"等不到回應（超過 {_options.RequestTimeoutSeconds} 秒）", retryable: true, ex,
+                LlmErrorKind.Timeout);
         }
         catch (Exception ex)
         {
             sw.Stop();
-            throw new LlmException(Friendly(ex), retryable: IsRetryable(ex), ex);
+            var (kind, message) = Classify(ex);
+            throw new LlmException(message, retryable: IsRetryable(ex), ex, kind);
         }
         finally
         {
@@ -284,34 +286,23 @@ public sealed class SemanticKernelLlmClient : ILlmClient, IDisposable
     private static string ShortenUrl(string url)
         => url.Length <= 80 ? url : url[..80] + "…";
 
-    /// <summary>把 API 的例外翻成看得懂的一句話（400／401／429 是最常見的三種）。</summary>
-    private string Friendly(Exception ex)
-    {
-        var raw = (ex.Message ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
-        if (raw.Length > 200) raw = raw[..200] + "…";
-
-        var text = raw + " " + (ex.InnerException?.Message ?? "");
-        var host = _options.EndpointHost;
-
-        if (text.Contains("401") || text.Contains("Unauthorized") || text.Contains("invalid_api_key"))
-            return $"金鑰被拒絕（{host}）：檢查 LLM_API_KEY 是否正確、有沒有過期";
-
-        if (text.Contains("404") || text.Contains("model_not_found"))
-            return $"找不到模型「{_options.Model}」（{host}）：檢查 LLM_MODEL 名稱";
-
-        if (text.Contains("429") || text.Contains("rate limit", StringComparison.OrdinalIgnoreCase))
-            return $"服務端限流（429，{host}）：等一下再試，或換一個模型";
-
-        if (text.Contains("insufficient", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("quota", StringComparison.OrdinalIgnoreCase))
-            return $"服務端餘額不足（{host}）：去服務商後台加值";
-
-        if (ex is HttpRequestException || text.Contains("Name or service not known")
-            || text.Contains("No such host") || text.Contains("Connection refused"))
-            return $"連不上 {host}（網路或網址錯誤）";
-
-        return $"呼叫失敗：{ex.GetType().Name}: {raw}";
-    }
+    /// <summary>
+    /// 例外 → 「種類 ＋ 看得懂的一句話」。
+    ///
+    /// ⚠️ 真正的分類規則在 <see cref="LlmErrors"/>（純函式，可以離線測）。
+    ///    這一層只負責把**兩個線索**撈出來：HTTP 狀態碼與整串訊息。
+    ///    為什麼一定要撈狀態碼：實測 DeepSeek 的 401 回應裡**沒有**「401」也**沒有**「Unauthorized」
+    ///    （只有 `Authentication Fails`），只比對字串會讓「最常見的那種失敗」分類不出來，
+    ///    於是 `/ai llm` 的自動回退永遠不會啟動（症狀是 Bot 安靜地壞掉）。
+    /// </summary>
+    private (LlmErrorKind Kind, string Message) Classify(Exception ex)
+        => LlmErrors.Classify(
+            LlmErrors.StatusOf(ex),
+            LlmErrors.TextOf(ex),
+            ex.GetType().Name,
+            _options.EndpointHost,
+            _options.Model,
+            networkException: LlmErrors.IsNetwork(ex));
 
     private static bool IsRetryable(Exception ex)
         => ex is HttpRequestException or IOException or System.Net.Sockets.SocketException;

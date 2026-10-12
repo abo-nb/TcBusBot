@@ -1723,13 +1723,16 @@ public static class DryRun
                 .Select(c => c.Name)
                 .ToHashSet(StringComparer.Ordinal);
 
-            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "cset", "test", "think" };
+            var expectedAi = new[] { "status", "forget", "learned", "audit", "pset", "cset", "test", "think", "llm" };
             var missingAi = expectedAi.Where(e => !aiSubs.Contains(e)).ToList();
 
             if (missingAi.Count > 0)
                 Problem($"/ai 缺少子指令：{string.Join("、", missingAi)}");
             else
                 Console.WriteLine($"  ✔ /ai 的 {expectedAi.Length} 個子指令都在（{string.Join("、", expectedAi)}）");
+
+            // ── /ai llm（換金鑰／端點／模型）：這是**憑證**，權限與實作都要驗 ──
+            AuditLlmEndpointCommand(commands, services);
 
             // ── /ai pset：管理員直接設定這個伺服器的提示詞 ──────
             var pset = commands.FirstOrDefault(c => CommandPath(c) == "ai pset");
@@ -2090,6 +2093,131 @@ public static class DryRun
     }
 
     /// <summary>
+    /// <c>/ai llm</c>（換模型 API 金鑰／base URL／模型）的稽核。
+    ///
+    /// 這個指令動的是**憑證**：能改它的人可以把整台 Bot 的對話導到自己的端點。
+    /// 所以離線驗證要回答四個問題：
+    ///   1. 有沒有真的擋在主人名單（`LLM_ADMIN_IDS`）——**不是**按鈕同意過的管理員
+    ///   2. 模型有沒有機會自己呼叫它（工具）——絕對不能有
+    ///   3. 換完之後**連線真的換掉了**嗎（熱抽換），而且能退回環境變數那一組
+    ///   4. 金鑰有沒有可能被印出來（遮罩／加密）
+    /// </summary>
+    private static void AuditLlmEndpointCommand(
+        IReadOnlyList<SlashCommandInfo> commands, IServiceProvider services)
+    {
+        var command = commands.FirstOrDefault(c => CommandPath(c) == "ai llm");
+
+        if (command is null)
+        {
+            Problem("找不到 /ai llm —— 主人沒有辦法在 Discord 上換模型金鑰（只能改後台環境變數＋重新部署）");
+            return;
+        }
+
+        var options = command.Parameters.Select(p => p.Name).ToList();
+        Console.WriteLine($"  ℹ /ai llm 參數：{string.Join("、", options)}");
+
+        if (!options.Contains("key") || !options.Contains("baseurl") || !options.Contains("model"))
+            Problem("/ai llm 少了參數（需要 key／baseurl／model）");
+        else if (!options.Contains("clear") || !options.Contains("test"))
+            Problem("/ai llm 少了 clear（回退）或 test（設定完立刻驗證）");
+        else if (command.Parameters.Any(p => p.IsRequired))
+            Problem("/ai llm 不該有必填參數 —— 不給參數時應該顯示目前的設定");
+
+        // ── 1) 不能是模型可以呼叫的工具 ────────────────────
+        var toolFunctions = typeof(AiEndpointModule)
+            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .SelectMany(m => m.GetCustomAttributes(inherit: true))
+            .Count(a => a.GetType().Name == "KernelFunctionAttribute");
+
+        if (toolFunctions > 0)
+            Problem("AiEndpointModule 有 KernelFunction —— 模型可以自己換掉 API 金鑰（這是憑證，絕對不行）");
+        else
+            Console.WriteLine("  ✔ 換金鑰**只能**由 Discord 指令發起（模組裡沒有任何 KernelFunction／工具）");
+
+        // ── 2) 授權：只認 LLM_ADMIN_IDS ─────────────────────
+        var method = typeof(AiEndpointModule).GetMethod(nameof(AiEndpointModule.LlmAsync));
+        var calls = method is null ? [] : CollectCalls(method, resolveAll: true);
+
+        if (method is null)
+            Problem("找不到 AiEndpointModule.LlmAsync");
+        else if (!calls.Contains("LlmOptions.get_AdminUserIds"))
+            Problem("/ai llm 沒有檢查 LLM_ADMIN_IDS —— 任何人都能換掉整台 Bot 的模型端點");
+        else if (calls.Contains("ChatModule.CanSetPersona") || calls.Contains("PersonaGrantStore.PeekAuthority"))
+            Problem("/ai llm 用了「伺服器層」的授權 —— 那個授權只該給設定提示詞，不該給全域憑證");
+        else if (!calls.Contains("LlmEndpointStore.Apply") || !calls.Contains("ReloadableLlmClient.Reload"))
+            Problem("/ai llm 沒有真的套用設定並重建連線（改了不生效，或要等重啟）");
+        else if (!calls.Contains("LlmEndpointStore.Restore")
+                 || !calls.Contains("LlmException.get_LooksLikeBadSettings"))
+            Problem("/ai llm 少了「金鑰被拒絕就自動回退」那條路 —— 打錯字會讓 Bot 安靜地壞掉");
+        else if (!calls.Contains("LlmEndpointStore.Mask"))
+            Problem("/ai llm 沒有用 LlmEndpointStore.Mask —— 有機會把金鑰原文貼到頻道上");
+        else
+            Console.WriteLine("  ✔ 只有 LLM_ADMIN_IDS 能用；套用後會重建連線；金鑰被拒（401）會自動回退；金鑰只以遮罩顯示");
+
+        // ── 3) 熱抽換真的會換掉連線，而且退得回去 ────────────
+        try
+        {
+            var llm = services.GetRequiredService<ILlmClient>();
+            var reloadable = services.GetRequiredService<ReloadableLlmClient>();
+            var endpoints = services.GetRequiredService<LlmEndpointStore>();
+            var llmOptions = services.GetRequiredService<LlmOptions>();
+
+            if (!ReferenceEquals(llm, reloadable))
+                Problem("容器裡的 ILlmClient 不是 ReloadableLlmClient —— 換金鑰之後聊天服務還在用舊連線");
+
+            var baseline = endpoints.Baseline;
+            var before = reloadable.Current;
+
+            endpoints.Apply(new LlmEndpointOverride(
+                BaseUrl: "https://dryrun.invalid/v1",
+                ApiKey: "sk-dryrun-not-a-real-key-0001",
+                Model: "dryrun-model",
+                SetBy: 1UL, SetAt: DateTimeOffset.UtcNow, Where: "--dryrun"));
+
+            var applied = llmOptions.Model == "dryrun-model"
+                          && llmOptions.BaseUrl == "https://dryrun.invalid/v1";
+
+            reloadable.Reload();
+
+            var swapped = !ReferenceEquals(before, reloadable.Current)
+                          && reloadable.Current.IsConfigured == (baseline.ApiKey is not null);
+
+            var restored = endpoints.Clear();
+            reloadable.Reload();
+
+            var backToBaseline = llmOptions.Model == baseline.Model
+                                 && llmOptions.BaseUrl == baseline.BaseUrl
+                                 && llmOptions.ApiKey == baseline.ApiKey
+                                 && restored.Model == baseline.Model;
+
+            if (!applied) Problem("/ai llm 套用後 LlmOptions 沒有跟著改（聊天服務看到的還是舊設定）");
+            else if (!swapped) Problem("/ai llm 重建連線沒有真的換掉裡面的客戶端");
+            else if (!backToBaseline) Problem("/ai llm clear 沒有回到環境變數那一組值（退不回原狀）");
+            else
+                Console.WriteLine($"  ✔ 熱抽換有效：換掉連線不必重啟，`clear` 精確回到環境變數那一組" +
+                                  $"（{baseline.Model} @ {LlmEndpointStore.Host(baseline.BaseUrl)}）");
+        }
+        catch (Exception ex)
+        {
+            Problem($"驗證 /ai llm 的熱抽換時失敗：{ex.GetType().Name}: {ex.Message}");
+        }
+
+        // ── 4) 寫進資料庫的金鑰一定要經過 Protect ────────────
+        //    ⚠️ 金鑰**只有**在私有方法 Save 裡被寫出去，所以就驗那一個方法
+        //       （Apply 只是合併與套用，不碰字串）
+        var save = typeof(LlmEndpointStore).GetMethod("Save",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var saveCalls = save is null ? [] : CollectCalls(save, resolveAll: true);
+
+        if (save is null)
+            Problem("找不到 LlmEndpointStore.Save —— 無法驗證金鑰有沒有加密");
+        else if (!saveCalls.Contains("LlmSecretProtector.Protect"))
+            Problem("LlmEndpointStore 寫入時沒有呼叫 LlmSecretProtector.Protect —— 金鑰會以明文存進資料庫");
+        else
+            Console.WriteLine("  ✔ 寫進資料庫的金鑰會經過 LlmSecretProtector（有 LLM_ADMIN_KEY 就是 AES-GCM）");
+    }
+
+    /// <summary>
     /// LLM 設定檢查（**完全離線**，不會打任何 API）。
     ///
     /// 這裡只驗「設定本身合不合理」——因為這些錯誤在啟動時看不出來，
@@ -2277,13 +2405,12 @@ public static class DryRun
         var topic = typeof(TopicSwitchDetector).GetMethod(nameof(TopicSwitchDetector.DetectAsync));
         var topicCalls = topic is null ? [] : CollectCalls(topic, resolveAll: true);
 
-        var createClient = typeof(BotServices).GetMethod("CreateLlmClient",
-            BindingFlags.Static | BindingFlags.NonPublic);
+        var createClient = typeof(LlmClientFactory).GetMethod(nameof(LlmClientFactory.Create));
         var createCalls = createClient is null ? [] : CollectCalls(createClient, resolveAll: true);
 
         if (addressee is null || topic is null || createClient is null)
         {
-            Problem("找不到 AddresseeDetector／TopicSwitchDetector／BotServices.CreateLlmClient");
+            Problem("找不到 AddresseeDetector／TopicSwitchDetector／LlmClientFactory.Create");
         }
         else if (!addresseeCalls.Contains("LlmRequest.set_JudgeCall")
                  || !topicCalls.Contains("LlmRequest.set_JudgeCall"))
@@ -2292,7 +2419,7 @@ public static class DryRun
         }
         else if (!createCalls.Contains("RoutingLlmClient.Create"))
         {
-            Problem("BotServices 沒有用 RoutingLlmClient.Create —— 判斷模型不會被建立");
+            Problem("LlmClientFactory 沒有用 RoutingLlmClient.Create —— 判斷模型不會被建立");
         }
         else
         {

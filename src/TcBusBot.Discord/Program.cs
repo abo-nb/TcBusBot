@@ -185,7 +185,10 @@ public static class Program
 
         // ★ 想讓模型看到「伺服器暱稱」就需要 **Server Members 意圖**（也是特權意圖）。
         //   沒開的話暱稱讀不到、會默默退回帳號名，所以一樣要先問過再決定要不要。
-        var wantsNicknames = cfg.Llm.IsConfigured && cfg.Llm.ShowNicknames;
+        //   （有主人名單但還沒有金鑰時也要問 —— 那種實例之後可以用 `/ai llm` 補金鑰，
+        //     而意圖是**連線時**決定的，補了金鑰重連才生效。）
+        var wantsNicknames = (cfg.Llm.IsConfigured || cfg.Llm.AdminUserIds.Length > 0)
+                             && cfg.Llm.ShowNicknames;
 
         // ★ 先問 Discord「這個應用程式有沒有被允許這些特權意圖」再做決定。
         //
@@ -221,9 +224,10 @@ public static class Program
         {
             intents |= GatewayIntents.GuildMessages | GatewayIntents.MessageContent;
         }
-        else if (cfg.Llm.IsConfigured)
+        else if (cfg.EnableMessageContentIntent)
         {
             // 沒有特權意圖也要收訊息事件：Discord 對「@ 提及 Bot」的訊息會例外附上內容
+            //（用設定的值而不是 cfg.Llm.IsConfigured —— 差別在「有主人名單但還沒金鑰」的實例）
             intents |= GatewayIntents.GuildMessages;
         }
 
@@ -264,6 +268,19 @@ public static class Program
         var budget = provider.GetRequiredService<WeeklyTokenBudget>();
         var llmOptions = provider.GetRequiredService<LlmOptions>();
         var llm = provider.GetRequiredService<ILlmClient>();
+        var reloadable = provider.GetRequiredService<ReloadableLlmClient>();
+        var endpoints = provider.GetRequiredService<LlmEndpointStore>();
+
+        // 模型連線的**來源**要印出來：金鑰可以是環境變數，也可以是有人在 Discord 上
+        // 用 `/ai llm` 換過的（那會存進資料庫、跨重啟保留）—— 出問題時第一個要確認的就是這個。
+        // ⚠️ 只印 host 與「誰設的」，**不印金鑰的任何片段**（主機的 console log 會留很久）。
+        Console.WriteLine($"    模型連線：{llmOptions.Model} @ {llmOptions.EndpointHost}" +
+                          $"｜來源：{endpoints.DescribeSource()}");
+
+        if (endpoints.LoadWarning is not null)
+            Console.WriteLine($"    ⚠️  {endpoints.LoadWarning}");
+        else if (endpoints.HasOverride && !endpoints.Persistent)
+            Console.WriteLine("    ⚠️  這一台的儲存後端是記憶體模式 → 上面那組設定重啟後會回到環境變數");
 
         if (llmOptions.IsConfigured && llm.IsConfigured)
         {
@@ -299,27 +316,37 @@ public static class Program
         }
 
         // ── AI 聊天：接上訊息事件 ───────────────────────────
+        //
+        // ⚠️ 這裡寫成「可以重複呼叫」的區域函式，而不是單純的 if：
+        //    開機時沒有金鑰（`llm.IsConfigured == false`）的人，之後可以用 `/ai llm`
+        //    當場補上 —— 那時 <see cref="ReloadableLlmClient.Reloaded"/> 會再叫一次這裡，
+        //    把訊息事件、工具、狀態全部接上，**不必重啟**。
         LlmChatService? chat = null;
+        var chatStarted = false;
 
-        if (llm.IsConfigured)
+        void StartChatIfPossible()
         {
+            if (chatStarted || !llm.IsConfigured) return;
+
+            chatStarted = true;
             chat = provider.GetRequiredService<LlmChatService>();
             chat.Start();   // 訂閱 MessageReceived（只有真的啟用時才接）
 
             var tools = provider.GetRequiredService<IChatToolProvider>();
             Console.WriteLine($"    工具　　：{(llmOptions.ToolsEnabled ? tools.Describe() : "未啟用（LLM_TOOLS=false）")}");
 
-            BotStatus.Llm = () => chat.Describe();
-
             if (cfg.EnableMessageContentIntent)
                 Console.WriteLine("▶️  AI 聊天已接上（@ 它、或回覆它的訊息就會回話）");
             else
                 Console.WriteLine("⚠️  AI 聊天需要 Message Content 意圖，但被 --no-message-intent 關掉了 → 不會回話");
         }
-        else
-        {
-            BotStatus.Llm = () => "未啟用（沒有 LLM_API_KEY）";
-        }
+
+        // /health 看得到狀態；沒有金鑰時也要說得出「為什麼」（而不是只有一句未啟用）
+        BotStatus.Llm = () => chat is null
+            ? $"未啟用（沒有可用的 LLM 金鑰；來源：{endpoints.DescribeSource()}）"
+            : chat.Describe();
+
+        StartChatIfPossible();
 
         client.Log += msg => OnLog(msg, cfg.Verbose);
         interactions.Log += msg => OnLog(msg, cfg.Verbose);
@@ -362,6 +389,20 @@ public static class Program
 
             Console.WriteLine($"🗓  每週摘要排程已啟動（{cfg.Llm.Digest.Describe()}）");
         }
+
+        // ── `/ai llm` 換完設定之後要做的事 ───────────────────────
+        //
+        // 為什麼要在這裡接：換金鑰是**熱抽換**（連線整批重建），但「有沒有接上訊息事件」
+        // 與「摘要排程有沒有在跑」是開機時決定的 —— 沒有這一段，
+        // 開機時沒有金鑰的實例即使在 Discord 補上金鑰，也還是不會理人、不會發摘要。
+        reloadable.Reloaded += _ =>
+        {
+            Console.WriteLine($"[llm] 🔌 連線已重建（第 {reloadable.ReloadCount} 次）：" +
+                              $"{llmOptions.Model} @ {llmOptions.EndpointHost}｜{endpoints.DescribeSource()}");
+
+            StartChatIfPossible();
+            StartDigestScheduler();
+        };
 
         client.Ready += async () =>
         {

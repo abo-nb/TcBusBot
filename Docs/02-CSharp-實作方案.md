@@ -1,4 +1,4 @@
-﻿# 台中市公車 Discord Bot：C# 實作方案
+# 台中市公車 Discord Bot：C# 實作方案
 
 > 搭配 `docs/01-TDX-研究報告.md` 閱讀。本方案的所有 API 行為與資料結構，都以研究報告中
 > **[實測]** 的結果為依據；關鍵設計決策會標明「為什麼這樣做」。
@@ -4600,6 +4600,93 @@ MessageAddress.Decide(facts, appMode);   // appMode: Context（預設）／Reply
 
 `--dryrun`：`/ai` 子指令清單多了 `cset`；`/ai cset` 真的先問 `CanSetPersona`、
 真的走 `SetChannelRules`／`ChannelLines`／`ResetChannel`；`/rest` 真的清頻道層。
+
+---
+
+### 20.33 整台 Bot 的模型連線（`/ai llm`：金鑰、base URL、模型）
+
+需求原文：**「加个功能，管理者可以在dc指定全局的模型apikey baseurl ，使用命令」**。
+
+#### 20.33.1 為什麼這個功能比看起來麻煩
+
+「收到指令就 `cfg.Llm.ApiKey = 新的`」是**做得到但會壞**的寫法。真正要解的是四件事：
+
+| 問題 | 直覺寫法會怎樣 | 這裡的做法 |
+| --- | --- | --- |
+| **退不回去** | 開機時那一組值被蓋掉，`clear` 只能變成「把金鑰清空」→ 整個 AI 掛掉 | 開機值（`Baseline`）與覆寫（`Override`）分開存，`Clear()` 精確還原三個欄位 |
+| **重啟就沒了** | Render 每次部署都是新行程，設定消失 —— 那就失去「不用改後台」的意義 | 覆寫寫進**資料庫**（跟訂閱組同一條後端鏈），開機時自動套回 |
+| **看不出來源** | `/ai status` 只印「現在的金鑰」，沒人知道那是環境變數還是有人偷改過 | 每一處顯示都帶「來源：環境變數／Discord 指令（誰、何時、改了哪幾項）」 |
+| **改了不生效** | 連線是**建立時**決定的（模型／思考／逾時都綁在 HttpClient），只改屬性不會換連線 | `ReloadableLlmClient`：外面是同一顆單例，裡面整批重建 |
+
+#### 20.33.2 三個型別的分工
+
+```
+LlmEndpointStore     開機值 ＋ 覆寫 → 套進 LlmOptions（並負責加密、遮罩、顯示）
+LlmClientFactory     一組 LlmOptions → 一條真的連線（唯一的一份建立邏輯）
+ReloadableLlmClient  永遠存在的那顆 ILlmClient；Reload() 時把裡面的連線整批換掉
+```
+
+| 決定 | 為什麼 |
+| --- | --- |
+| `Apply` 是**合併**、`Restore` 是**整筆還原** | 使用者「只改金鑰」要沿用其他欄位；但**回退**絕不能合併 —— 拿舊紀錄去合併會留下「這次剛設的新 base URL」，變成沒人設定過的組合（症狀是 404） |
+| 任何一筆讀不出來（解密失敗、JSON 壞掉）→ **整筆放棄**回到環境變數 | 套一半會產生「新模型 ＋ 舊端點」這種查不出原因的組合；放棄至少是「回到已知可用」 |
+| 舊連線**延後 30 秒**才處置 | 「換設定的同時有人在問問題」不該讓那一則對話莫名失敗 |
+| 舊連線一定要處置 | 每次重建都有一組 HttpClient，不處置就是漏 socket |
+| `IsConfigured` 是**動態**的 | 「開機沒有金鑰、後來在 Discord 補上」也必須真的生效（連訊息事件與摘要排程都會跟著接上，見 Program 的 `Reloaded`） |
+
+#### 20.33.3 金鑰怎麼存（這一節是安全性質，不是實作細節）
+
+* **顯示**：任何地方都只給遮罩（`LlmEndpointStore.Mask`，`LlmOptions.MaskedKey` 也改用它 —— 單一來源）
+* **保存**：有 `LLM_ADMIN_KEY` 時用 PBKDF2(SHA256) 推導金鑰做 **AES-GCM**（同時保護機密性與完整性）；
+  沒有時存明文，但**明確標示**（`plain:` 字首 ＋ `/ai llm` 直說），不假裝有加密
+* **讀不回**：主人換了 `LLM_ADMIN_KEY` → 舊密文永遠解不開 → 回 `null` 而不是垃圾 → 整筆放棄 ＋ 啟動時出聲
+* **模型碰不到**：只有斜線指令，**沒有** KernelFunction（`--dryrun` 用反射數 `KernelFunctionAttribute` 來保證）
+* **授權只有 `LLM_ADMIN_IDS`**：刻意**不**開放給 `CanSetPersona`（按鈕同意／有 `Manage Server` 的人）——
+  那兩種授權的語意是「可以設定那個伺服器的提示詞」，而這一組設定能決定**所有**伺服器（含別人的私頻）的對話送去哪裡
+
+#### 20.33.4 失敗分類（決定要不要自動回退）
+
+`LlmException` 多了 `Kind`（`LlmErrorKind`）：`Auth` / `ModelNotFound` / `RateLimited` / `Quota` /
+`Network` / `Timeout` / `Unknown`。
+
+| 失敗 | 處置 | 為什麼 |
+| --- | --- | --- |
+| `Auth`（401／403） | **自動退回**舊設定 | 幾乎一定是「新的設定打錯了」；不退回的話症狀是「Bot 從此不理人」，而沒人會想到是剛剛那個指令 |
+| 其他（404／429／餘額／網路／逾時） | 設定留著，只警告 | 這些不一定是設定錯（可能是暫時的）—— 自動退掉反而會把一組**正確**的設定丟掉 |
+
+`/ai test` 的「怎麼查」也改成用同一份分類（不再靠訊息字串比對，那種判斷會隨服務商文案而失效）。
+
+#### 20.33.5 驗收
+
+`tcbus selftest` 新增 **30 項（第 32 節）**：
+
+| 檢查 | 驗什麼 |
+| --- | --- |
+| AES-GCM 來回、密語不對／密文被動過 → `null`、沒有密語 → `plain:` | 加解密本體 |
+| 覆寫套進 `LlmOptions`、部分更新沿用其他欄位、`clear` 三欄精確還原 | 需求本體 |
+| **同一份資料庫 ＋ 全新行程 → 覆寫仍在** | 「重啟後還在」 |
+| 資料庫那一筆看不到金鑰原文、顯示字串都不含原文 | 不外洩 |
+| 換過 `LLM_ADMIN_KEY` → 整筆放棄 ＋ `LoadWarning` | 不會拿亂碼去打 API |
+| 記憶體後端會說「重啟後會回到環境變數」 | 不讓人以為存起來了 |
+| **真的 Semantic Kernel ＋ 假 HTTP 端點**：換完之後送出的請求是**新 host／新 `Authorization`／新 `model`** | 熱抽換真的換掉連線（最難發現的壞法） |
+| 重建時會處置舊連線（`GraceDelay = 0`） | 不漏 HttpClient |
+| 開機沒金鑰 → `IsConfigured` false；補上金鑰 → true | 後面才啟用那條路 |
+| 401 → `Auth` 且 `LooksLikeBadSettings`；連不上 → `Network` 且**不**回退 | 回退的判斷依據 |
+
+`--dryrun`：`/ai` 子指令清單多了 `llm`；參數是 `key`／`baseurl`／`model`／`clear`／`test` 且都選填；
+模組裡**沒有任何 `KernelFunction`**；真的先問 `LLM_ADMIN_IDS`（而且沒有用 `CanSetPersona`）；
+真的呼叫 `Apply` ＋ `Reload` ＋ `Restore`（回退）＋ `Mask`；**在容器裡真的換一次連線再退回來**
+（驗熱抽換與精確還原）；`LlmEndpointStore.Save` 真的經過 `LlmSecretProtector.Protect`。
+
+#### 20.33.6 已知限制（誠實寫出來）
+
+* **金鑰會經過 Discord**：斜線指令的參數是透過 Discord 的伺服器送到 Bot 的，而且 Discord 目前沒有
+  「隱藏指令參數」的官方選項（參數可能出現在頻道的指令訊息上）。要完全避免就維持用環境變數；
+  Bot 這一側能保證的是「不再印出去、資料庫裡加密、模型碰不到」。
+* **`/ai llm` 改不到 `LLM_JUDGE_MODEL`／`LLM_DIGEST_MODEL`**：判斷模型與摘要模型仍然只能靠環境變數
+  （它們是「額外的連線」，變更介面會變成一次要解釋三個模型；真的需要時再說）。
+* **`clear` 是回到環境變數**，不是回到「上一次的 Discord 設定」——
+  這是有意的：使用者要的是「回到主機那一組」。
 
 ---
 

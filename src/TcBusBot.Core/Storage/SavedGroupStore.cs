@@ -230,7 +230,13 @@ public sealed class SavedGroupStore : IDisposable, TcBusBot.Core.Chat.ILlmStateS
 
     private readonly ISavedGroupRepository _repo;
 
-    /// <summary>是否真的寫進檔案（false = 記憶體模式，重啟就消失）。</summary>
+    /// <summary>
+    /// 是否真的寫進檔案（false = 記憶體模式，重啟就消失）。
+    ///
+    /// ⚠️ 同時是 <see cref="TcBusBot.Core.Chat.ILlmStateStore.IsPersistent"/> 的實作 ——
+    ///    管理員在 Discord 上設定的模型金鑰會不會留著，看的就是這個值
+    ///    （記憶體模式要誠實說「重啟後會回到環境變數」）。
+    /// </summary>
     public bool IsPersistent => _repo.IsPersistent;
 
     /// <summary>資料實際放在哪（文字檔路徑／MongoDB 說明／記憶體）。</summary>

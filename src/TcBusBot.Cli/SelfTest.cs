@@ -131,6 +131,9 @@ public static class SelfTest
         Section("31. 誰在對它說話（別的 App @ 它要吃得到；@ 別人不是 @ 它）");
         TestMessageAddress();
 
+        Section("32. 整台 Bot 的模型連線（/ai llm）：覆寫、加密、跨重啟、熱抽換、回退");
+        TestLlmEndpoint();
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -1504,6 +1507,11 @@ public static class SelfTest
         public string? GetBlob(string key) => _map.TryGetValue(key, out var json) ? json : null;
 
         public void SetBlob(string key, string json) => _map[key] = json;
+
+        /// <summary>記憶體模式（重啟就消失）的後端 —— 也可以當成「後端本身有寫進檔案」。</summary>
+        public bool Persistent { get; set; } = true;
+
+        public bool IsPersistent => Persistent;
     }
 
     private static ChatTurn Turn(ulong id, string author, string content, DateTimeOffset at, ulong? replyTo = null)
@@ -5549,6 +5557,402 @@ public static class SelfTest
 
         endpoint.Dispose();
         Check("端點可以正常關閉", !endpoint.IsRunning);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  32) 整台 Bot 的模型連線（/ai llm）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 管理員在 Discord 上換「整台 Bot 用的模型」（金鑰／base URL／模型名稱）。
+    ///
+    /// 這一段驗的是**四件出事會很痛的事**：
+    ///   1. **金鑰不能外洩**：資料庫裡要加密（有 `LLM_ADMIN_KEY` 時）、顯示時要遮罩
+    ///   2. **要跨重啟**：Render 每次重新部署都是新行程 —— 存不起來就等於沒這個功能
+    ///   3. **要真的換掉連線**：只改設定值、連線還是舊的，是最難發現的壞法
+    ///      （介面顯示新模型、實際上還在打舊端點）
+    ///   4. **要退得回去**：打錯字時要能精確回到環境變數那一組
+    ///
+    /// ⚠️ 第 3 點刻意用**真的 Semantic Kernel 客戶端 ＋ 假的 HTTP handler**：
+    ///    驗的是「送出去的請求真的帶了新端點與新金鑰」，不是只有欄位被改掉。
+    /// </summary>
+    private static void TestLlmEndpoint()
+    {
+        const string secret = "owner-secret-key-1234";
+        const string apiKey = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        const string envKey = "sk-env-key-000000";
+
+        // ── 1) 金鑰的保護（純函式）────────────────────────
+        var encrypted = LlmSecretProtector.Protect(apiKey, secret);
+
+        Check("★ 有密語 → 金鑰加密（`enc:v1:` 字首，內容不含原文）",
+            encrypted.StartsWith(LlmSecretProtector.EncryptedPrefix, StringComparison.Ordinal)
+            && !encrypted.Contains(apiKey, StringComparison.Ordinal),
+            encrypted[..Math.Min(14, encrypted.Length)]);
+
+        Check("★ 加密後解得回原文", LlmSecretProtector.Unprotect(encrypted, secret) == apiKey);
+        Check("★ 密語不對 → 解不開（回 null，不是垃圾）",
+            LlmSecretProtector.Unprotect(encrypted, "wrong-secret") is null);
+        Check("★ 密文被改一個字元 → 解不開（AES-GCM 的完整性保護）",
+            LlmSecretProtector.Unprotect(FlipOneChar(encrypted), secret) is null);
+        Check("★ 沒有密語 → 明講「沒有加密」（`plain:` 字首，不是假裝有加密）",
+            LlmSecretProtector.Protect(apiKey, null) == LlmSecretProtector.PlainPrefix + apiKey
+            && !LlmSecretProtector.IsEncrypted(LlmSecretProtector.Protect(apiKey, null)));
+        Check("兩次加密同一組金鑰 → 密文不同（nonce 是隨機的）",
+            LlmSecretProtector.Protect(apiKey, secret) != encrypted);
+        Check("沒有字首的舊資料 → 當成明文照用（不會整個壞掉）",
+            LlmSecretProtector.Unprotect("sk-old-plain-key", secret) == "sk-old-plain-key");
+
+        // ── 2) 覆寫 → 生效 → 跨重啟 → 回退 ────────────────
+        var storage = new FakeStateStore();
+
+        var options = new LlmOptions
+        {
+            BaseUrl = "https://env.example.com/v1", Model = "env-model", ApiKey = envKey, AdminKey = secret
+        };
+
+        var store = new LlmEndpointStore(options, storage);
+
+        Check("一開始沒有覆寫 → 完全照環境變數",
+            !store.HasOverride && options.Model == "env-model" && store.DescribeSource() == "環境變數");
+        Check("沒有覆寫時也知道「退回的目標」是環境變數那一組",
+            store.DescribeBaseline().Contains("env-model", StringComparison.Ordinal));
+
+        store.Apply(new LlmEndpointOverride(
+            BaseUrl: "https://new.example.com/v1", ApiKey: apiKey, Model: "new-model",
+            SetBy: 42UL, SetAt: DateTimeOffset.UtcNow, Where: "測試伺服器 #ai"));
+
+        Check("★ 覆寫會套進 LlmOptions（端點、模型、金鑰三個都換）",
+            options.BaseUrl == "https://new.example.com/v1" && options.Model == "new-model"
+            && options.ApiKey == apiKey);
+
+        Check("★ 有覆寫時說得出誰、什麼時候、改了哪幾項",
+            store.DescribeSource().Contains("Discord", StringComparison.Ordinal)
+            && store.DescribeSource().Contains("<@42>", StringComparison.Ordinal)
+            && store.DescribeSource().Contains("金鑰", StringComparison.Ordinal)
+            && store.DescribeOverride().Contains("測試伺服器 #ai", StringComparison.Ordinal));
+
+        var blob = storage.GetBlob(LlmEndpointStore.BlobKey) ?? "";
+
+        Check("★ 資料庫裡**看不到金鑰原文**（有 LLM_ADMIN_KEY 就是加密保存）",
+            blob.Length > 0 && !blob.Contains(apiKey, StringComparison.Ordinal)
+            && blob.Contains(LlmSecretProtector.EncryptedPrefix, StringComparison.Ordinal),
+            blob[..Math.Min(70, blob.Length)]);
+
+        Check("★ 顯示用的每一個字串都不含金鑰原文（只有遮罩）",
+            !store.Describe().Contains(apiKey, StringComparison.Ordinal)
+            && !store.DescribeOverride().Contains(apiKey, StringComparison.Ordinal)
+            && !store.DescribeBaseline().Contains(apiKey, StringComparison.Ordinal)
+            && store.Describe().Contains("…", StringComparison.Ordinal),
+            store.Describe());
+
+        // 模擬 Render 重新部署：同一份資料庫、全新的一組 options
+        var afterRestart = new LlmOptions
+        {
+            BaseUrl = "https://env.example.com/v1", Model = "env-model", ApiKey = envKey, AdminKey = secret
+        };
+
+        var restartedStore = new LlmEndpointStore(afterRestart, storage);
+
+        Check("★ 重啟後還在：新的行程讀同一份資料庫 → 覆寫照樣生效（這就是不必改後台環境變數的意義）",
+            restartedStore.HasOverride && afterRestart.Model == "new-model"
+            && afterRestart.BaseUrl == "https://new.example.com/v1" && afterRestart.ApiKey == apiKey);
+        Check("重啟後也知道那一筆是加密保存的", restartedStore.Encrypted);
+
+        restartedStore.Apply(new LlmEndpointOverride(
+            Model: "only-model", SetBy: 42UL, SetAt: DateTimeOffset.UtcNow));
+
+        Check("★ 只改模型時，端點與金鑰沿用原本的覆寫（部分更新不會把其他欄位清掉）",
+            afterRestart.Model == "only-model" && afterRestart.BaseUrl == "https://new.example.com/v1"
+            && afterRestart.ApiKey == apiKey);
+
+        var back = restartedStore.Clear();
+
+        Check("★ clear 精確回到環境變數那一組（端點、模型、金鑰三個都比對）",
+            afterRestart.BaseUrl == "https://env.example.com/v1" && afterRestart.Model == "env-model"
+            && afterRestart.ApiKey == envKey && !restartedStore.HasOverride
+            && back.Model == "env-model" && back.ApiKey == envKey);
+
+        var afterClearRestart = new LlmOptions
+        {
+            BaseUrl = "https://env.example.com/v1", Model = "env-model", ApiKey = envKey, AdminKey = secret
+        };
+
+        Check("clear 之後資料庫那一筆不再是覆寫（重啟不會又跳回來）",
+            !new LlmEndpointStore(afterClearRestart, storage).HasOverride);
+
+        // 沒有 LLM_ADMIN_KEY → 明文（而且要誠實說）
+        var plainStorage = new FakeStateStore();
+        var plainOptions = new LlmOptions { BaseUrl = "https://env.example.com/v1", Model = "env-model", ApiKey = envKey };
+        var plainStore = new LlmEndpointStore(plainOptions, plainStorage);
+
+        plainStore.Apply(new LlmEndpointOverride(ApiKey: apiKey, SetBy: 1UL, SetAt: DateTimeOffset.UtcNow));
+        var plainBlob = plainStorage.GetBlob(LlmEndpointStore.BlobKey) ?? "";
+
+        Check("★ 沒有 LLM_ADMIN_KEY 時是明文，而且**會說出來**（不假裝有加密）",
+            plainBlob.Contains(apiKey, StringComparison.Ordinal) && !plainStore.Encrypted
+            && plainStore.DescribeOverride().Contains("明文", StringComparison.Ordinal));
+
+        // 主人換了 LLM_ADMIN_KEY → 舊密文解不開 → 整筆放棄，回到環境變數
+        restartedStore.Apply(new LlmEndpointOverride(
+            BaseUrl: "https://new.example.com/v1", ApiKey: apiKey, Model: "new-model",
+            SetBy: 7UL, SetAt: DateTimeOffset.UtcNow));
+
+        var rotated = new LlmOptions
+        {
+            BaseUrl = "https://env.example.com/v1", Model = "env-model", ApiKey = envKey, AdminKey = "換過的主人密語"
+        };
+
+        var rotatedStore = new LlmEndpointStore(rotated, storage);
+
+        Check("★ LLM_ADMIN_KEY 換過 → 舊密文解不開 → **整筆放棄**回到環境變數" +
+              "（不會拿亂碼去打 API，那會變成看不出原因的 401）",
+            !rotatedStore.HasOverride && rotated.BaseUrl == "https://env.example.com/v1"
+            && rotated.Model == "env-model" && rotated.ApiKey == envKey
+            && rotatedStore.LoadWarning is not null, rotatedStore.LoadWarning);
+
+        // 記憶體後端：要講「重啟後會消失」
+        var volatileStorage = new FakeStateStore { Persistent = false };
+        var volatileStore = new LlmEndpointStore(
+            new LlmOptions { BaseUrl = "https://env.example.com/v1", Model = "env-model", ApiKey = envKey },
+            volatileStorage);
+
+        volatileStore.Apply(new LlmEndpointOverride(ApiKey: apiKey, SetBy: 1UL, SetAt: DateTimeOffset.UtcNow));
+
+        Check("★ 後端是記憶體模式時會說「重啟後會回到環境變數」（不讓人以為存起來了）",
+            !volatileStore.Persistent && volatileStore.DescribeOverride().Contains("記憶體", StringComparison.Ordinal));
+
+        // ── 3) 熱抽換：真的換掉連線（用假的 HTTP 端點攔下請求）──
+        var hits = new List<(string Host, string? Auth, string Body)>();
+        var endpoint = new RecordingEndpoint(hits);
+
+        var hotOptions = new LlmOptions
+        {
+            BaseUrl = "https://old.example.com/v1", Model = "old-model",
+            ApiKey = "sk-old-key-111111", RequestTimeoutSeconds = 5
+        };
+
+        var hotStorage = new FakeStateStore();
+        var hotStore = new LlmEndpointStore(hotOptions, hotStorage);
+
+        (ILlmClient, string) Factory(LlmOptions opts)
+        {
+            var (created, message) = SemanticKernelLlmClient.Create(opts, null, endpoint);
+            return (created ?? (ILlmClient)DisabledLlmClient.Instance, message);
+        }
+
+        var reloadable = new ReloadableLlmClient(hotOptions, factory: Factory) { GraceDelay = TimeSpan.Zero };
+        var reloadedEvents = 0;
+        reloadable.Reloaded += _ => reloadedEvents++;
+
+        var probe = new LlmRequest(
+            "你是一個測試用的助理。", [], new ChatTurn(
+                ChatRole.User, "tester", 1UL, 2UL, "ping", DateTimeOffset.UtcNow),
+            MaxTokens: 32, Temperature: 0, Tag: "probe");
+
+        reloadable.CompleteAsync(probe, CancellationToken.None).GetAwaiter().GetResult();
+
+        Check("★ 第一次呼叫走的是原本的端點與金鑰（假端點收到的是舊的）",
+            hits.Count == 1 && hits[0].Host == "old.example.com" && hits[0].Auth == "sk-old-key-111111"
+            && hits[0].Body.Contains("\"model\":\"old-model\"", StringComparison.Ordinal),
+            hits.Count == 0 ? "(沒有收到請求)" : $"{hits[0].Host}｜{hits[0].Auth}");
+
+        hotStore.Apply(new LlmEndpointOverride(
+            BaseUrl: "https://new.example.com/v1", ApiKey: "sk-new-key-222222", Model: "new-model",
+            SetBy: 9UL, SetAt: DateTimeOffset.UtcNow));
+
+        reloadable.Reload();
+        reloadable.CompleteAsync(probe, CancellationToken.None).GetAwaiter().GetResult();
+
+        Check("★ 換完設定＋重建連線後，下一個請求真的走**新端點、新金鑰、新模型名稱**" +
+              "（不是只有介面顯示改了）",
+            hits.Count == 2 && hits[1].Host == "new.example.com" && hits[1].Auth == "sk-new-key-222222"
+            && hits[1].Body.Contains("\"model\":\"new-model\"", StringComparison.Ordinal),
+            hits.Count < 2 ? "(第二次沒有送出)" : $"{hits[1].Host}｜{hits[1].Auth}");
+
+        Check("★ 重建連線不必重啟（原本那個 ReloadableLlmClient 物件就換掉了裡面的客戶端）",
+            reloadable.ReloadCount == 1 && reloadedEvents == 1 && reloadable.IsConfigured);
+
+        // 舊連線要被處置（不然換幾次就漏幾組 socket）
+        var disposed = new List<string>();
+        var generation = 0;
+
+        var swapping = new ReloadableLlmClient(
+            new LlmOptions { BaseUrl = "https://x.example.com/v1", Model = "m", ApiKey = "sk-x-000000" },
+            factory: _ =>
+            {
+                generation++;
+                return (new DisposableClient($"#{generation}", disposed), $"第 {generation} 條");
+            }) { GraceDelay = TimeSpan.Zero };
+
+        swapping.Reload();
+
+        Check("★ 重建時會處置舊連線（這裡把 GraceDelay 設 0；正式是延後 30 秒讓進行中的請求跑完）",
+            disposed.Count == 1 && disposed[0] == "#1" && generation == 2,
+            string.Join(",", disposed));
+
+        // 「開機沒有金鑰 → 之後在 Discord 補上」那條路
+        var flipOptions = new LlmOptions { BaseUrl = "https://x.example.com/v1", Model = "m" };
+        var flipping = new ReloadableLlmClient(flipOptions, factory: opts => opts.IsConfigured
+            ? (new DisposableClient("configured", disposed), "已啟用")
+            : (DisabledLlmClient.Instance, "未啟用"));
+
+        Check("★ 開機沒有金鑰時 IsConfigured 是 false（AI 功能整組關掉）", !flipping.IsConfigured);
+
+        flipOptions.ApiKey = "sk-added-later-123456";
+        flipping.Reload();
+
+        Check("★ 之後補上金鑰 → IsConfigured 變成 true（不必重啟；Program 會順便接上訊息事件與摘要排程）",
+            flipping.IsConfigured && flipping.ReloadCount == 1);
+
+        // ── 4) 失敗的分類（決定要不要自動回退）────────────
+        var (authClient, _) = SemanticKernelLlmClient.Create(
+            new LlmOptions
+            {
+                BaseUrl = "https://auth.example.com/v1", Model = "m",
+                ApiKey = "sk-bad-key-000000", RequestTimeoutSeconds = 5
+            },
+            null,
+            new StatusEndpoint(401, """{"error":{"message":"Authentication Fails, Your api key is invalid"}}"""));
+
+        LlmException? authError = null;
+
+        try { authClient!.CompleteAsync(probe, CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (Exception ex) { authError = ex as LlmException; }
+
+        Check("★ 401 → 分類成 Auth（只有這一種會自動退回舊設定）",
+            authError?.Kind == LlmErrorKind.Auth && authError.LooksLikeBadSettings,
+            authError is null ? "(沒有丟例外)" : $"{authError.Kind}：{authError.Message}");
+
+        Check("★ 分類後給使用者看的訊息不含金鑰原文",
+            authError is not null && !authError.Message.Contains("sk-bad", StringComparison.Ordinal),
+            authError?.Message);
+
+        var (netClient, _) = SemanticKernelLlmClient.Create(
+            new LlmOptions
+            {
+                BaseUrl = "https://net.example.com/v1", Model = "m",
+                ApiKey = "sk-net-key-000000", RequestTimeoutSeconds = 5
+            },
+            null,
+            new ThrowingEndpoint(new HttpRequestException(
+                "Connection refused (net.example.com:443)")));
+
+        LlmException? netError = null;
+
+        try { netClient!.CompleteAsync(probe, CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (Exception ex) { netError = ex as LlmException; }
+
+        Check("★ 連不上 → 分類成 Network，而且**不會**自動回退（設定本身可能是對的）",
+            netError?.Kind == LlmErrorKind.Network && !netError.LooksLikeBadSettings,
+            netError is null ? "(沒有丟例外)" : $"{netError.Kind}：{netError.Message}");
+
+        // ── 5) 分類器：用「真實服務回來的原文」驗（不是自己想像的文案）──
+        //
+        // 實測（拿一組故意打錯的金鑰打 DeepSeek v1/chat/completions）：
+        //   HTTP 401
+        //   {"error":{"message":"Authentication Fails, Your api key: ****0000 is invalid...",
+        //             "type":"authentication_error","code":"invalid_request_error"}}
+        // ⚠️ 這串裡面**沒有**「401」也**沒有**「Unauthorized」——
+        //    只比對那兩個關鍵字的分類器會把「最常見的失敗」判成說不出來，自動回退就永遠不會啟動。
+        const string realAuthBody =
+            """{"error":{"message":"Authentication Fails, Your api key: ****0000 is invalid (request_id: x)","type":"authentication_error","code":"invalid_request_error"}}""";
+
+        var byStatus = LlmErrors.Classify(401, realAuthBody, "HttpOperationException", "api.deepseek.com", "deepseek-flash");
+        Check("★ 真實的 401 原文（不含「401」字樣）→ 靠**狀態碼**分類成 Auth",
+            byStatus.Kind == LlmErrorKind.Auth && byStatus.Message.Contains("金鑰被拒絕", StringComparison.Ordinal),
+            $"{byStatus.Kind}：{byStatus.Message}");
+
+        var byText = LlmErrors.Classify(null, realAuthBody, "HttpOperationException", "api.deepseek.com", "deepseek-flash");
+        Check("★ 連狀態碼都拿不到時 → 靠真實文案（Authentication Fails／authentication_error）也認得出來",
+            byText.Kind == LlmErrorKind.Auth, $"{byText.Kind}");
+
+        Check("★ 402 → Quota、404 → ModelNotFound、429 → RateLimited（各自的下一步完全不同）",
+            LlmErrors.KindOf(402, "") == LlmErrorKind.Quota
+            && LlmErrors.KindOf(404, "") == LlmErrorKind.ModelNotFound
+            && LlmErrors.KindOf(429, "") == LlmErrorKind.RateLimited);
+
+        Check("★ 500（服務端自己的問題）→ **不會**被誤判成「金鑰問題」而亂回退",
+            LlmErrors.KindOf(500, "Internal Server Error") == LlmErrorKind.Unknown);
+
+        Check("★ 400 invalid_request_error（格式錯誤）不會被當成金鑰問題",
+            LlmErrors.KindOf(400, """{"error":{"code":"invalid_request_error","type":"invalid_request_error"}}""")
+                != LlmErrorKind.Auth);
+
+        Check("★ 真正的金鑰字串不會出現在任何分類訊息裡",
+            !byStatus.Message.Contains("****0000", StringComparison.Ordinal)
+            && byStatus.Message.Length < 120);
+    }
+
+    /// <summary>把字串裡的一個字元改掉（驗「密文被動過就解不開」）。</summary>
+    private static string FlipOneChar(string text)
+    {
+        var chars = text.ToCharArray();
+
+        // 挑 base64 內容中間的位置（避開字首與尾端的 '=' 補位）
+        var index = Math.Min(chars.Length - 1, LlmSecretProtector.EncryptedPrefix.Length + 6);
+        chars[index] = chars[index] == 'A' ? 'B' : 'A';
+
+        return new string(chars);
+    }
+
+    /// <summary>
+    /// 假的模型端點：把每一次請求的 **host／金鑰／body** 記下來，並回一個最小的 chat completion。
+    ///
+    /// 為什麼要記這三樣：熱抽換最難發現的壞法是「介面顯示換了、實際還在打舊端點」——
+    /// 只有看送出去的東西才驗得出來。金鑰看 `Authorization`，模型名稱看 body。
+    /// </summary>
+    private sealed class RecordingEndpoint(List<(string Host, string? Auth, string Body)> hits) : HttpMessageHandler
+    {
+        private const string Completion =
+            """{"id":"x","object":"chat.completion","created":0,"model":"echo","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}""";
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var body = request.Content is null
+                ? ""
+                : await request.Content.ReadAsStringAsync(cancellationToken);
+
+            hits.Add((request.RequestUri?.Host ?? "", request.Headers.Authorization?.Parameter, body));
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(Completion, Encoding.UTF8, "application/json")
+            };
+        }
+    }
+
+    /// <summary>假的端點：固定回一個 HTTP 狀態（驗錯誤分類）。</summary>
+    private sealed class StatusEndpoint(int status, string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(new HttpResponseMessage((HttpStatusCode)status)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            });
+    }
+
+    /// <summary>假的端點：直接丟例外（驗「網路問題不算設定錯」）。</summary>
+    private sealed class ThrowingEndpoint(Exception error) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromException<HttpResponseMessage>(error);
+    }
+
+    /// <summary>可以被觀察「有沒有被處置」的假客戶端。</summary>
+    private sealed class DisposableClient(string name, List<string> disposed) : ILlmClient, IDisposable
+    {
+        public bool IsConfigured => true;
+
+        public string Describe() => name;
+
+        public Task<LlmReply> CompleteAsync(LlmRequest request, CancellationToken cancellationToken)
+            => Task.FromResult(new LlmReply("ok", 1, 1, true, name, TimeSpan.Zero));
+
+        public void Dispose() => disposed.Add(name);
     }
 
     private static void Section(string title)

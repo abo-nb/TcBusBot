@@ -79,13 +79,57 @@ public sealed record LlmReply(
     public bool HasReasoning => Reasoning.Length > 0 || ReasoningTokens > 0;
 }
 
+/// <summary>
+/// 失敗的**種類**（不是給人看的訊息，是給程式判斷用的）。
+///
+/// 為什麼需要它：有些失敗是可以**用它自己來修正**的，有些不行 ——
+/// 最明顯的例子是 `/ai llm` 換金鑰：金鑰打錯（401／403）幾乎一定是「新設定是壞的」，
+/// 應該自動退回舊設定；但網路不通或服務商太慢就只是暫時的，**不該**因此丟掉
+/// 一組其實正確的設定。只靠比對訊息文字來判斷太脆弱（訊息會被改寫、翻譯、包裝）。
+/// </summary>
+public enum LlmErrorKind
+{
+    /// <summary>說不出來是哪一種（保守：什麼都不要自動做）。</summary>
+    Unknown,
+
+    /// <summary>金鑰被拒絕（401／403）：金鑰錯、被撤銷、或服務商不對。</summary>
+    Auth,
+
+    /// <summary>找不到模型（404／model_not_found）：模型名稱或端點不對。</summary>
+    ModelNotFound,
+
+    /// <summary>被限流（429）。</summary>
+    RateLimited,
+
+    /// <summary>服務端餘額不足（402／insufficient quota）。</summary>
+    Quota,
+
+    /// <summary>連不上（DNS、連線被拒、憑證問題）。</summary>
+    Network,
+
+    /// <summary>等太久（逾時）。</summary>
+    Timeout
+}
+
 /// <summary>呼叫 LLM 失敗（訊息一定是「人看得懂」的那種，不會把金鑰印出來）。</summary>
 public sealed class LlmException : Exception
 {
-    public LlmException(string message, bool retryable = false, Exception? inner = null)
-        : base(message, inner) => Retryable = retryable;
+    public LlmException(
+        string message, bool retryable = false, Exception? inner = null,
+        LlmErrorKind kind = LlmErrorKind.Unknown)
+        : base(message, inner)
+    {
+        Retryable = retryable;
+        Kind = kind;
+    }
 
     public bool Retryable { get; }
+
+    /// <summary>失敗的種類（見 <see cref="LlmErrorKind"/>；判斷不出來時是 Unknown）。</summary>
+    public LlmErrorKind Kind { get; }
+
+    /// <summary>這一種失敗是不是「設定本身有問題」（換回舊設定就會好）。</summary>
+    public bool LooksLikeBadSettings => Kind == LlmErrorKind.Auth;
 }
 
 /// <summary>

@@ -468,13 +468,8 @@ public sealed class LlmOptions
     /// <summary>對話段落的識別碼（不同伺服器一定不相通；私訊用 0）。</summary>
     public static (ulong GuildId, ulong ChannelId) Key(ulong guildId, ulong channelId) => (guildId, channelId);
 
-    /// <summary>金鑰只露出前後幾碼（log 與 /ai status 用）。</summary>
-    public string MaskedKey
-        => string.IsNullOrWhiteSpace(ApiKey)
-            ? "（未設定）"
-            : ApiKey!.Length <= 8
-                ? "****"
-                : $"{ApiKey[..4]}…{ApiKey[^4..]}（{ApiKey.Length} 字元）";
+    /// <summary>金鑰只露出前後幾碼（log 與 /ai status 用）。實作在 <see cref="LlmEndpointStore.Mask"/>（單一來源）。</summary>
+    public string MaskedKey => LlmEndpointStore.Mask(ApiKey);
 
     /// <summary>只印 host，不要把完整 URL（可能含自架服務的內網位址）大聲講出來。</summary>
     public string EndpointHost
