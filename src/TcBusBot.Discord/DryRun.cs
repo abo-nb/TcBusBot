@@ -576,6 +576,9 @@ public static class DryRun
         // ── 指令樹（斜線指令真的註冊得起來嗎）───────────────
         if (provider is not null) AuditCommandTree(cfg, data, provider);
 
+        // ── 資料抓不到時的行為（TDX 429 不可以讓 Bot 起不來）──
+        if (provider is not null) AuditStaticDataResilience(provider);
+
         // ── LLM 設定（不連線，只驗設定本身合不合理）─────────
         AuditLlmConfig(cfg);
 
@@ -1982,6 +1985,29 @@ public static class DryRun
     /// 剛好掃到別人運算元裡的位元組時，解析結果不會是
     /// <c>InteractionModuleBase</c>／<c>ISocketMessageChannel</c>／本模組的方法，會直接被丟掉。
     /// </summary>
+    /// <summary>
+    /// 掃一個型別裡**所有**方法（含編譯器產生的閉包／狀態機巢狀型別）的呼叫。
+    ///
+    /// 為什麼需要它：<see cref="CollectCalls"/> 只掃「傳進去的那一個方法」的 IL，
+    /// 而 lambda 會被編譯成**另一個方法**（閉包類別）—— 「啟動背景重試」與「熱換資料」
+    /// 都寫在 lambda 裡，只掃 <c>Main</c> 會看不到。這個專案已經吃過兩次同一種虧
+    /// （`IsOwnAppRole`、`ExpandMentions` 都是被 LINQ lambda 藏起來的呼叫）。
+    /// </summary>
+    private static List<string> CollectCallsDeep(Type type)
+    {
+        var calls = new List<string>();
+
+        foreach (var method in type.GetMethods(BindingFlags.Instance | BindingFlags.Static
+                                               | BindingFlags.Public | BindingFlags.NonPublic
+                                               | BindingFlags.DeclaredOnly))
+            calls.AddRange(CollectCalls(method, resolveAll: true));
+
+        foreach (var nested in type.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic))
+            calls.AddRange(CollectCallsDeep(nested));
+
+        return calls.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+    }
+
     private static List<string> CollectCalls(MethodInfo method, bool resolveAll = false)
     {
         var target = method;
@@ -2090,6 +2116,142 @@ public static class DryRun
             Console.WriteLine($"    └ {option.Name} [{option.DiscordOptionType}／{required}{limit}]" +
                               $"　{option.Description}");
         }
+    }
+
+    /// <summary>
+    /// 「TDX 抓不到資料（429）時 Bot 還能不能用」的稽核。
+    ///
+    /// 這一條來自真實事故：TDX 回 `HTTP 429 Too Many Requests` → 舊版行程直接 `return 1`
+    /// → Render 健康檢查失敗 → **部署失敗、Bot 完全不上線**。
+    /// 但 429 是幾分鐘後就沒事的暫時狀態，而公車查詢只是這個 Bot 的其中一個功能。
+    ///
+    /// 所以這裡要驗的是「有沒有那條退路」：
+    ///   1. 載入流程有沒有「舊快取」與「最小資料集／空資料集」的退路
+    ///   2. 有沒有**背景重試**（而且要真的換進正在服務的資料目錄，不必重啟）
+    ///   3. 資料是空的時候，UI 與模型拿到的是「還沒好」而不是「找不到」（也不可以丟例外）
+    /// </summary>
+    private static void AuditStaticDataResilience(IServiceProvider services)
+    {
+        Console.WriteLine();
+        Console.WriteLine("▶ 資料韌性檢查  TDX 抓不到（429）時還能不能用");
+
+        var catalog = services.GetRequiredService<BusDataCatalog>();
+        var status = services.GetRequiredService<StaticDataStatus>();
+
+        if (status.All.Count == 0)
+            Problem("StaticDataStatus 沒有任何城市 —— /health 與「資料還沒好」的訊息都會是空的");
+        else
+            Console.WriteLine($"  ℹ 目前狀態：{status.Describe()}");
+
+        // ── 1) 退路鏈：舊快取 → 最小資料集／空資料集 ──────────
+        var load = typeof(StaticDataLoader).GetMethod(nameof(StaticDataLoader.LoadAsync));
+        var loadCalls = load is null ? [] : CollectCalls(load, resolveAll: true);
+
+        if (load is null)
+            Problem("找不到 StaticDataLoader.LoadAsync");
+        else if (!loadCalls.Contains("StaticDataLoader.TryReadCache"))
+            Problem("StaticDataLoader 在 TDX 失敗時沒有退回**本機快取** —— 429 會讓整個行程起不來");
+        else
+            Console.WriteLine("  ✔ TDX 失敗時會退回本機快取（四小時才更新一次，舊資料幾乎沒有差別）");
+
+        var provision = typeof(StaticDataProvisioner).GetMethod(nameof(StaticDataProvisioner.LoadCityAsync));
+        var provisionCalls = provision is null ? [] : CollectCalls(provision, resolveAll: true);
+
+        var miniFixture = typeof(StaticDataProvisioner).GetMethod("TryMiniFixture",
+            BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic);
+        var miniCalls = miniFixture is null ? [] : CollectCalls(miniFixture, resolveAll: true);
+
+        if (provision is null || miniFixture is null)
+            Problem("找不到 StaticDataProvisioner.LoadCityAsync／TryMiniFixture");
+        else if (!miniCalls.Contains("MiniFixtureSource.Load"))
+            Problem("StaticDataProvisioner 沒有內建最小資料集的退路（連快取都沒有時會沒有資料）");
+        else
+            Console.WriteLine("  ✔ 連舊快取都沒有時還有內建最小資料集（臺中），最差是空資料集（不是例外）");
+
+        // ── 2) Program 真的用了這些東西，而且啟動了背景重試 ──
+        //
+        // ⚠️ 用 CollectCallsDeep：`CollectCalls` 只掃「那一個方法」的 IL，
+        //    而「啟動重試」與「熱換資料」都寫在 lambda 裡（＝編譯器產生的另一個方法），
+        //    只掃 Main 會看不到 —— 這個專案已經吃過兩次同一種虧。
+        var mainCalls = CollectCallsDeep(typeof(Program));
+
+        if (mainCalls.Count == 0)
+            Problem("掃不到 Program 的任何呼叫");
+        else if (!mainCalls.Contains("StaticDataProvisioner.LoadCityAsync"))
+            Problem("Program 沒有走 StaticDataProvisioner（退路鏈不會生效）");
+        else if (!mainCalls.Contains("StaticDataRetryLoop.RunAsync"))
+            Problem("Program 沒有啟動背景重試 —— 429 之後要**重啟**才會再試一次");
+        else if (!mainCalls.Contains("BusDataCatalog.Install"))
+            Problem("背景重試成功後沒有把資料換進 BusDataCatalog —— 補到了資料但服務還在用舊的（空的）");
+        else
+            Console.WriteLine("  ✔ Program 走退路鏈、啟動背景重試，而且成功時會熱換資料（不必重啟）");
+
+        // ── 3) 空資料不可以丟例外，而且 UI／模型要說實話 ──────
+        var city = catalog.Default;
+
+        if (catalog.For(0UL) is null)
+        {
+            Problem("BusDataCatalog.For 回傳 null —— 資料目錄壞了");
+        }
+        else
+        {
+            var before = catalog.ForCity(city);
+
+            try
+            {
+                // 故意換成「什麼都沒有」的資料：查詢**不可以**丟例外
+                catalog.Install(city, StaticDataProvisioner.Build([], [], []));
+
+                var emptyActions = services.GetRequiredService<BusActionService>();
+                var text = emptyActions.FindRoutes("不可能的站A", "不可能的站B", userId: 0);
+
+                if (text.Contains("例外", StringComparison.Ordinal))
+                    Problem("空資料集時模型拿到的是例外訊息");
+                else
+                    Console.WriteLine("  ✔ 空資料集時查詢不會丟例外（行程可以活著、AI 與通知都還在）");
+            }
+            catch (Exception ex)
+            {
+                Problem($"空資料集時查詢丟了例外（{ex.GetType().Name}: {ex.Message}）—— 這就是「429 讓 Bot 掛掉」的同類問題");
+            }
+            finally
+            {
+                catalog.Install(city, before);   // 還原（後面的檢查還要用真資料）
+            }
+        }
+
+        // UI 的三個入口都要有「資料還沒好」的守門（不然使用者只會看到「找不到站牌」）
+        var panel = typeof(BusModule).GetMethod(nameof(BusModule.PanelAsync));
+        var panelCalls = panel is null ? [] : CollectCalls(panel, resolveAll: true);
+
+        var search = typeof(BusComponentModule).GetMethod("RunSearchAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var searchCalls = search is null ? [] : CollectCalls(search, resolveAll: true);
+
+        var find = typeof(BusComponentModule).GetMethod(nameof(BusComponentModule.FindAsync));
+        var findCalls = find is null ? [] : CollectCalls(find, resolveAll: true);
+
+        var actionSearch = typeof(BusActionService).GetMethod(nameof(BusActionService.SearchStops));
+        var actionCalls = actionSearch is null ? [] : CollectCalls(actionSearch, resolveAll: true);
+
+        var notReady = typeof(BusActionService).GetMethod("NotReady",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var notReadyCalls = notReady is null ? [] : CollectCalls(notReady, resolveAll: true);
+
+        if (panel is null || search is null || find is null)
+            Problem("找不到面板／搜尋的處理函式（無法驗證「資料還沒好」的守門）");
+        else if (!panelCalls.Contains("BusModule.NotReady")
+                 || !searchCalls.Contains("StaticDataStatus.get_Item")
+                    && !searchCalls.Contains("StaticDataStatus.For")
+                 || !findCalls.Contains("StaticDataStatus.get_Item")
+                    && !findCalls.Contains("StaticDataStatus.For"))
+            Problem("面板／搜尋沒有檢查「這個城市的資料好了沒」—— 使用者只會看到「找不到站牌」而不知道原因");
+        else if (actionSearch is null || notReady is null
+                 || !actionCalls.Contains("BusActionService.NotReady")
+                 || !notReadyCalls.Contains("StaticDataStatus.For"))
+            Problem("LLM 工具沒有「資料還沒好」的守門 —— 模型會以為是站名打錯而亂猜");
+        else
+            Console.WriteLine("  ✔ 面板、站牌搜尋、路線搜尋、LLM 工具都會說「資料還沒好」（而不是「找不到」）");
     }
 
     /// <summary>

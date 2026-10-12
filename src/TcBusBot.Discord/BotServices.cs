@@ -4,6 +4,7 @@ using Discord.WebSocket;
 using Microsoft.Extensions.DependencyInjection;
 using TcBusBot.Core.Bus;
 using TcBusBot.Core.Chat;
+using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Realtime;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Subscriptions;
@@ -47,7 +48,8 @@ internal static class BotServices
         Action<string> log,
         StorageSettings? storage = null,
         BusDataCatalog? catalog = null,
-        UserCityStore? userCities = null)
+        UserCityStore? userCities = null,
+        StaticDataStatus? dataStatus = null)
     {
         var services = new ServiceCollection();
 
@@ -127,7 +129,18 @@ internal static class BotServices
         services.AddSingleton(cities);
         services.AddSingleton(dataCatalog);
 
-        services.AddSingleton(sp => new BusActionService(dataCatalog.DefaultData, sp.GetRequiredService<SubscriptionService>(), dataCatalog));
+        // 「每個城市的靜態資料現在能不能用」——UI 的「資料還沒好」訊息與 /health 都讀它。
+        // ⚠️ 一定要是**同一個實例**：背景重試迴圈改的是這一份，Discord 互動讀的也是這一份
+        //    （分成兩份的話，重試成功了但 UI 還是會說「還沒好」）。
+        //    沒傳進來時（`--dryrun`／測試）就照**目前實際載入的資料**自己生一份，
+        //    不然 UI 會說「還沒有資料」而實際上查得到站牌 —— 兩邊說法不一致。
+        services.AddSingleton(dataStatus ?? SeedDataStatus(cities.Available, dataCatalog));
+
+        services.AddSingleton(sp => new BusActionService(
+            dataCatalog.DefaultData,
+            sp.GetRequiredService<SubscriptionService>(),
+            dataCatalog,
+            sp.GetRequiredService<StaticDataStatus>()));   // 「資料還沒好」要據實回報給模型
         services.AddSingleton(sp => new GuildPersonaStore(
             sp.GetRequiredService<ILlmStateStore>(), cfg.Llm.BuildPersonaLimits()));
 
@@ -201,6 +214,33 @@ internal static class BotServices
             services.AddTransient(type);
 
         return services;
+    }
+
+    /// <summary>
+    /// 沒有傳入 <see cref="StaticDataStatus"/> 時，照「現在實際載入的資料」生一份。
+    ///
+    /// 為什麼不能只用 `new StaticDataStatus(cities)`（全部標成「還沒好」）：
+    /// `--dryrun`／測試走的就是這條路，那樣會讓 UI 的訊息與事實相反
+    /// （狀態說沒有資料，但查詢其實查得到）。
+    /// </summary>
+    private static StaticDataStatus SeedDataStatus(
+        IReadOnlyList<string> cities, BusDataCatalog catalog)
+    {
+        var status = new StaticDataStatus(cities);
+
+        foreach (var city in cities)
+        {
+            var stops = catalog.ForCity(city).StopCount;
+
+            status.Report(new StaticCityState(
+                City: city,
+                StopCount: stops,
+                Source: stops > 0 ? "啟動時載入" : "尚未載入",
+                Available: stops > 0,
+                Fresh: stops > 0));
+        }
+
+        return status;
     }
 
     /// <summary>

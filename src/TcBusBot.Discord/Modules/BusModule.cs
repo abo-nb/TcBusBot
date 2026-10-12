@@ -1,6 +1,7 @@
 using Discord;
 using Discord.Interactions;
 using TcBusBot.Core.Bus;
+using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Subscriptions;
 using TcBusBot.Core.Tdx;
@@ -94,6 +95,7 @@ public sealed class BusModule : BusModuleBase
     private readonly SavedGroupStore _savedGroups;
     private readonly BusDataCatalog _catalog;
     private readonly UserCityStore _cities;
+    private readonly StaticDataStatus _dataStatus;
 
     public BusModule(
         BusDataService data,
@@ -102,7 +104,8 @@ public sealed class BusModule : BusModuleBase
         BotRuntime runtime,
         SavedGroupStore savedGroups,
         BusDataCatalog catalog,
-        UserCityStore cities)
+        UserCityStore cities,
+        StaticDataStatus dataStatus)
     {
         _data = data;
         _subs = subs;
@@ -111,6 +114,7 @@ public sealed class BusModule : BusModuleBase
         _savedGroups = savedGroups;
         _catalog = catalog;
         _cities = cities;
+        _dataStatus = dataStatus;
     }
 
     /// <summary>這個人目前選的城市（訂公車的人自己決定要看哪個城市）。</summary>
@@ -184,12 +188,29 @@ public sealed class BusModule : BusModuleBase
     [SlashCommand("panel", "開啟訂閱面板：設定起點與目的地，找出可以搭的路線")]
     public async Task PanelAsync()
     {
+        // 資料還沒好時**先講清楚**（不然使用者會看到「找不到站牌」，以為是自己打錯字）
+        if (NotReady(MyCity) is { } blocked)
+        {
+            await RespondAsync(blocked, ephemeral: true);
+            return;
+        }
+
         var session = _sessions.GetOrCreate(Context.User.Id, Context.Channel.Id);
         await RespondAsync(
             embed: BusUi.Panel(session, _subs.GetGroupsByUser(Context.User.Id).Count()),
             components: BusUi.PanelComponents(session),
             ephemeral: true);
     }
+
+    /// <summary>
+    /// 這個城市的資料還沒好嗎（回傳要講給使用者的話；null ＝ 可以照常查）。
+    ///
+    /// ⚠️ 這裡是「誠實」的關鍵：TDX 429 的時候 Bot 照常啟動，如果沒有這一道，
+    ///    使用者輸入站名後只會看到「找不到站牌」——他會以為打錯字或 Bot 壞掉，
+    ///    然後一直重試。直接說「資料還沒抓好、幾分鐘後自己會好」才是對的。
+    /// </summary>
+    private string? NotReady(string city)
+        => _dataStatus.For(city).Available ? null : _dataStatus.DescribeForUser(city);
 
     [SlashCommand("groups", "我的訂閱組：一次套用多個、合併、改名、刪除（存在 SQLite，重啟後還在）")]
     public async Task GroupsAsync()
@@ -274,7 +295,12 @@ public sealed class BusModule : BusModuleBase
                 (_cities.HasOwnChoice(Context.User.Id) ? "（你自己選的）" : "（預設）") +
                 (_cities.HasChoice ? $"　可換：{BusCity.DisplayOfMany(_cities.Available)}（`/bus city`）" : ""),
                 inline: false)
-            .AddField("靜態資料（這個城市）", $"{MyData.StopCount} 個站牌、{MyData.TripCount} 筆路線站序", inline: false)
+            .AddField("靜態資料（這個城市）", $"{MyData.StopCount} 個站牌、{MyData.TripCount} 筆路線站序" +
+                (_dataStatus.For(MyCity).Available ? "" : "　⚠️ **還沒有資料**"), inline: false)
+            .AddField("全部城市的資料狀態", _dataStatus.Describe() +
+                (_dataStatus.AnyNeedsRetry
+                    ? "\n-# 「還沒好／只有舊快取」的城市由**背景自動重試**補齊（不需要重啟）"
+                    : ""), inline: false)
             .AddField("資料來源", _runtime.DataSourceDescription, inline: false)
             .AddField("訂閱", $"{_subs.GroupCount} 組、{_subs.SubscriptionCount} 個訂閱", inline: true)
             .AddField("面板 session", $"{_sessions.Count} 個", inline: true)

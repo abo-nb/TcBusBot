@@ -14,13 +14,48 @@ namespace TcBusBot.Core.Bus;
 /// </summary>
 public sealed class BusDataCatalog
 {
-    private readonly Dictionary<string, BusDataService> _byCity;
+    /// <summary>
+    /// 城市 → 資料。**改動時整份換掉**（copy-on-write），見 <see cref="Install"/>。
+    ///
+    /// 為什麼不直接改同一個字典：Discord 的互動是多執行緒進來的，
+    /// 「一邊查詢、一邊把某個城市換成新資料」會讓列舉中的字典被改到
+    /// （`InvalidOperationException: Collection was modified`）。
+    /// 一次換掉整個參考最簡單而且不可能觀察到「一半舊一半新」。
+    /// </summary>
+    private volatile Dictionary<string, BusDataService> _byCity;
+
     private readonly UserCityStore _cities;
+    private readonly object _gate = new();
 
     public BusDataCatalog(IReadOnlyDictionary<string, BusDataService> byCity, UserCityStore cities)
     {
         _byCity = new Dictionary<string, BusDataService>(byCity, StringComparer.OrdinalIgnoreCase);
         _cities = cities;
+    }
+
+    /// <summary>
+    /// 把某個城市的資料換成新的一份（背景重試抓到資料時用）。
+    ///
+    /// ⚠️ 這裡刻意用「換掉整個字典」而不是「改一個鍵」：正在查詢的執行緒拿到的是
+    ///    舊的完整字典（照樣正確），下一個請求拿到的是新的完整字典 ——
+    ///    沒有任何時刻會看到半套資料。
+    ///
+    /// 為什麼是**新的一份** <see cref="BusDataService"/> 而不是對舊的再呼叫一次
+    /// <c>Load</c>：`Load` 會先清空內部索引，正在跑的查詢會踩到「集合已被修改」。
+    /// </summary>
+    public void Install(string city, BusDataService data)
+    {
+        var code = BusCity.Normalize(city);
+
+        lock (_gate)
+        {
+            var copy = new Dictionary<string, BusDataService>(_byCity, StringComparer.OrdinalIgnoreCase)
+            {
+                [code] = data
+            };
+
+            _byCity = copy;
+        }
     }
 
     /// <summary>可用城市（依 `BUS_CITY` 的順序）。</summary>

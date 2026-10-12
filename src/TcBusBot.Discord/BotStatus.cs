@@ -31,6 +31,18 @@ internal static class BotStatus
     public static string Poller { get; set; } = "（尚未啟動）";
 
     /// <summary>
+    /// 每個城市的靜態資料狀態（幾個站牌、來源、失敗原因、下次重試時間）。
+    ///
+    /// 為什麼要放進 `/health`：TDX 429 的時候 Bot **照常啟動**（這是刻意的），
+    /// 所以「公車查詢為什麼一直說沒資料」只能靠這裡看出來 ——
+    /// 沒有這個欄位，從外面看只知道「服務活著」，看不到「資料還沒抓下來、正在重試」。
+    ///
+    /// ⚠️ 是**函式**而不是字串：背景重試每幾分鐘就改一次狀態，
+    ///    存成字串會永遠落後一步（顯示上一次的重試時間）。
+    /// </summary>
+    public static Func<string>? DataStatus { get; set; }
+
+    /// <summary>
     /// 服務城市的顯示名（預設臺中）。
     ///
     /// 為什麼放在這裡：畫面上的字（面板標題、說明）散在很多地方，
@@ -81,6 +93,7 @@ internal static class BotStatus
                 storage = StorageMode,
                 city = CityDisplay,
                 dataSource = DataSource,
+                dataStatus = DataStatus?.Invoke() ?? "（尚未載入）",
                 poller = Poller,
                 subscriptionGroups = groups,
                 subscriptions = subs,

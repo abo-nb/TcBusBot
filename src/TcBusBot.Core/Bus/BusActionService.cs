@@ -17,12 +17,45 @@ public sealed class BusActionService
     private readonly BusDataService _data;
     private readonly BusDataCatalog? _catalog;
     private readonly Subscriptions.SubscriptionService _subs;
+    private readonly DataSources.StaticDataStatus? _dataStatus;
 
-    public BusActionService(BusDataService data, Subscriptions.SubscriptionService subs, BusDataCatalog? catalog = null)
+    public BusActionService(
+        BusDataService data,
+        Subscriptions.SubscriptionService subs,
+        BusDataCatalog? catalog = null,
+        DataSources.StaticDataStatus? dataStatus = null)
     {
         _catalog = catalog;
         _data = data;
         _subs = subs;
+        _dataStatus = dataStatus;
+    }
+
+    /// <summary>
+    /// 資料還沒好嗎 → 回一句**誠實**的話給模型轉述（null ＝ 可以照常查）。
+    ///
+    /// 為什麼要在這一層擋：模型看到的「找不到站牌」會讓它去猜站名（甚至編造），
+    /// 而真正的原因是 TDX 暫時抓不到資料（429）。把原因講清楚，模型就會照實回答
+    /// 「資料還沒抓好、幾分鐘後自己會好」，而不是叫使用者一直換關鍵字。
+    /// </summary>
+    private string? NotReady(string? city)
+    {
+        if (_dataStatus is null) return null;
+
+        // 沒指定城市 → 跨城市搜尋：只要**有任何一個**城市有資料就照常查
+        if (string.IsNullOrWhiteSpace(city))
+        {
+            if (!_catalog!.Available.Any(c => _dataStatus.For(c).Available))
+                return "⚠️ 公車資料還沒載入完成（TDX 暫時抓不到）。" +
+                       "請告訴使用者「資料還在抓，幾分鐘後再試一次就可以」，**不要**叫他換站名或改關鍵字。";
+
+            return null;
+        }
+
+        return _dataStatus.For(city).Available
+            ? null
+            : "⚠️ " + _dataStatus.DescribeForUser(city) +
+              "\n請據實告訴使用者「資料還沒抓好、系統會自動重試」，不要猜站名。";
     }
 
     // ─────────────────────────────────────────────────────
@@ -130,6 +163,8 @@ public sealed class BusActionService
         keyword = (keyword ?? "").Trim();
         if (keyword.Length < 2) return "關鍵字太短（至少 2 個字）。";
 
+        if (NotReady(city) is { } notReady) return notReady;
+
         if (!TryCitySource(city, out var requested, out var cityError)) return cityError;
 
         var sources = string.IsNullOrWhiteSpace(city) ? SourcesFor(userId) : [requested];
@@ -207,6 +242,8 @@ public sealed class BusActionService
         number = (number ?? "").Trim();
         if (number.Length == 0) return "請給我路線號碼，例如 300、304、藍1。";
 
+        if (NotReady(null) is { } notReadyRoutes) return notReadyRoutes;
+
         var sources = SourcesFor(userId);
         var found = new List<(string City, BusDataService.RouteSummary Route)>();
 
@@ -234,6 +271,8 @@ public sealed class BusActionService
 
     public string FindRoutes(string origin, string destination, ulong userId = 0, string? city = null)
     {
+        if (NotReady(city) is { } notReadyFind) return notReadyFind;
+
         if (!TryCitySource(city, out var requested, out var cityError)) return cityError;
 
         // 起訖**必須在同一個城市**才算得出來（跨城市的站牌沒有共同路線索引），

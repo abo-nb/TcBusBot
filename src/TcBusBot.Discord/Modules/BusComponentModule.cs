@@ -2,6 +2,7 @@ using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
 using TcBusBot.Core.Bus;
+using TcBusBot.Core.DataSources;
 using TcBusBot.Core.Storage;
 using TcBusBot.Core.Subscriptions;
 
@@ -15,6 +16,7 @@ namespace TcBusBot.Discord.Modules;
 public sealed class BusComponentModule : BusModuleBase
 {
     private readonly BusDataCatalog _catalog;
+    private readonly StaticDataStatus _dataStatus;
 
     /// <summary>**這個人**選的城市要用哪一份資料（訂公車的人自己選，見 `/bus city`）。</summary>
     private BusDataService MyData => _catalog.For(Context.User.Id);
@@ -28,13 +30,15 @@ public sealed class BusComponentModule : BusModuleBase
         SubscriptionService subs,
         BusSessionStore sessions,
         BotRuntime runtime,
-        SavedGroupStore savedGroups)
+        SavedGroupStore savedGroups,
+        StaticDataStatus dataStatus)
     {
         _catalog = catalog;
         _subs = subs;
         _sessions = sessions;
         _runtime = runtime;
         _savedGroups = savedGroups;
+        _dataStatus = dataStatus;
     }
 
     private BusSession? Session => _sessions.Get(Context.User.Id, Context.Channel.Id);
@@ -141,6 +145,15 @@ public sealed class BusComponentModule : BusModuleBase
 
         session.PendingIsOrigin = isOrigin;
         session.LastKeyword = keyword ?? "";
+
+        // 資料還沒好 → 不要說「找不到站牌」（那會讓使用者以為是自己打錯字）
+        var city = _catalog.CityFor(Context.User.Id);
+
+        if (!_dataStatus.For(city).Available)
+        {
+            await RespondAsync(_dataStatus.DescribeForUser(city), ephemeral: true);
+            return;
+        }
 
         // 有「完全／前綴相符」的結果時就只顯示那些，避免被模糊相符的雜訊塞滿 25 個選項
         var all = MyData.Search.SearchGrouped(keyword).ToList();
@@ -261,6 +274,19 @@ public sealed class BusComponentModule : BusModuleBase
                     .WithDescription("請先設定起點與目的地。")
                     .Build(),
                 components: BusUi.PanelComponents(session));
+            return;
+        }
+
+        // 資料還沒好 → 直接說清楚（不要在「找不到路線」的訊息裡讓使用者猜）
+        var city = _catalog.CityFor(Context.User.Id);
+
+        if (!_dataStatus.For(city).Available)
+        {
+            await UpdateAsync(embed: new EmbedBuilder()
+                .WithColor(new Color(0xE6, 0x7E, 0x22))
+                .WithTitle("公車資料還沒準備好")
+                .WithDescription(_dataStatus.DescribeForUser(city))
+                .Build(), components: BusUi.PanelComponents(session));
             return;
         }
 

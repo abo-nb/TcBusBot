@@ -134,6 +134,9 @@ public static class SelfTest
         Section("32. 整台 Bot 的模型連線（/ai llm）：覆寫、加密、跨重啟、熱抽換、回退");
         TestLlmEndpoint();
 
+        Section("33. TDX 抓不到資料也要能啟動（429）：舊快取、最小資料集、背景重試、熱換");
+        TestStaticDataResilience(fixturesRoot);
+
         Console.WriteLine();
         Console.WriteLine(new string('─', 64));
         Console.WriteLine($"  通過 {_pass} 項，失敗 {_fail} 項");
@@ -5953,6 +5956,265 @@ public static class SelfTest
             => Task.FromResult(new LlmReply("ok", 1, 1, true, name, TimeSpan.Zero));
 
         public void Dispose() => disposed.Add(name);
+    }
+
+    // ─────────────────────────────────────────────────────
+    //  33) TDX 抓不到資料也要能啟動（429）
+    // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 「TDX 回 429 就整個 Bot 起不來」這件事**不可以再發生**。
+    ///
+    /// 這一段驗的是完整的退路鏈與後果：
+    ///   * TDX 失敗 → **舊快取**（四小時才更新一次，舊資料幾乎沒有差別）
+    ///   * 連舊快取都沒有 → 內建最小資料集（只有臺中）→ 最差是「空的資料集」
+    ///   * 任何情況都**不丟例外**（行程要活著：AI 聊天、已訂好的通知都還在）
+    ///   * 背景重試會把資料補上，而且**換進正在服務的資料目錄**（不必重啟）
+    ///   * 使用者與模型看到的是「資料還沒好、幾分鐘後會自己好」，而不是「找不到站牌」
+    ///
+    /// ⚠️ 這裡用的 TDX 端點是 `http://127.0.0.1:1`（連不上），所以完全不需要網路。
+    /// </summary>
+    private static void TestStaticDataResilience(string fixturesRoot)
+    {
+        var temp = Path.Combine(Path.GetTempPath(), $"tcbus-stale-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(temp);
+
+        var tdx = new TdxApiClient(TdxApiClient.CreateHttpClient(), new TdxOptions
+        {
+            BaseUrl = "http://127.0.0.1:1",       // 一定連不上（模擬 429／斷線）
+            City = "Taichung",
+            CacheDirectory = temp
+        });
+
+        var template = new TdxOptions { BaseUrl = "http://127.0.0.1:1", CacheDirectory = temp };
+
+        try
+        {
+            // ── 1) 有「過期的快取」→ 一定要用得到，不可以丟掉 ──
+            WriteCache(temp, "Taichung", stopName: "快取站", stopUid: "TXG9001");
+            MakeStale(temp, "Taichung");
+
+            var stale = StaticDataLoader.LoadAsync(tdx, new TdxOptions
+            {
+                BaseUrl = "http://127.0.0.1:1", City = "Taichung", CacheDirectory = temp
+            }).GetAwaiter().GetResult();
+
+            Check("★ TDX 抓不到時改用**過期的本機快取**（而不是讓行程起不來）",
+                stale.Source == StaticLoadSource.StaleCache && stale.Data.Stops.Count > 0
+                && stale.Error is not null, stale.DescribeSource());
+
+            Check("★ 舊快取會標示「已多久沒更新」（使用者才看得出資料不是最新的）",
+                stale.CacheAge is not null && stale.DescribeSource().Contains("沒更新", StringComparison.Ordinal),
+                stale.DescribeSource());
+
+            // ── 2) 連舊快取都沒有 → 臺中用內建最小資料集，其他城市是空的（不是例外）──
+            var empty = Path.Combine(Path.GetTempPath(), $"tcbus-none-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(empty);
+
+            var taichung = StaticDataProvisioner.LoadCityAsync(
+                "Taichung", tdx, new TdxOptions { BaseUrl = "http://127.0.0.1:1", CacheDirectory = empty },
+                fixturesRoot: fixturesRoot).GetAwaiter().GetResult();
+
+            Check("★ 完全沒有快取時，臺中改用內建最小資料集（有資料可用、而且標成「不是最新」）",
+                taichung.Available && !taichung.Fresh && taichung.Error is not null,
+                $"{taichung.Describe()}｜{taichung.Source}");
+
+            var tainan = StaticDataProvisioner.LoadCityAsync(
+                "Tainan", tdx, new TdxOptions { BaseUrl = "http://127.0.0.1:1", CacheDirectory = empty },
+                fixturesRoot: fixturesRoot).GetAwaiter().GetResult();
+
+            Check("★ 沒有內建資料集的城市 → 回**空資料集**而不是丟例外（行程必須活著）",
+                !tainan.Available && tainan.Service.StopCount == 0 && tainan.Error is not null,
+                tainan.Error?.Message);
+
+            Check("★ 內建最小資料集**不會**被拿去服務別的城市（只有臺中那條走廊）",
+                !tainan.Source.Contains("最小資料集", StringComparison.Ordinal));
+
+            // ── 3) 背景重試：失敗會記錄、成功會換上去 ──────────
+            var status = new StaticDataStatus(["Taichung", "Tainan"]);
+            var installed = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var succeed = false;
+
+            StaticCityLoad Load(string city, CancellationToken _)
+                => succeed
+                    ? new StaticCityLoad(city, StaticDataProvisioner.Build(
+                        [new BusStop { StopUID = "TXG1", StopName = new LocalizedName("測試站", null) }],
+                        [new BusStopOfRoute
+                        {
+                            RouteUID = "TXG_R1", Direction = 0,
+                            Stops = [new StopOfRouteStop { StopUID = "TXG1", StopSequence = 1, StopName = new LocalizedName("測試站", null) }]
+                        }],
+                        [new BusRoute { RouteUID = "TXG_R1", RouteName = new LocalizedName("測試路線", null) }]),
+                        "剛剛向 TDX 抓取", Fresh: true)
+                    : new StaticCityLoad(city, StaticDataProvisioner.Build([], [], []), "沒有資料",
+                        Fresh: false, new Exception("TDX API 失敗：HTTP 429 Too Many Requests"));
+
+            var loop = new StaticDataRetryLoop(
+                load: (city, ct) => Task.FromResult(Load(city, ct)),
+                install: load => installed[load.City] = load.Service.StopCount,
+                status: status);
+
+            loop.TryOnceAsync().GetAwaiter().GetResult();
+
+            var failed = status.For("Taichung");
+
+            Check("★ 重試失敗會記下原因與次數（`/bus status` 與 /health 看得到）",
+                failed.Attempts == 1 && failed.Error?.Contains("429", StringComparison.Ordinal) == true
+                && failed.NextRetryAt is not null && !failed.Available, failed.Describe());
+
+            Check("★ 重試間隔是「先快後慢」：1 分 → 2 分 → 5 分 → … → 最多 30 分",
+                StaticDataRetryLoop.DelayFor(0) == TimeSpan.FromMinutes(1)
+                && StaticDataRetryLoop.DelayFor(1) == TimeSpan.FromMinutes(2)
+                && StaticDataRetryLoop.DelayFor(2) == TimeSpan.FromMinutes(5)
+                && StaticDataRetryLoop.DelayFor(99) == TimeSpan.FromMinutes(30));
+
+            succeed = true;
+            var fixedUp = loop.TryOnceAsync().GetAwaiter().GetResult();
+
+            Check("★ 重試成功後資料會被**換進正在服務的那一份**（不必重啟）",
+                fixedUp.Count == 2
+                && installed.GetValueOrDefault("Taichung") > 0 && installed.GetValueOrDefault("Tainan") > 0
+                && status.For("Taichung").Available && status.For("Taichung").Fresh
+                && !status.AnyNeedsRetry, $"補上：{string.Join("、", fixedUp)}");
+
+            // 重試失敗時**不可以**把還堪用的舊資料蓋成空的
+            var staleCity = new StaticDataStatus(["Taichung"]);
+            staleCity.Report(new StaticCityState("Taichung", 1200, "本機快取（已過期）",
+                Available: true, Fresh: false));
+
+            var keptStops = -1;
+
+            var downgrade = new StaticDataRetryLoop(
+                load: (city, _) => Task.FromResult(new StaticCityLoad(
+                    city, StaticDataProvisioner.Build([], [], []), "沒有資料",
+                    Fresh: false, new Exception("TDX API 失敗：HTTP 429"))),
+                install: load => keptStops = load.Service.StopCount,
+                status: staleCity);
+
+            downgrade.TryOnceAsync().GetAwaiter().GetResult();
+
+            Check("★ 重試失敗的空結果**不會**蓋掉還堪用的舊快取（不然重試會自己製造災難）",
+                keptStops == -1 && staleCity.For("Taichung").StopCount == 1200
+                && staleCity.For("Taichung").Error?.Contains("429", StringComparison.Ordinal) == true,
+                $"install 次數對應的站牌數 {keptStops}");
+
+            Check("★ 已經是新鮮資料的城市不會再打 TDX（`AnyNeedsRetry` 是 false → 迴圈會結束）",
+                !status.AnyNeedsRetry);
+
+            // 丟例外也要被吞掉（重試迴圈不能把行程弄死）
+            var brokenStatus = new StaticDataStatus(["Taichung"]);
+            var brokenLoop = new StaticDataRetryLoop(
+                load: (_, _) => throw new InvalidOperationException("磁碟滿了"),
+                install: _ => { },
+                status: brokenStatus);
+
+            brokenLoop.TryOnceAsync().GetAwaiter().GetResult();
+
+            Check("★ 重試本身丟例外也不會往外炸（只記下來、下一輪再試）",
+                brokenStatus.For("Taichung").Error?.Contains("磁碟滿了", StringComparison.Ordinal) == true
+                && brokenStatus.AnyNeedsRetry);
+
+            // ── 4) 資料目錄的熱換（copy-on-write）─────────────
+            var userCities = new UserCityStore(["Taichung"], "Taichung");
+            var emptyService = StaticDataProvisioner.Build([], [], []);
+            var catalog = new BusDataCatalog(new Dictionary<string, BusDataService> { ["Taichung"] = emptyService }, userCities);
+
+            Check("一開始查不到站牌（資料還沒來）", catalog.For(0UL).StopCount == 0);
+
+            catalog.Install("Taichung", StaticDataProvisioner.Build(
+                [new BusStop { StopUID = "TXG1", StopName = new LocalizedName("測試站", null) }],
+                [new BusStopOfRoute
+                {
+                    RouteUID = "TXG_R1", Direction = 0,
+                    Stops = [new StopOfRouteStop { StopUID = "TXG1", StopSequence = 1, StopName = new LocalizedName("測試站", null) }]
+                }],
+                [new BusRoute { RouteUID = "TXG_R1", RouteName = new LocalizedName("測試路線", null) }]));
+
+            Check("★ 背景重試成功之後，**正在跑的服務立刻查得到**（同一個 catalog 物件）",
+                catalog.For(0UL).StopCount > 0 && catalog.ForCity("Taichung").TripCount > 0);
+
+            Check("★ 換資料不會動到舊的那一份（避免「查到一半被清空」）",
+                emptyService.StopCount == 0);
+
+            // ── 5) 「還沒好」要說清楚，不能只說「找不到」──────
+            var missing = new StaticDataStatus(["Taichung"]);
+            missing.Report(new StaticCityState("Taichung", 0, "沒有資料", false,
+                Error: "TDX API 失敗：HTTP 429 Too Many Requests",
+                NextRetryAt: DateTimeOffset.UtcNow.AddMinutes(1)));
+
+            var message = missing.DescribeForUser("Taichung");
+
+            Check("★ 給使用者的說明包含：還沒好、原因、**下次重試時間**、不用重啟",
+                message.Contains("還沒載入完成", StringComparison.Ordinal)
+                && message.Contains("429", StringComparison.Ordinal)
+                && message.Contains("自動再試", StringComparison.Ordinal)
+                && message.Contains("不需要重啟", StringComparison.Ordinal), message.Replace("\n", " "));
+
+            var staleStatus = new StaticDataStatus(["Taichung"]);
+            staleStatus.Report(new StaticCityState("Taichung", 1200, "本機快取（已 30 小時沒更新）",
+                Available: true, Fresh: false));
+
+            Check("★ 只有舊快取時不要說「還沒好」（查詢其實可以用），改成說「可能不是最新」",
+                staleStatus.For("Taichung").NeedsRetry
+                && staleStatus.DescribeForUser("Taichung").Contains("可能不是最新", StringComparison.Ordinal),
+                staleStatus.DescribeForUser("Taichung").Replace("\n", " "));
+
+            var actions = new BusActionService(emptyService, new SubscriptionService(), catalog, missing);
+
+            var modelText = actions.FindRoutes("測試A", "測試B");
+
+            Check("★ 模型拿到的也是「資料還沒好」（不是「找不到站牌」→ 它才不會亂猜站名）",
+                modelText.Contains("還沒載入完成", StringComparison.Ordinal)
+                && !modelText.Contains("找不到站牌", StringComparison.Ordinal), modelText.Replace("\n", " "));
+        }
+        finally
+        {
+            try { Directory.Delete(temp, recursive: true); } catch (Exception) { /* 清理失敗不影響測試 */ }
+        }
+    }
+
+    /// <summary>寫三個快取檔（內容是合法但極小的資料集）。</summary>
+    private static void WriteCache(string dir, string city, string stopName, string stopUid)
+    {
+        var paths = StaticDataLoader.Paths(dir, city);
+
+        Directory.CreateDirectory(dir);
+
+        File.WriteAllText(paths.Stops, JsonSerializer.Serialize(new List<BusStop>
+        {
+            new() { StopUID = stopUid, StopName = new LocalizedName(stopName, null), City = city }
+        }));
+
+        File.WriteAllText(paths.StopOfRoutes, JsonSerializer.Serialize(new List<BusStopOfRoute>
+        {
+            new()
+            {
+                RouteUID = $"{stopUid}_R1", Direction = 0, City = city,
+                Stops =
+                [
+                    new StopOfRouteStop
+                    {
+                        StopUID = stopUid, StopSequence = 1,
+                        StopName = new LocalizedName(stopName, null)
+                    }
+                ]
+            }
+        }));
+
+        File.WriteAllText(paths.Routes, JsonSerializer.Serialize(new List<BusRoute>
+        {
+            new() { RouteUID = $"{stopUid}_R1", RouteName = new LocalizedName("測試路線", null), City = city }
+        }));
+    }
+
+    /// <summary>把快取檔的時間改成 30 小時前（＝過期，但檔案還在）。</summary>
+    private static void MakeStale(string dir, string city)
+    {
+        var paths = StaticDataLoader.Paths(dir, city);
+        var old = DateTime.UtcNow.AddHours(-30);
+
+        foreach (var path in new[] { paths.Stops, paths.StopOfRoutes, paths.Routes })
+            File.SetLastWriteTimeUtc(path, old);
     }
 
     private static void Section(string title)

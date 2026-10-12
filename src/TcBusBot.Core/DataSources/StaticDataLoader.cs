@@ -17,6 +17,57 @@ public sealed record StaticDataSet(
 /// <summary>某個城市的快取檔路徑。</summary>
 public sealed record StaticCachePaths(string Directory, string Stops, string StopOfRoutes, string Routes);
 
+/// <summary>這份資料是從哪裡來的。</summary>
+public enum StaticLoadSource
+{
+    /// <summary>本機快取，而且還在新鮮期內。</summary>
+    FreshCache,
+
+    /// <summary>剛剛跟 TDX 抓的。</summary>
+    Tdx,
+
+    /// <summary>
+    /// 本機快取，但已經過期 —— TDX 抓不到時的備援。
+    ///
+    /// 為什麼要留這一條：靜態資料平台 4 小時才更新一次，所以「12 小時前的資料」
+    /// 對查站牌與路線來說幾乎沒有差別，但 TDX 只要回一次 429（速率限制）
+    /// 就會讓整個行程起不來。**有可用的舊資料 ＝ 絕對比開不起來好。**
+    /// </summary>
+    StaleCache
+}
+
+/// <summary>
+/// 一次載入的結果（**含「這份資料是哪裡來的」**）。
+///
+/// 為什麼不能只回 <see cref="StaticDataSet"/>：429 的時候使用者最需要知道的是
+/// 「現在用的是舊資料、系統正在重試」——沒有這個欄位，UI 只能顯示成功，
+/// 而使用者看到的會是「查不到某些站牌」（明明昨天還查得到）。
+/// </summary>
+public sealed record StaticLoadResult(
+    StaticDataSet Data,
+    StaticLoadSource Source,
+    TimeSpan? CacheAge = null,
+    Exception? Error = null)
+{
+    /// <summary>舊快取嗎（UI 要誠實標示）。</summary>
+    public bool IsStale => Source == StaticLoadSource.StaleCache;
+
+    public string DescribeSource()
+        => Source switch
+        {
+            StaticLoadSource.Tdx => "剛剛向 TDX 抓取",
+            StaticLoadSource.FreshCache => "本機快取",
+            _ => CacheAge is { } age
+                ? $"本機快取（已 {Describe(age)}沒更新）"
+                : "本機快取（已過期）"
+        };
+
+    public static string Describe(TimeSpan age)
+        => age.TotalHours >= 1
+            ? $"{age.TotalHours:0.#} 小時"
+            : $"{Math.Max(1, age.TotalMinutes):0} 分鐘";
+}
+
 /// <summary>
 /// 靜態資料的載入策略：本機快取 → TDX API。
 ///
@@ -52,7 +103,7 @@ public static class StaticDataLoader
             Routes: Path.Combine(dir, $"Route.{code}.json"));
     }
 
-    public static async Task<StaticDataSet> LoadAsync(
+    public static async Task<StaticLoadResult> LoadAsync(
         TdxApiClient api,
         TdxOptions options,
         bool refresh = false,
@@ -76,7 +127,8 @@ public static class StaticDataLoader
                     Read<List<BusRoute>>(routePath));
 
                 if (cached.Stops.Count > 0 && cached.StopOfRoutes.Count > 0)
-                    return cached;
+                    return new StaticLoadResult(cached, StaticLoadSource.FreshCache,
+                        Age(CacheTimestamp(options.CacheDirectory, options.City)));
             }
             catch (Exception ex)
             {
@@ -88,23 +140,49 @@ public static class StaticDataLoader
             ? $"向 TDX 抓取{BusCity.DisplayOf(options.City)}靜態資料（訪客模式，未帶 API 金鑰）…"
             : $"向 TDX 抓取{BusCity.DisplayOf(options.City)}靜態資料（會員模式）…");
 
-        // 三次呼叫。並行可以，但 TDX 對並行連線有上限（每 IP 60 條），三次沒問題。
-        var stopsTask = api.GetStopsAsync(ct);
-        var sorsTask = api.GetStopOfRoutesAsync(ct);
-        var routesTask = api.GetRoutesAsync(ct);
-        await Task.WhenAll(stopsTask, sorsTask, routesTask);
+        try
+        {
+            // 三次呼叫。並行可以，但 TDX 對並行連線有上限（每 IP 60 條），三次沒問題。
+            var stopsTask = api.GetStopsAsync(ct);
+            var sorsTask = api.GetStopOfRoutesAsync(ct);
+            var routesTask = api.GetRoutesAsync(ct);
+            await Task.WhenAll(stopsTask, sorsTask, routesTask);
 
-        var data = new StaticDataSet(
-            await stopsTask,
-            await sorsTask,
-            await routesTask);
+            var data = new StaticDataSet(
+                await stopsTask,
+                await sorsTask,
+                await routesTask);
 
-        TryWriteCache(dir, stopPath, data.Stops, log);
-        TryWriteCache(dir, sorPath, data.StopOfRoutes, log);
-        TryWriteCache(dir, routePath, data.Routes, log);
+            TryWriteCache(dir, stopPath, data.Stops, log);
+            TryWriteCache(dir, sorPath, data.StopOfRoutes, log);
+            TryWriteCache(dir, routePath, data.Routes, log);
 
-        return data;
+            return new StaticLoadResult(data, StaticLoadSource.Tdx);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // ── TDX 抓不到（429／5xx／斷線）→ **先看有沒有舊快取可以用** ──
+            //
+            // 為什麼一定要有這一條：以前抓不到就直接把整個行程結束掉。
+            // 而 TDX 最常見的失敗是「429 超過 API 呼叫速率限制」——那是**幾分鐘後就沒事**
+            // 的暫時狀態，卻讓 Bot 完全起不來（Render 上就是健康檢查失敗、部署失敗）。
+            // 站牌與路線四小時才更新一次，所以「昨天的資料」絕對比「起不來」好。
+            var stale = TryReadCache(options.CacheDirectory, options.City);
+
+            if (stale is null) throw;   // 真的沒有東西可用 → 交給呼叫端決定（不要在這裡吞掉）
+
+            var age = Age(CacheTimestamp(options.CacheDirectory, options.City));
+
+            log?.Invoke($"⚠️  TDX 抓取失敗（{ex.Message}）→ 改用本機快取繼續" +
+                        (age is { } a ? $"（已 {StaticLoadResult.Describe(a)}沒更新）" : "") +
+                        "；系統會在背景自動重試。");
+
+            return new StaticLoadResult(stale, StaticLoadSource.StaleCache, age, ex);
+        }
     }
+
+    private static TimeSpan? Age(DateTimeOffset? timestamp)
+        => timestamp is { } at ? DateTimeOffset.UtcNow - at : null;
 
     private static bool IsFresh(string path)
         => File.Exists(path) && DateTimeOffset.UtcNow - File.GetLastWriteTimeUtc(path) < CacheTtl;

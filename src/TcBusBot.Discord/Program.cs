@@ -67,91 +67,74 @@ public static class Program
         //    而「合併再過濾」只要漏掉任何一條查詢路徑，就會吐出別的城市站牌
         //    （而且不會報錯）。一個城市一份索引，選哪一份由資料目錄決定，
         //    就**不可能看錯城市**。
+        //
+        // ⚠️ **這裡絕對不能因為資料抓不到就結束行程。**
+        //    TDX 最常見的失敗是 429（速率限制），那是幾分鐘後就沒事的暫時狀態；
+        //    舊版遇到它會 `return 1`，在 Render 上就變成「健康檢查失敗 → 部署失敗 →
+        //    Bot 完全不上線」。現在改成：拿到什麼就用什麼（新鮮快取 → TDX → 舊快取 →
+        //    （臺中）內建最小資料集 → 空資料集），然後在**背景**重試並熱換資料。
         var byCity = new Dictionary<string, BusDataService>(StringComparer.OrdinalIgnoreCase);
         TdxApiClient? api = null;
         string sourceDesc;
 
-        var cityDisplay = BusCity.DisplayOfMany(cfg.Tdx.EffectiveCities);
+        var cities = cfg.Tdx.EffectiveCities;
+        var cityDisplay = BusCity.DisplayOfMany(cities);
+        var dataStatus = new StaticDataStatus(cities);
 
-        foreach (var unknownCity in cfg.Tdx.EffectiveCities.Where(c => !BusCity.IsKnown(c)))
+        // 內建資料集只是**最後的備援**，所以延後到真的需要時才找它
+        // （找不到不該讓行程起不來，也不該在 TDX 正常時印一堆警告）
+        var fixturesRoot = new Lazy<string?>(() => SafeFixtureRoot(cfg.FixturesPath));
+
+        foreach (var unknownCity in cities.Where(c => !BusCity.IsKnown(c)))
         {
             Console.WriteLine($"⚠️  不認識的城市「{unknownCity}」—— 我會照原樣去 TDX 問一次，");
             Console.WriteLine($"    如果資料是空的，請改用：{BusCity.SupportedList()}");
             Console.WriteLine();
         }
 
-        try
+        if (cfg.EffectiveDataSource == "tdx")
         {
-            if (cfg.EffectiveDataSource == "tdx")
-            {
-                // 用 TdxApiClient.CreateHttpClient()：它會開啟 AutomaticDecompression，
-                // 否則 TDX 回傳的 gzip 內容會讓 JSON 解析失敗。
-                api = new TdxApiClient(TdxApiClient.CreateHttpClient(), cfg.Tdx);
-
-                foreach (var city in cfg.Tdx.EffectiveCities)
-                {
-                    var cityOptions = new TdxOptions
-                    {
-                        BaseUrl = cfg.Tdx.BaseUrl,
-                        City = city,
-                        Cities = [city],
-                        CacheDirectory = cfg.Tdx.CacheDirectory,
-                        ClientId = cfg.Tdx.ClientId,
-                        ClientSecret = cfg.Tdx.ClientSecret
-                    };
-
-                    var set = await StaticDataLoader.LoadAsync(api, cityOptions, cfg.Refresh, Console.WriteLine);
-
-                    var service = new BusDataService();
-                    service.Load(set.Stops, set.StopOfRoutes, set.Routes);
-                    byCity[city] = service;
-
-                    Console.WriteLine($"[資料] {BusCity.DisplayOf(city)}：{set.Describe()}");
-                }
-
-                sourceDesc = api.IsVisitorMode
-                    ? $"TDX {cityDisplay}公車（訪客模式：沒有 API 金鑰，每日 20 次上限）"
-                    : $"TDX {cityDisplay}公車（會員模式）";
-                Console.WriteLine(sourceDesc);
-            }
-            else if (cfg.Tdx.EffectiveCities.Count == 1 && BusCity.Normalize(cfg.Tdx.City) == BusCity.Default)
-            {
-                var root = MiniFixtureSource.ResolveRoot(cfg.FixturesPath);
-                byCity[BusCity.Default] = MiniFixtureSource.Load(root);
-                sourceDesc = $"內建最小資料集（{root}）";
-            }
-            else
-            {
-                // 內建最小資料集只有臺中走廊 —— 拿它去服務臺南會出現「查得到臺中站牌」
-                // 這種更難懂的錯誤，所以這裡直接講清楚。
-                throw new InvalidOperationException(
-                    $"內建最小資料集只有臺中的資料，沒辦法用來跑 {cityDisplay}。" +
-                    "請設定 TDX_CLIENT_ID／TDX_CLIENT_SECRET（或用 --data tdx），" +
-                    "或把 BUS_CITY 改回 Taichung。");
-            }
+            // 用 TdxApiClient.CreateHttpClient()：它會開啟 AutomaticDecompression，
+            // 否則 TDX 回傳的 gzip 內容會讓 JSON 解析失敗。
+            api = new TdxApiClient(TdxApiClient.CreateHttpClient(), cfg.Tdx);
         }
-        catch (Exception ex)
+
+        foreach (var city in cities)
+        {
+            var load = await StaticDataProvisioner.LoadCityAsync(
+                city, api, cfg.Tdx, cfg.Refresh, fixturesRoot.Value, Console.WriteLine);
+
+            byCity[BusCity.Normalize(city)] = load.Service;
+
+            dataStatus.Report(load.ToState(
+                lastAttemptAt: DateTimeOffset.UtcNow,
+                nextRetryAt: load.Fresh ? null : DateTimeOffset.UtcNow,
+                attempts: load.Fresh ? 0 : 1));
+
+            if (load.Available)
+                Console.WriteLine($"[資料] {BusCity.DisplayOf(city)}：{load.Describe()}（來源：{load.Source}）");
+            else
+                Console.WriteLine($"[資料] ⚠️  {BusCity.DisplayOf(city)}：目前沒有可用資料（{load.Error?.Message}）");
+        }
+
+        sourceDesc = api is null
+            ? $"內建最小資料集（{fixturesRoot.Value ?? "找不到"}）"
+            : api.IsVisitorMode
+                ? $"TDX {cityDisplay}公車（訪客模式：沒有 API 金鑰，每日 20 次上限）"
+                : $"TDX {cityDisplay}公車（會員模式）";
+
+        // 資料不完整時**照樣啟動**，但要把「現在是什麼狀態、會不會自己好」講清楚
+        if (dataStatus.AnyMissing || dataStatus.AnyNeedsRetry)
         {
             Console.WriteLine();
-            Console.WriteLine($"❌ 載入靜態資料失敗：{ex.Message}");
-            if (ex.InnerException is not null)
-                Console.WriteLine($"   內部錯誤：{ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
-            Console.WriteLine();
+            Console.WriteLine("   ⚠️  靜態資料還沒齊全 —— **Bot 照常啟動**（AI 聊天、已訂好的到站通知都不受影響），");
+            Console.WriteLine("       但還沒好的城市現在查不到站牌。系統會在背景自動重試，資料一到就換上去（不必重啟）。");
+            Console.WriteLine($"       {dataStatus.Describe()}");
 
-            if (cfg.Tdx.EffectiveCities.Count > 1 || BusCity.Normalize(cfg.Tdx.City) != BusCity.Default)
-            {
-                Console.WriteLine($"   ⚠️  現在設定的是{BusCity.DisplayOf(cfg.Tdx.City)}，");
-                Console.WriteLine("       內建最小資料集只有臺中的走廊，所以**不**拿它當備援（會查到錯的站牌）。");
-                Console.WriteLine("       請先修好 TDX 連線或金鑰，再把服務啟動起來。");
-                Console.WriteLine();
-                return 1;
-            }
+            if (api is null)
+                Console.WriteLine("       （這台主機沒有 TDX 金鑰 → 不會自動重試；請設 TDX_CLIENT_ID／TDX_CLIENT_SECRET）");
 
-            Console.WriteLine("   改用內建最小資料集繼續執行（搜尋範圍僅限臺中車站～靜宜大學走廊）。");
-            Console.WriteLine("   修正後可用 --refresh 重新抓取。");
             Console.WriteLine();
-            byCity[BusCity.Default] = MiniFixtureSource.Load(MiniFixtureSource.ResolveRoot(cfg.FixturesPath));
-            sourceDesc = "內建最小資料集（TDX 載入失敗後的備援）";
         }
 
         // 資料目錄：**「哪個使用者要用哪一份資料」的唯一入口**
@@ -167,10 +150,57 @@ public static class Program
         Console.WriteLine();
 
         BotStatus.DataSource = sourceDesc;
+        BotStatus.DataStatus = () => dataStatus.Describe();   // 每次都讀最新的（背景重試會改它）
         BotStatus.CityDisplay = cityDisplay;
 
+        // 背景重試：把還沒好的城市補齊（成功就換進 catalog，不需要重啟）
+        //   ⚠️ 一定要在**啟動早期**就開始（不等 Discord 連上）—— 它不需要 Discord，
+        //      而 Render 的健康檢查只在意 HTTP 端點有沒有活著。
+        if (api is not null && dataStatus.AnyNeedsRetry)
+        {
+            var tdx = api;
+
+            var retry = new StaticDataRetryLoop(
+                load: (city, ct) => StaticDataProvisioner.LoadCityAsync(
+                    city, tdx, cfg.Tdx, refresh: true, fixturesRoot.Value, Console.WriteLine, ct),
+                install: load =>
+                {
+                    catalog.Install(load.City, load.Service);
+
+                    // `/health` 的 dataStatus 是函式（每讀一次都是最新的），所以這裡不用更新它
+                    BotStatus.DataSource = sourceDesc;
+                },
+                status: dataStatus,
+                log: Console.WriteLine);
+
+            var retryToken = _stop?.Token ?? CancellationToken.None;
+            _ = Task.Run(() => retry.RunAsync(retryToken), retryToken);
+
+            Console.WriteLine($"🔄 靜態資料背景重試已啟動（{StaticDataRetryLoop.DelayFor(0).TotalMinutes:0} 分鐘後第一次；" +
+                              "拿到資料會自動換上去）");
+        }
+
         // ── 離線 UI 驗證（不需要 Token）────────────────────
-        if (dryRun) return DryRun.Run(data, cfg);
+        if (dryRun)
+        {
+            // ⚠️ 這裡刻意**比正式啟動嚴格**：`--dryrun` 是一套「資料相關的行為驗證」
+            //    （站牌搜尋、面板、路線匹配、多城市分批），資料不完整的話它會回一堆
+            //    看不出原因的失敗。所以寧可拒絕跑，也不要給出誤導的結果。
+            //    （正式啟動不會這樣：拿不到資料照樣上線，只是還不能查公車。）
+            if (dataStatus.AnyMissing)
+            {
+                Console.WriteLine("❌ --dryrun 需要完整的靜態資料才能驗證（站牌搜尋／路線匹配／多城市）。");
+                Console.WriteLine($"   目前：{dataStatus.Describe()}");
+                Console.WriteLine("   這是驗證工具的限制，不是 Bot 的限制 —— 正式啟動遇到這個情況**會照常上線**。");
+                Console.WriteLine("   請稍後再試（TDX 429 通常幾分鐘就恢復），或先讓本機快取存在。");
+                return 1;
+            }
+
+            if (dataStatus.AnyNeedsRetry)
+                Console.WriteLine("ℹ️ 目前用的是舊快取 —— 驗證會照跑，但正式啟動時系統會自動重試更新。");
+
+            return DryRun.Run(data, cfg);
+        }
 
         // ── 2) Discord 客戶端（意圖要在建立時決定）──────────
         // 意圖（intents）：
@@ -245,7 +275,7 @@ public static class Program
         // ── 2b) 服務組裝（**DI 容器**，註冊集中在 BotServices）──
         //   `--dryrun` 用的是同一份註冊程式碼，所以離線驗證通過 = 這裡也組得起來。
         var services = BotServices.Create(cfg, data, api, client, sourceDesc, Console.WriteLine,
-            catalog: catalog, userCities: userCities);
+            catalog: catalog, userCities: userCities, dataStatus: dataStatus);
 
         using var provider = services.BuildServiceProvider(new ServiceProviderOptions
         {
@@ -550,7 +580,9 @@ public static class Program
 
         // ── 4) 即時輪詢（只有真的拿得到即時資料時才啟動）──
         //   停止訊號：Ctrl+C（主控台）或 Program.RequestStop()（Android 服務）
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        //     ⚠️ 用 `_stop?.Token ?? …` 而不是 `_stop.Token`：`_stop` 是靜態欄位，
+        //        編譯器無法保證「呼叫過任何方法之後它還是非 null」（其他地方也都這樣寫）
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_stop?.Token ?? CancellationToken.None);
         try
         {
             Console.CancelKeyPress += (_, e) =>
@@ -704,6 +736,26 @@ public static class Program
     }
 
     // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 內建最小資料集的根目錄（找不到就回 null）。
+    ///
+    /// 為什麼要包一層：它只是**最後的備援**，而 <c>ResolveRoot</c> 找不到時會丟例外 ——
+    /// 「備援找不到」不該讓行程起不來，也不該在 TDX 正常時嚇人。
+    /// </summary>
+    private static string? SafeFixtureRoot(string? explicitPath)
+    {
+        try
+        {
+            return MiniFixtureSource.ResolveRoot(explicitPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️  找不到內建資料集（{ex.Message}）" +
+                              "→ 沒有 TDX 金鑰、又抓不到 TDX 時，公車查詢會沒有資料可用");
+            return null;
+        }
+    }
 
     private static void PrintBanner(BotConfig cfg)
     {
