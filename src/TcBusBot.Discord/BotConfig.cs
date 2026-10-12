@@ -469,7 +469,7 @@ public sealed class BotConfig
         // 需要讀訊息內容才有 AI 聊天 → 有設 LLM 就預設要這個意圖。
         //
         // ★ 也包含「有主人名單、但還沒有金鑰」的情況：那種實例可以用 `/ai llm`
-        //   在 Discord 上當場補金鑰（見 AiEndpointModule），但**意圖是連線時決定的** ——
+        //   在 Discord 上當場補金鑰（見 LlmEndpointCommand），但**意圖是連線時決定的** ——
         //   開機時沒要，補了金鑰也讀不到訊息內容（會變成「指令說成功、它卻不理人」）。
         //   真的沒被 Discord 允許時，下面會先問再決定（見 MessageContentIntentProbe），
         //   所以多要這一個意圖不會讓 Bot 連不上。

@@ -112,6 +112,10 @@ internal static class BotServices
 
         services.AddSingleton<ILlmClient>(sp => sp.GetRequiredService<ReloadableLlmClient>());
 
+        // `/ai llm` 的實作（**不是**一個指令模組 —— 一個 [Group] 只能有一個模組，
+        // 否則送給 Discord 的 payload 會有兩個同名指令而被整份拒絕；見該類別的說明）。
+        services.AddSingleton<LlmEndpointCommand>();
+
         // ── 公車資料目錄：**「哪個使用者要用哪一份資料」的唯一入口** ──
         //     `/bus city` 讓訂公車的人自己選城市；沒選過的人用預設（BUS_CITY 的第一個）。
         // ⚠️ 這兩個**永遠要註冊**（呼叫端沒傳時就用「只有一個城市」的預設組合）：

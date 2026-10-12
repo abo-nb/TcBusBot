@@ -27,7 +27,6 @@ public static class BotModules
         (typeof(BusComponentModule), "bus（按鈕／選單）"),
         (typeof(SayModule), "say"),
         (typeof(ChatModule), "ai"),
-        (typeof(AiEndpointModule), "ai（模型連線設定）"),
         (typeof(DigestModule), "digest（每週摘要）"),
         (typeof(PersonaGrantModule), "ai（授權按鈕）"),
         (typeof(QuotaResetModule), "ai（額度重置按鈕）"),

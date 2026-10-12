@@ -1688,6 +1688,11 @@ public static class DryRun
             .OrderBy(CommandPath, StringComparer.Ordinal)
             .ToList();
 
+        // ★ 真正送給 Discord 的 payload —— 這一關才是「指令在不在線上」的真相。
+        //   記憶體裡的指令樹看起來完全正常，但 Discord.Net 是**每個 top-level 模組**
+        //   各自產生一個指令；兩個模組掛同一個 [Group] 就會送出重複名稱而被 Discord 拒絕。
+        AuditCommandPayload(interactions);
+
         foreach (var command in commands)
             PrintCommand(command);
 
@@ -2104,6 +2109,190 @@ public static class DryRun
             ? $"{module.SlashGroupName} {command.Name}"
             : command.Name;
 
+    /// <summary>
+    /// **真正送給 Discord 的 payload**（不是記憶體裡的指令樹）。
+    ///
+    /// ── 為什麼一定要驗這個（真實事故）────────────────────────
+    /// `--dryrun` 原本只檢查 `interactions.SlashCommands`（把每個模組的子指令接起來），
+    /// 所以「`/ai` 的 9 個子指令都在」看起來完全正常 —— 但線上就是**找不到 `/ai llm`**。
+    ///
+    /// 原因在 Discord.Net 的註冊方式：
+    /// <code>
+    /// var topLevelModules = _moduleDefs.Where(x => !x.IsSubModule);
+    /// var props = topLevelModules.SelectMany(x => x.ToApplicationCommandProps()).ToList();
+    /// RestClient.BulkOverwriteGuildCommands(props.ToArray(), guildId);
+    /// </code>
+    /// 也就是「**每個 top-level 模組各自產生一個指令**」。兩個類別都掛 `[Group("ai")]`
+    /// 就會送出**兩個** `name: "ai"` —— Discord 直接拒絕整份請求，
+    /// 而這個例外發生在 <c>Ready</c> 事件裡（會被吃掉）→ 使用者只看到「指令不見了」，
+    /// console 也不一定看得到原因。舊的指令則原封不動留著（所以只少了新的那一個）。
+    ///
+    /// 所以這裡驗兩件事：
+    ///   1. payload 裡**不可以有重複的指令名稱**（＝有沒有兩個模組共用一個群組）
+    ///   2. 記憶體裡的每一個 slash command **都要真的在 payload 裡**（寫了但送不出去不算）
+    /// </summary>
+    private static void AuditCommandPayload(InteractionService interactions)
+    {
+        var toProps = FindToApplicationCommandProps(typeof(ModuleInfo));
+
+        if (toProps is null)
+        {
+            Problem("找不到 ModuleInfo.ToApplicationCommandProps —— 沒辦法驗證送給 Discord 的內容");
+            return;
+        }
+
+        var payload = new List<(string Name, List<string> Subs)>();
+
+        foreach (var module in interactions.Modules.Where(m => !m.IsSubModule))
+        {
+            IReadOnlyList<ApplicationCommandProperties> produced;
+
+            try
+            {
+                produced = toProps(module);
+            }
+            catch (Exception ex)
+            {
+                Problem($"產生「{module.Name}」的 payload 時失敗：" +
+                        $"{ex.InnerException?.GetType().Name ?? ex.GetType().Name}: " +
+                        $"{ex.InnerException?.Message ?? ex.Message}");
+                continue;
+            }
+
+            foreach (var props in produced)
+            {
+                var name = props.Name.IsSpecified ? props.Name.Value : module.Name;
+                var subs = new List<string>();
+
+                if (props is SlashCommandProperties slash
+                    && slash.Options.IsSpecified && slash.Options.Value is { } options)
+                    subs.AddRange(options.Select(o => o.Name));
+
+                payload.Add((name, subs));
+            }
+        }
+
+        // ── 1) 不能有兩個同名指令 ────────────────────────────
+        var duplicates = payload
+            .GroupBy(p => p.Name, StringComparer.Ordinal)
+            .Where(g => g.Count() > 1)
+            .ToList();
+
+        if (duplicates.Count > 0)
+            Problem($"送給 Discord 的指令有**重複的名稱**（{string.Join("、", duplicates.Select(d => $"{d.Key} × {d.Count()}"))}）" +
+                    "—— Discord 會拒絕整份註冊請求，症狀就是「有些指令不見了」。" +
+                    "原因幾乎都是**兩個模組宣告了同一個 [Group] 名稱**（要合併成同一個模組）");
+        else
+            Console.WriteLine($"  ✔ 送給 Discord 的 payload 沒有重複的名稱（{payload.Count} 個 top-level）");
+
+        // ── 2) 每一個 slash command 都要在 payload 裡 ────────
+        //    ⚠️ 用迴圈而不是 ToDictionary：同名時 ToDictionary 會丟例外，
+        //       而那正好是上面剛抓到的那個 bug（驗證工具不能在報告問題時自己炸掉）
+        var sent = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+
+        foreach (var (name, subs) in payload)
+            sent[name] = subs.ToHashSet(StringComparer.Ordinal);
+
+        var missing = new List<string>();
+
+        foreach (var command in interactions.SlashCommands)
+        {
+            var group = command.Module is { IsSlashGroup: true, SlashGroupName.Length: > 0 } module
+                        && !command.IgnoreGroupNames
+                ? module.SlashGroupName
+                : null;
+
+            if (group is null)
+            {
+                if (!sent.ContainsKey(command.Name)) missing.Add($"/{command.Name}");
+            }
+            else if (!sent.TryGetValue(group, out var subs) || !subs.Contains(command.Name))
+            {
+                missing.Add($"/{group} {command.Name}");
+            }
+        }
+
+        if (missing.Count > 0)
+            Problem($"這些指令**不會**出現在 Discord 上：{string.Join("、", missing)}");
+        else
+            Console.WriteLine($"  ✔ 記憶體裡的 {interactions.SlashCommands.Count} 個 slash command 全部都在 payload 裡");
+
+        // 讓「線上實際會看到的樣子」也印出來（出事時對照用）
+        foreach (var (name, subs) in payload.OrderBy(p => p.Name, StringComparer.Ordinal))
+        {
+            if (subs.Count == 0) continue;
+
+            var paths = subs.Select(sub => $"/{name} {sub}").OrderBy(x => x, StringComparer.Ordinal);
+
+            Console.WriteLine($"  │ {string.Join("、", paths)}");
+        }
+    }
+
+    /// <summary>
+    /// 找出 Discord.Net 內部「模組 → 送給 Discord 的指令」的那個方法，
+    /// 並包成「不管它回一個還是多個，都回一份清單」。
+    ///
+    /// 為什麼要用找的：它是 **internal 的擴充方法**（`x.ToApplicationCommandProps()`），
+    /// 版本之間位置與回傳形狀都會變（實測 3.18 對 `ModuleInfo` 回的是**集合**，
+    /// 對單一 command 回的是**單一物件**）。寫死型別名稱與形狀都很脆弱，
+    /// 所以這裡掃整個組件、並把兩種形狀都吃下來。
+    /// </summary>
+    private static Func<ModuleInfo, IReadOnlyList<ApplicationCommandProperties>>? FindToApplicationCommandProps(
+        Type moduleInfoType)
+    {
+        var assembly = moduleInfoType.Assembly;
+
+        IEnumerable<Type> types;
+        try { types = assembly.GetTypes(); }
+        catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t is not null)!; }
+
+        foreach (var type in types)
+        {
+            foreach (var method in type.GetMethods(BindingFlags.Static | BindingFlags.Instance
+                                                   | BindingFlags.Public | BindingFlags.NonPublic
+                                                   | BindingFlags.DeclaredOnly))
+            {
+                if (!string.Equals(method.Name, "ToApplicationCommandProps", StringComparison.Ordinal))
+                    continue;
+
+                var parameters = method.GetParameters();
+                var isExtension = method.IsStatic && parameters.Length >= 1
+                                  && parameters[0].ParameterType == moduleInfoType;
+                var isInstance = !method.IsStatic && method.DeclaringType == moduleInfoType
+                                 && parameters.Length == 0;
+
+                if (!isExtension && !isInstance) continue;
+
+                var args = new object?[parameters.Length];
+
+                return module =>
+                {
+                    object? result;
+
+                    if (isExtension)
+                    {
+                        args[0] = module;
+                        for (var i = 1; i < args.Length; i++) args[i] = false;
+                        result = method.Invoke(null, args);
+                    }
+                    else
+                    {
+                        result = method.Invoke(module, null);
+                    }
+
+                    return result switch
+                    {
+                        ApplicationCommandProperties single => [single],
+                        IEnumerable<ApplicationCommandProperties> many => many.ToList(),
+                        _ => []
+                    };
+                };
+            }
+        }
+
+        return null;
+    }
+
     private static void PrintCommand(SlashCommandInfo command)
     {
         var path = CommandPath(command);
@@ -2286,26 +2475,33 @@ public static class DryRun
             Problem("/ai llm 不該有必填參數 —— 不給參數時應該顯示目前的設定");
 
         // ── 1) 不能是模型可以呼叫的工具 ────────────────────
-        var toolFunctions = typeof(AiEndpointModule)
+        var toolFunctions = typeof(LlmEndpointCommand)
             .GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .SelectMany(m => m.GetCustomAttributes(inherit: true))
             .Count(a => a.GetType().Name == "KernelFunctionAttribute");
 
         if (toolFunctions > 0)
-            Problem("AiEndpointModule 有 KernelFunction —— 模型可以自己換掉 API 金鑰（這是憑證，絕對不行）");
+            Problem("LlmEndpointCommand 有 KernelFunction —— 模型可以自己換掉 API 金鑰（這是憑證，絕對不行）");
         else
-            Console.WriteLine("  ✔ 換金鑰**只能**由 Discord 指令發起（模組裡沒有任何 KernelFunction／工具）");
+            Console.WriteLine("  ✔ 換金鑰**只能**由 Discord 指令發起（實作裡沒有任何 KernelFunction／工具）");
 
         // ── 2) 授權：只認 LLM_ADMIN_IDS ─────────────────────
-        var method = typeof(AiEndpointModule).GetMethod(nameof(AiEndpointModule.LlmAsync));
+        //    ⚠️ 掃**實作**（LlmEndpointCommand.RunAsync）+ 轉呼叫的指令方法兩邊：
+        //       授權寫在哪一邊都要驗到（外層只有一行轉呼叫，真正的判斷在裡面）
+        var method = typeof(LlmEndpointCommand).GetMethod(nameof(LlmEndpointCommand.RunAsync));
         var calls = method is null ? [] : CollectCalls(method, resolveAll: true);
 
+        var wrapper = typeof(ChatModule).GetMethod(nameof(ChatModule.LlmAsync));
+        var wrapperCalls = wrapper is null ? [] : CollectCalls(wrapper, resolveAll: true);
+
         if (method is null)
-            Problem("找不到 AiEndpointModule.LlmAsync");
+            Problem("找不到 LlmEndpointCommand.RunAsync");
         else if (!calls.Contains("LlmOptions.get_AdminUserIds"))
             Problem("/ai llm 沒有檢查 LLM_ADMIN_IDS —— 任何人都能換掉整台 Bot 的模型端點");
         else if (calls.Contains("ChatModule.CanSetPersona") || calls.Contains("PersonaGrantStore.PeekAuthority"))
             Problem("/ai llm 用了「伺服器層」的授權 —— 那個授權只該給設定提示詞，不該給全域憑證");
+        else if (wrapper is null || !wrapperCalls.Contains("LlmEndpointCommand.RunAsync"))
+            Problem("/ai llm 的指令方法沒有轉呼叫實作（指令會按了沒反應）");
         else if (!calls.Contains("LlmEndpointStore.Apply") || !calls.Contains("ReloadableLlmClient.Reload"))
             Problem("/ai llm 沒有真的套用設定並重建連線（改了不生效，或要等重啟）");
         else if (!calls.Contains("LlmEndpointStore.Restore")

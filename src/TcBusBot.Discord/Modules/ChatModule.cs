@@ -18,7 +18,7 @@ namespace TcBusBot.Discord.Modules;
 /// 在 Discord 上按一下就能改的東西會讓「到底有沒有開」變得不確定。
 /// </summary>
 [Group("ai", "AI 聊天（OpenAI 相容 API）")]
-public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
+public sealed class ChatModule : CommandResponderBase
 {
     private readonly LlmOptions _options;
     private readonly ConversationStore _conversations;
@@ -32,6 +32,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private readonly DigestStore _digests;
     private readonly AddresseeLog _addressee;
     private readonly LlmEndpointStore _endpoints;
+    private readonly LlmEndpointCommand _endpointCommand;
 
     /// <summary>
     /// ⚠️ 所有參數都**必填**：Discord.Net 挑的是「參數最多的建構子」，
@@ -50,12 +51,14 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         ReasoningCapture reasoning,
         DigestStore digests,
         AddresseeLog addressee,
-        LlmEndpointStore endpoints)
+        LlmEndpointStore endpoints,
+        LlmEndpointCommand endpointCommand)
     {
         _reasoning = reasoning;
         _digests = digests;
         _addressee = addressee;
         _endpoints = endpoints;
+        _endpointCommand = endpointCommand;
         _options = options;
         _conversations = conversations;
         _budget = budget;
@@ -65,6 +68,28 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
         _diagnostics = diagnostics;
         _cities = cities;
     }
+
+    /// <summary>
+    /// <c>/ai llm</c>：看／設定整台 Bot 的模型連線（金鑰、base URL、模型名稱；只有主人）。
+    ///
+    /// ⚠️ 為什麼只是**薄薄的一層轉呼叫**（邏輯在 <see cref="LlmEndpointCommand"/>）：
+    ///    Discord.Net 的註冊是「**每個 top-level 模組各自產生一個指令**」——
+    ///    以前 `/ai llm` 住在另一個也掛 `[Group("ai")]` 的模組裡，
+    ///    送出的 payload 就變成**兩個** `name: "ai"`，Discord 直接拒絕整份請求
+    ///    （例外發生在 `Ready` 事件裡、被吃掉）→ 使用者看到的只有「找不到 /ai llm」。
+    ///    所以規則是：**一個群組只能有一個模組** —— 這支轉呼叫就是為了滿足那條規則，
+    ///    同時讓那段邏輯留在自己的檔案裡。`--dryrun` 會檢查送出的 payload 來擋住再犯。
+    /// </summary>
+    [SlashCommand("llm", "看／設定整台 Bot 的模型連線（金鑰、base URL、模型名稱；只有主人）")]
+    public Task LlmAsync(
+        [Summary("key", "新的 API 金鑰（只會顯示前後幾碼；留空＝不改）")] string? key = null,
+        [Summary("baseurl", "新的 base URL（要含 /v1，例如 https://api.deepseek.com/v1；留空＝不改）")]
+        string? baseurl = null,
+        [Summary("model", "新的模型名稱（留空＝不改）")] string? model = null,
+        [Summary("clear", "清掉 Discord 上的設定，回到主機環境變數那一組")] bool clear = false,
+        [Summary("test", "設定完立刻打一次真實的測試呼叫（預設要；測不過會自動退回舊設定）")]
+        bool test = true)
+        => _endpointCommand.RunAsync(this, key, baseurl, model, clear, test);
 
     /// <summary>
     /// 這個人在這個伺服器可以設定提示詞嗎？
@@ -649,7 +674,7 @@ public sealed class ChatModule : InteractionModuleBase<SocketInteractionContext>
     private static string CheckList(LlmErrorKind? kind, string? error)
     {
         if (kind is { } known && known != LlmErrorKind.Unknown)
-            return AiEndpointModule.CheckList(known);
+            return LlmEndpointCommand.CheckListFor(known);
 
         var text = error ?? "";
 

@@ -1,4 +1,4 @@
-using Discord;
+﻿using Discord;
 using Discord.Interactions;
 using TcBusBot.Core.Chat;
 
@@ -17,9 +17,24 @@ namespace TcBusBot.Discord.Modules;
 /// 斜線指令是 Discord 直接送到 Bot 的互動，**模型看不到也碰不到** ——
 /// 而工具是模型可以自己決定要不要呼叫的。所以這一條路刻意只有指令，沒有工具，
 /// 也因此不需要 `LLM_ADMIN_KEY`（那把 key 是為了擋「模型被騙去打主人的指令」）。
+///
+/// ── ⚠️ 為什麼這個類別**不是**一個指令模組（而是被 <see cref="ChatModule"/> 轉呼叫）──
+/// 真實事故：`/ai llm` 上線後「找不到」。原因是 Discord.Net 的註冊方式是
+/// <code>
+/// var topLevelModules = _moduleDefs.Where(x => !x.IsSubModule);
+/// var props = topLevelModules.SelectMany(x => x.ToApplicationCommandProps()).ToList();
+/// </code>
+/// —— 「**每個 top-level 模組各自產生一個指令**」。所以當 `/ai llm` 寫在另一個也掛著
+/// <c>[Group("ai")]</c> 的類別裡時，payload 會是**兩個** `name: "ai"`，
+/// Discord 直接拒絕整份註冊請求；而那個例外發生在 <c>Ready</c> 事件裡（會被吃掉），
+/// 使用者看到的就只有「指令不見了」。
+///
+/// 現在的做法：**一個群組只能有一個模組**。這個類別是一般的服務（沒有 `[Group]`、
+/// 沒有 `[SlashCommand]`），`ChatModule` 用一個薄薄的 <c>[SlashCommand("llm")]</c> 轉呼叫它 ——
+/// 邏輯仍然住在自己的檔案裡，但 Discord 只會收到**一個** `/ai`。
+/// `--dryrun` 的 payload 稽核（<c>AuditCommandPayload</c>）會擋住這種錯誤再發生。
 /// </summary>
-[Group("ai", "AI 聊天（OpenAI 相容 API）")]
-public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionContext>
+public sealed class LlmEndpointCommand
 {
     private readonly LlmOptions _options;
     private readonly LlmEndpointStore _endpoints;
@@ -27,8 +42,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
     private readonly WeeklyTokenBudget _budget;
     private readonly GuildPersonaStore _personas;
 
-    /// <summary>⚠️ 所有參數都必填：Discord.Net 挑「參數最多的建構子」（見 DisabledLlmClient 的說明）。</summary>
-    public AiEndpointModule(
+    public LlmEndpointCommand(
         LlmOptions options,
         LlmEndpointStore endpoints,
         ReloadableLlmClient llm,
@@ -48,14 +62,12 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
     /// 參數名稱刻意是小寫（`baseurl`／`model`）：Discord.Net 直接把**參數名稱**當成
     /// 選項名稱，而 Discord 只接受小寫。`--dryrun` 的指令樹檢查會在離線時就抓到寫錯。
     /// </summary>
-    [SlashCommand("llm", "看／設定整台 Bot 的模型連線（金鑰、base URL、模型名稱；只有主人）")]
-    public async Task LlmAsync(
-        [Summary("key", "新的 API 金鑰（只會顯示前後幾碼；留空＝不改）")] string? key = null,
-        [Summary("baseurl", "新的 base URL（要含 /v1，例如 https://api.deepseek.com/v1；留空＝不改）")]
+    public async Task RunAsync(
+        CommandResponderBase module,
+        string? key = null,
         string? baseurl = null,
-        [Summary("model", "新的模型名稱（留空＝不改）")] string? model = null,
-        [Summary("clear", "清掉 Discord 上的設定，回到主機環境變數那一組")] bool clear = false,
-        [Summary("test", "設定完立刻打一次真實的測試呼叫（預設要；測不過會自動退回舊設定）")]
+        string? model = null,
+        bool clear = false,
         bool test = true)
     {
         // ── 授權：只有主機端名單（LLM_ADMIN_IDS）上的人 ──────────
@@ -64,9 +76,9 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
         //    那些授權是「可以設定那個伺服器的提示詞」，而這一組設定是**全機器**的 ——
         //    拿到它等於能決定所有伺服器（含別人的私頻）的對話要送到哪裡去。
         //    只有主機主人（能改環境變數的人）才該有這個權限。
-        if (!_options.AdminUserIds.Contains(Context.User.Id))
+        if (!_options.AdminUserIds.Contains(module.Context.User.Id))
         {
-            await RespondAsync(
+            await module.RespondRawAsync(
                 "這個指令只有**主人**能用（`LLM_ADMIN_IDS` 名單）。\n" +
                 "它改的是**整台 Bot**的模型連線（金鑰、端點、模型）——" +
                 "等於能決定所有伺服器的對話要送到哪一個服務，所以刻意只給主機端名單上的人。\n" +
@@ -83,10 +95,10 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
             var restored = _endpoints.Clear();
             var message = _llm.Reload();
 
-            _personas.AuditAdmin(Context.User.Id, "清掉 Discord 的模型連線設定",
+            _personas.AuditAdmin(module.Context.User.Id, "清掉 Discord 的模型連線設定",
                 $"回到 {restored.Model} @ {LlmEndpointStore.Host(restored.BaseUrl)}（金鑰 {LlmEndpointStore.Mask(restored.ApiKey)}）");
 
-            await RespondAsync(embed: new EmbedBuilder()
+            await module.RespondRawAsync(embed: new EmbedBuilder()
                 .WithColor(new Color(0x5A, 0x5A, 0x5A))
                 .WithTitle("🧹 已回到環境變數的設定")
                 .WithDescription(_endpoints.DescribeOverride())
@@ -111,7 +123,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
         {
             var now = _endpoints.Effective;
 
-            await RespondAsync(embed: new EmbedBuilder()
+            await module.RespondRawAsync(embed: new EmbedBuilder()
                 .WithColor(new Color(0x2B, 0x6C, 0xB0))
                 .WithTitle("🔌 整台 Bot 的模型連線")
                 .WithDescription(_endpoints.DescribeOverride())
@@ -127,7 +139,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
                         ? "跨重啟保留；資料庫裡的金鑰**已加密**（用 `LLM_ADMIN_KEY` 推導的密語）"
                         : "跨重啟保留；但資料庫裡的金鑰是**明文** —— 設 `LLM_ADMIN_KEY` 就會自動改成加密保存"
                     : "⚠️ 這一台的儲存後端是記憶體模式 → 重啟後會回到環境變數", inline: false)
-                .WithFooter(_options.AdminUserIds.Contains(Context.User.Id)
+                .WithFooter(_options.AdminUserIds.Contains(module.Context.User.Id)
                     ? "用法：/ai llm key:<金鑰> baseurl:<含 /v1> model:<名稱>｜clear:True 回到環境變數"
                     : "")
                 .Build(), ephemeral: true);
@@ -143,7 +155,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
 
             if (newKey.Length < 8)
             {
-                await RespondAsync("❌ 金鑰太短（看起來不像一組金鑰）。沒有動到任何設定。", ephemeral: true);
+                await module.RespondRawAsync("❌ 金鑰太短（看起來不像一組金鑰）。沒有動到任何設定。", ephemeral: true);
                 return;
             }
         }
@@ -155,7 +167,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
             if (!Uri.TryCreate(text, UriKind.Absolute, out var uri)
                 || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
             {
-                await RespondAsync(
+                await module.RespondRawAsync(
                     $"❌ `{Trim(text)}` 不是有效的 http(s) 網址。沒有動到任何設定。\n" +
                     "（要像 `https://api.deepseek.com/v1` 這樣，**含 `/v1`**。）",
                     ephemeral: true);
@@ -169,7 +181,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
 
         // ── 套用 ＋ 重建連線 ──────────────────────────────────
         // 先回應（打 API 可能要好幾秒 → 不 defer 的話 Discord 會說「互動失敗」）
-        await DeferAsync(ephemeral: true);
+        await module.DeferRawAsync(ephemeral: true);
 
         var previous = _endpoints.Override;   // 供「金鑰被拒絕」時回退
         var now2 = DateTimeOffset.UtcNow;
@@ -178,9 +190,9 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
             BaseUrl: newUrl,
             ApiKey: newKey,
             Model: newModel,
-            SetBy: Context.User.Id,
+            SetBy: module.Context.User.Id,
             SetAt: now2,
-            Where: Where()));
+            Where: Where(module)));
 
         var reloadMessage = _llm.Reload();
 
@@ -196,11 +208,11 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
         {
             try
             {
-                probe = await _llm.CompleteAsync(ProbeRequest(), CancellationToken.None);
+                probe = await _llm.CompleteAsync(ProbeRequest(module), CancellationToken.None);
 
                 // 真的呼叫要算進每週額度（不然「換金鑰」會變成繞過額度的後門）
                 _budget.Record(probe.InputTokens, probe.OutputTokens,
-                    Context.Guild?.Id ?? 0, DateTimeOffset.UtcNow);
+                    module.Context.Guild?.Id ?? 0, DateTimeOffset.UtcNow);
             }
             catch (LlmException ex) { failure = ex; }
             catch (Exception ex) { rawFailure = $"{ex.GetType().Name}: {ex.Message}"; }
@@ -215,10 +227,10 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
             _endpoints.Restore(previous);
             _llm.Reload();
 
-            _personas.AuditAdmin(Context.User.Id, "模型連線設定被回退（金鑰被拒絕）",
+            _personas.AuditAdmin(module.Context.User.Id, "模型連線設定被回退（金鑰被拒絕）",
                 $"{failure.Kind}｜已退回 {_endpoints.DescribeSource()}｜金鑰 {LlmEndpointStore.Mask(_endpoints.Effective.ApiKey)}");
 
-            await FollowupAsync(embed: new EmbedBuilder()
+            await module.FollowupRawAsync(embed: new EmbedBuilder()
                 .WithColor(new Color(0xC0, 0x39, 0x2B))
                 .WithTitle("❌ 新設定接不上 → 已自動退回舊設定")
                 .WithDescription($"`{Trim(failure.Message)}`")
@@ -227,7 +239,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
                 .AddField("現在生效", _endpoints.DescribeSource() +
                                      $"\n`{_endpoints.Effective.Model} @ {LlmEndpointStore.Host(_endpoints.Effective.BaseUrl)}`" +
                                      $"\n金鑰：{LlmEndpointStore.Mask(_endpoints.Effective.ApiKey)}", inline: false)
-                .AddField("怎麼辦", CheckList(failure.Kind), inline: false)
+                .AddField("怎麼辦", CheckListFor(failure.Kind), inline: false)
                 .WithFooter("確認金鑰無誤後可以再下一次指令")
                 .Build(), ephemeral: true);
             return;
@@ -236,7 +248,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
         // ── 沒有可用的設定（例如 clear 之後環境變數也沒有金鑰）──
         if (!_llm.IsConfigured)
         {
-            await FollowupAsync(
+            await module.FollowupRawAsync(
                 "⚠️ 設定已寫入，但**現在沒有可用的金鑰**（環境變數也沒有）→ AI 聊天與每週摘要都會是關閉的。\n" +
                 $"• 環境變數那一組：{_endpoints.DescribeBaseline()}\n" +
                 "• 要用這一組跑起來，請補上 `key:`（或到主機後台設 `LLM_API_KEY`）。",
@@ -252,7 +264,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
               "只有在自架、內網或本機（例如 `http://localhost:11434/v1`）時才適合。"
             : "";
 
-        _personas.AuditAdmin(Context.User.Id, "更換模型連線設定",
+        _personas.AuditAdmin(module.Context.User.Id, "更換模型連線設定",
             $"{applied.DescribeChanges()}｜現在：{_endpoints.Effective.Model} @ " +
             $"{LlmEndpointStore.Host(_endpoints.Effective.BaseUrl)}｜" +
             $"金鑰 {LlmEndpointStore.Mask(_endpoints.Effective.ApiKey)}" +
@@ -261,7 +273,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
         // 測不過（但不是金鑰問題）→ 明確說「設定留著、但要自己決定退不退」
         if (failure is not null || rawFailure is not null)
         {
-            await FollowupAsync(embed: new EmbedBuilder()
+            await module.FollowupRawAsync(embed: new EmbedBuilder()
                 .WithColor(new Color(0xE6, 0x7E, 0x22))
                 .WithTitle("⚠️ 設定已套用，但測試呼叫失敗")
                 .WithDescription($"`{Trim(failure?.Message ?? rawFailure ?? "")}`")
@@ -272,7 +284,7 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
                     (previous is null ? "（現在沒有 Discord 覆寫 → 就是環境變數那一組）" : ""),
                     inline: false)
                 .AddField("現在生效", _endpoints.DescribeOverride(), inline: false)
-                .AddField("怎麼查", CheckList(failure?.Kind ?? LlmErrorKind.Unknown), inline: false)
+                .AddField("怎麼查", CheckListFor(failure?.Kind ?? LlmErrorKind.Unknown), inline: false)
                 .WithFooter("確認可以用了之後，`/ai test` 會再打一次真的")
                 .Build(), ephemeral: true);
             return;
@@ -282,12 +294,12 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
             ? "✅ 設定已套用（這次沒有測試呼叫）。\n建議用 `/ai test` 打一次真的確認。"
             : $"✅ 設定已套用，而且**接得上**。它回你：{Truncate(probe.Text, 300)}";
 
-        await FollowupAsync(embed: new EmbedBuilder()
+        await module.FollowupRawAsync(embed: new EmbedBuilder()
             .WithColor(new Color(0x2E, 0x8B, 0x57))
             .WithTitle("🔌 模型連線已更新")
             .WithDescription(description + httpWarning)
             .AddField("改了什麼", DescribeChange(newUrl, newKey, newModel), inline: true)
-            .AddField("來源", $"Discord 指令（<@{Context.User.Id}>）", inline: true)
+            .AddField("來源", $"Discord 指令（<@{module.Context.User.Id}>）", inline: true)
             .AddField("保存", _endpoints.Persistent
                     ? _endpoints.Encrypted ? "跨重啟保留（金鑰加密）" : "跨重啟保留（金鑰**明文**）"
                     : "⚠️ 記憶體模式 → 重啟後會回到環境變數",
@@ -325,21 +337,22 @@ public sealed class AiEndpointModule : InteractionModuleBase<SocketInteractionCo
     }
 
     /// <summary>測試用的最小請求（跟 `/ai test` 一樣：便宜、而且回什麼都不影響判斷）。</summary>
-    private LlmRequest ProbeRequest() => new(
+    private static LlmRequest ProbeRequest(CommandResponderBase module) => new(
         SystemPrompt: "你是一個測試用的助理。只回答一個簡短的句子。",
         History: [],
         Incoming: new ChatTurn(
-            ChatRole.User, Context.User.Username, Context.User.Id, 0UL,
+            ChatRole.User, module.Context.User.Username, module.Context.User.Id, 0UL,
             "ping：請只回一個字 OK", DateTimeOffset.UtcNow),
         MaxTokens: 32,
         Temperature: 0,
         Tag: "probe");
 
-    private string Where()
-        => (Context.Guild?.Name is { Length: > 0 } guild ? $"{guild} " : "") + $"#{Context.Channel.Name}";
+    private static string Where(CommandResponderBase module)
+        => (module.Context.Guild?.Name is { Length: > 0 } guild ? $"{guild} " : "") +
+           $"#{module.Context.Channel.Name}";
 
     /// <summary>依失敗種類給對應的下一步（不然使用者只看到一串英文）。</summary>
-    internal static string CheckList(LlmErrorKind kind)
+    internal static string CheckListFor(LlmErrorKind kind)
         => kind switch
         {
             LlmErrorKind.Auth =>

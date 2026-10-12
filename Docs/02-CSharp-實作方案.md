@@ -4656,7 +4656,46 @@ ReloadableLlmClient  永遠存在的那顆 ILlmClient；Reload() 時把裡面的
 
 `/ai test` 的「怎麼查」也改成用同一份分類（不再靠訊息字串比對，那種判斷會隨服務商文案而失效）。
 
-#### 20.33.5 驗收
+#### 20.33.5 ⚠️ 上線事故：`/ai llm`「找不到」——兩個模組共用一個 `[Group]`
+
+`/ai llm` 第一版寫在**另一個**也掛著 `[Group("ai")]` 的模組類別裡，結果上線後**找不到這個指令**。
+
+原因在 Discord.Net 的註冊方式（讀 3.18 的原始碼確認）：
+
+```csharp
+// InteractionService.RegisterCommandsToGuildAsync
+var topLevelModules = _moduleDefs.Where(x => !x.IsSubModule);
+var props = topLevelModules.SelectMany(x => x.ToApplicationCommandProps()).ToList();
+return await RestClient.BulkOverwriteGuildCommands(props.ToArray(), guildId);
+```
+
+也就是「**每個 top-level 模組各自產生一個指令**」——兩個模組都宣告 `[Group("ai")]`
+就會送出**兩個** `name: "ai"`，Discord 直接拒絕整份 bulk-overwrite 請求。
+而那個例外發生在 `Ready` 事件裡，**會被 Discord.Net 吃掉**：console 一片安靜、
+舊的指令原封不動留著，使用者看到的只有「`/ai llm` 不見了」。
+
+| 修正 | 為什麼 |
+| --- | --- |
+| **一個 `[Group]` 只能有一個模組**：`/ai llm` 改成 `ChatModule` 裡的**薄指引**，實作搬到 `LlmEndpointCommand`（一般服務，沒有 `[Group]`／`[SlashCommand]`） | 讓 Discord 收到**一個** `/ai`（9 個子指令），同時保住「邏輯在自己的檔案裡」 |
+| `CommandResponderBase` 把 `RespondAsync`／`DeferAsync`／`FollowupAsync` 開放成 **internal** | 那三個是 `protected`，非模組的實作叫不到（開放成 public 則會讓別的模組亂回別人的互動） |
+| `--dryrun` 新增 **payload 稽核** | 原本只驗記憶體裡的指令樹（`SlashCommands`）——那看起來完全正常（9 個子指令都在）。**要驗的是真正送給 Discord 的東西** |
+| `Program` 把註冊包 try/catch 並大聲印出來 | 「靜默失敗」是這次真正的傷害：沒有訊息就沒有人查得出來 |
+
+payload 稽核驗兩件事，而且會把「線上實際會看到的樣子」印出來：
+
+```
+✔ 送給 Discord 的 payload 沒有重複的名稱（7 個 top-level）
+✔ 記憶體裡的 29 個 slash command 全部都在 payload 裡
+  │ /ai audit、/ai cset、/ai forget、/ai learned、/ai llm、/ai pset、/ai status、/ai test、/ai think
+  │ /bus city、/bus end、/bus groups、/bus list、/bus next、/bus panel、/bus status
+  ...
+```
+
+> ⚠️ 這也解釋了為什麼原本的「指令樹檢查」抓不到它：`interactions.SlashCommands` 是
+> 「把每個模組的指令接起來」，而 Discord 收到的是「每個模組各自一個指令」——
+> **兩者只有在一個群組恰好一個模組時才等價**。
+
+#### 20.33.6 驗收
 
 `tcbus selftest` 新增 **30 項（第 32 節）**：
 
@@ -4678,7 +4717,7 @@ ReloadableLlmClient  永遠存在的那顆 ILlmClient；Reload() 時把裡面的
 真的呼叫 `Apply` ＋ `Reload` ＋ `Restore`（回退）＋ `Mask`；**在容器裡真的換一次連線再退回來**
 （驗熱抽換與精確還原）；`LlmEndpointStore.Save` 真的經過 `LlmSecretProtector.Protect`。
 
-#### 20.33.6 已知限制（誠實寫出來）
+#### 20.33.7 已知限制（誠實寫出來）
 
 * **金鑰會經過 Discord**：斜線指令的參數是透過 Discord 的伺服器送到 Bot 的，而且 Discord 目前沒有
   「隱藏指令參數」的官方選項（參數可能出現在頻道的指令訊息上）。要完全避免就維持用環境變數；

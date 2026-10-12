@@ -476,20 +476,13 @@ public static class Program
             else
             {
                 foreach (var g in guilds)
-                {
-                    await interactions.RegisterCommandsToGuildAsync(g.Id);
-                    Console.WriteLine($"✅ 已在「{g.Name}」註冊指令");
-                }
+                    await RegisterToGuildAsync(interactions, g);
             }
 
             PrintReady(client);
         };
 
-        client.JoinedGuild += async guild =>
-        {
-            await interactions.RegisterCommandsToGuildAsync(guild.Id);
-            Console.WriteLine($"✅ 已加入「{guild.Name}」，指令已註冊");
-        };
+        client.JoinedGuild += async guild => await RegisterToGuildAsync(interactions, guild);
 
         client.InteractionCreated += async interaction =>
         {
@@ -736,6 +729,32 @@ public static class Program
     }
 
     // ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 把指令註冊到某個伺服器（**失敗一定要自己講出來**）。
+    ///
+    /// ⚠️ 為什麼不能像以前那樣直接 `await`：這段程式在 <c>Ready</c> 事件裡執行，
+    ///    而 Discord.Net 會**吃掉事件處理函式的例外**（只留一行 log 或完全沒有）。
+    ///    真實事故：`/ai llm` 上線後「找不到」——原因是送出的 payload 有兩個同名指令
+    ///    （兩個模組共用 `[Group("ai")]`），Discord 拒絕整份請求，但 console 一片安靜，
+    ///    使用者只看到「指令不見了」。
+    /// </summary>
+    private static async Task RegisterToGuildAsync(InteractionService interactions, SocketGuild guild)
+    {
+        try
+        {
+            await interactions.RegisterCommandsToGuildAsync(guild.Id);
+            Console.WriteLine($"✅ 已在「{guild.Name}」註冊指令");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ 在「{guild.Name}」註冊指令失敗（指令不會更新，舊的會留著）：" +
+                              $"{ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine("   最常見的原因：送出的指令有**重複的名稱**" +
+                              "（兩個模組共用同一個 `[Group]` 名稱 → 一個群組只能有一個模組）。");
+            Console.WriteLine("   可以先用 `--dryrun` 離線檢查（它會驗真正送給 Discord 的 payload）。");
+        }
+    }
 
     /// <summary>
     /// 內建最小資料集的根目錄（找不到就回 null）。
